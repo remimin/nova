@@ -172,11 +172,7 @@ REST_API_VERSION_HISTORY = """REST API Version History:
 # Note(cyeoh): This only applies for the v2.1 API once microversions
 # support is fully merged. It does not affect the V2 API.
 _MIN_API_VERSION = "2.1"
-<<<<<<< HEAD
-_MAX_API_VERSION = "2.65"
-=======
 _MAX_API_VERSION = "2.67"
->>>>>>> c7f4190... Add microversion 2.67 to support volume_type
 DEFAULT_API_VERSION = _MIN_API_VERSION
 
 # Almost all proxy APIs which are related to network, images and baremetal

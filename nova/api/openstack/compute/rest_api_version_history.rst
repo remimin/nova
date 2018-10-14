@@ -842,3 +842,21 @@ in server group APIs:
 
 Add support for abort live migrations in ``queued`` and ``preparing`` status
 for API ``DELETE /servers/{server_id}/migrations/{migration_id}``.
+
+2.66
+----
+
+The ``changes-before`` filter can be included as a request parameter of the
+following APIs to filter by changes before or equal to the resource
+``updated_at`` time:
+
+* ``GET /servers``
+* ``GET /servers/detail``
+* ``GET /servers/{server_id}/os-instance-actions``
+* ``GET /os-migrations``
+
+2.67
+----
+
+Adds the ``volume_type`` parameter to ``block_device_mapping_v2``, which can
+be used to specify cinder ``volume_type`` when creating a server.
