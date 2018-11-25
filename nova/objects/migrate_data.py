@@ -150,6 +150,23 @@ class LiveMigrateData(obj_base.NovaObject):
         obj.from_legacy_dict(legacy_dict)
         return obj
 
+    @staticmethod
+    def create_skeleton_migrate_vifs(vifs):
+        """Create migrate vifs for live migration.
+
+        :param vifs: a list of VIFs.
+        :return: list of VIFMigrateData object corresponding to the provided
+                 VIFs.
+        """
+        vif_mig_data = []
+
+        for vif in vifs:
+            mig_vif = VIFMigrateData(
+                port_id=vif['id'],
+                source_vif=vif)
+            vif_mig_data.append(mig_vif)
+        return vif_mig_data
+
 
 @obj_base.NovaObjectRegistry.register
 class LibvirtLiveMigrateBDMInfo(obj_base.NovaObject):
