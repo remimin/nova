@@ -7242,6 +7242,8 @@ class ComputeManager(manager.Manager):
         #                  for nova-network)
         # NOTE(mriedem): This is a no-op for neutron.
         self.network_api.setup_networks_on_host(context, instance, self.host)
+        self.driver.rollback_live_migration_at_source(context, instance,
+                                                      migrate_data)
 
         source_bdms_by_volid = {bdm.volume_id: bdm for bdm in source_bdms
                                 if bdm.is_volume}
