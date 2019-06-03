@@ -22,6 +22,7 @@ from keystoneauth1 import loading as ks_loading
 from neutronclient.common import exceptions as neutron_client_exc
 from neutronclient.v2_0 import client as clientv20
 from oslo_log import log as logging
+from oslo_middleware import request_id
 from oslo_utils import excutils
 from oslo_utils import strutils
 from oslo_utils import uuidutils
@@ -1317,7 +1318,7 @@ class API(base_api.NetworkAPI):
                 binding['profile'] = port_profiles[port_id]
 
             data = dict(binding=binding)
-            resp = self._create_port_binding(client, port_id, data)
+            resp = self._create_port_binding(context, client, port_id, data)
             if resp:
                 bindings_by_port_id[port_id] = resp.json()['binding']
             else:
@@ -1339,6 +1340,23 @@ class API(base_api.NetworkAPI):
 
         return bindings_by_port_id
 
+    @staticmethod
+    def _create_port_binding(context, client, port_id, data):
+        """Creates a port binding with the specified data.
+
+        :param context: The request context for the operation.
+        :param client: keystoneauth1.adapter.Adapter
+        :param port_id: The ID of the port on which to create the binding.
+        :param data: dict of port binding data (requires at least the host),
+            for example::
+
+                {'binding': {'host': 'dest.host.com'}}
+        :return: requests.Response object
+        """
+        return client.post(
+            '/v2.0/ports/%s/bindings' % port_id, json=data, raise_exc=False,
+            headers={request_id.INBOUND_HEADER: context.global_id})
+
     def delete_port_binding(self, context, port_id, host):
         """Delete the port binding for the given port ID and host
 
@@ -1352,9 +1370,7 @@ class API(base_api.NetworkAPI):
             response is received from neutron.
         """
         client = _get_ksa_client(context, admin=True)
-        resp = client.delete(
-            '/v2.0/ports/%s/bindings/%s' % (port_id, host),
-            raise_exc=False)
+        resp = self._delete_port_binding(context, client, port_id, host)
         if resp:
             LOG.debug('Deleted binding for port %s and host %s.',
                       port_id, host)
@@ -1369,6 +1385,20 @@ class API(base_api.NetworkAPI):
                           resp.status_code, resp.text)
                 raise exception.PortBindingDeletionFailed(
                     port_id=port_id, host=host)
+
+    @staticmethod
+    def _delete_port_binding(context, client, port_id, host):
+        """Deletes the binding for the given host on the given port.
+
+        :param context: The request context for the operation.
+        :param client: keystoneauth1.adapter.Adapter
+        :param port_id: ID of the port from which to delete the binding
+        :param host: A string name of the host on which the port is bound
+        :return: requests.Response object
+        """
+        return client.delete(
+            '/v2.0/ports/%s/bindings/%s' % (port_id, host), raise_exc=False,
+            headers={request_id.INBOUND_HEADER: context.global_id})
 
     def activate_port_binding(self, context, port_id, host):
         """Activates an inactive port binding.
@@ -1389,7 +1419,8 @@ class API(base_api.NetworkAPI):
         # to ACTIVE, it's more like a POST action method in the compute API.
         resp = client.put(
             '/v2.0/ports/%s/bindings/%s/activate' % (port_id, host),
-            raise_exc=False)
+            raise_exc=False,
+            headers={request_id.INBOUND_HEADER: context.global_id})
         if resp:
             LOG.debug('Activated binding for port %s and host %s.',
                       port_id, host)
@@ -2615,8 +2646,10 @@ class API(base_api.NetworkAPI):
             # Not all compute migration flows use the port binding-extended
             # API yet, so first check to see if there is a binding for the
             # port and destination host.
-            resp = client.get('/v2.0/ports/%s/bindings/%s' %
-                              (vif['id'], dest_host), raise_exc=False)
+            resp = client.get(
+                '/v2.0/ports/%s/bindings/%s' % (vif['id'], dest_host),
+                raise_exc=False,
+                headers={request_id.INBOUND_HEADER: context.global_id})
             if resp:
                 if resp.json()['binding']['status'] != 'ACTIVE':
                     self.activate_port_binding(context, vif['id'], dest_host)

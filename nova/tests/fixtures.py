@@ -1262,6 +1262,18 @@ class NeutronFixture(fixtures.Fixture):
         self.test.stub_out('nova.network.neutronv2.api.get_client',
                            lambda *args, **kwargs: self)
 
+    @staticmethod
+    def fake_create_port_binding(context, client, port_id, data):
+        # TODO(mriedem): Make this smarter by keeping track of our bindings
+        # per port so we can reflect the status accurately.
+        return fake_requests.FakeResponse(200, content=jsonutils.dumps(data))
+
+    @staticmethod
+    def fake_delete_port_binding(context, client, port_id, host):
+        # TODO(mriedem): Make this smarter by keeping track of our bindings
+        # per port so we can reflect the status accurately.
+        return fake_requests.FakeResponse(204)
+
     def _get_first_id_match(self, id, list):
         filtered_list = [p for p in list if p['id'] == id]
         if len(filtered_list) > 0:
