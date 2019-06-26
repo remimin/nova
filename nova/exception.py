@@ -2379,3 +2379,13 @@ class ZVMConnectorError(ZVMDriverException):
         self.rc = results.get('rc')
         self.rs = results.get('rs')
         self.errmsg = results.get('errmsg')
+
+
+class MonitorDeviceAttachFailed(Invalid):
+    msg_fmt = _("Failed to attach monitor device to "
+                "%(instance_uuid)s")
+
+
+class MonitorDeviceDisabled(Invalid):
+    msg_fmt = _("Instance %(instance_uuid)s monitor device attach "
+                "is disabled.")

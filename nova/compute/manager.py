@@ -8483,3 +8483,27 @@ class ComputeManager(manager.Manager):
         if not CONF.cells.enable:
             objects.ConsoleAuthToken.\
                 clean_expired_console_auths_for_host(context, self.host)
+
+    @wrap_exception()
+    @wrap_instance_event(prefix='compute')
+    @wrap_instance_fault
+    def attach_monitor_device(self, context, instance):
+        """Hotplug monitor device to instance"""
+        if not CONF.enable_vm_monitor:
+            LOG.error("Monitor is disabled.")
+            raise exception.MonitorDeviceDisabled(instance_uuid=instance.uuid)
+
+        self._notify_about_instance_usage(context, instance,
+                                          "attach_monitor_device.start")
+        compute_utils.notify_about_instance_action(context, instance,
+                self.host, action=fields.NotificationAction.MONITOR_ATTACH,
+                phase=fields.NotificationPhase.START)
+
+        image_meta = objects.ImageMeta.from_instance(instance)
+        self.driver.attach_monitor_device(instance, image_meta)
+
+        self._notify_about_instance_usage(context, instance,
+                                          "attach_monitor_device.end")
+        compute_utils.notify_about_instance_action(context, instance,
+                self.host, action=fields.NotificationAction.MONITOR_ATTACH,
+                phase=fields.NotificationPhase.END)

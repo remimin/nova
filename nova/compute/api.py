@@ -4902,6 +4902,16 @@ class API(base.Base):
             host_statuses[instance.uuid] = host_status
         return host_statuses
 
+    @check_instance_lock
+    @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
+                                    vm_states.STOPPED],
+                          task_state=[None])
+    def attach_monitor_device(self, context, instance):
+        """Hotplug monitor device."""
+        self._record_action_start(context, instance,
+                                  instance_actions.ATTACH_MONITOR_DEVICE)
+        self.compute_rpcapi.attach_monitor_device(context, instance)
+
 
 def target_host_cell(fn):
     """Target a host-based function to a cell.

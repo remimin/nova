@@ -20,6 +20,7 @@ libvirt specific routines.
 import binascii
 import os
 import stat
+import socket
 
 from oslo_concurrency import processutils
 from oslo_log import log as logging
@@ -255,3 +256,13 @@ def create_mdev(physical_device, mdev_type, uuid=None):
     with open(fpath, 'w') as f:
         f.write(uuid)
     return uuid
+
+@nova.privsep.sys_admin_pctxt.entrypoint
+def check_socket_access(sock_type, source):
+    sock = None
+    if sock_type == "unix":
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    if sock_type == "tcp":
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect(source)
+    sock.close()

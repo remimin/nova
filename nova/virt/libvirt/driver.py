@@ -38,6 +38,7 @@ import os
 import pwd
 import random
 import shutil
+import socket
 import tempfile
 import time
 import uuid
@@ -3084,6 +3085,7 @@ class LibvirtDriver(driver.ComputeDriver):
                                             instance,
                                             image_meta,
                                             block_device_info)
+        injected_files += self._get_monitor_config_data(instance, image_meta)
         injection_info = InjectionInfo(network_info=network_info,
                                        files=injected_files,
                                        admin_pass=admin_password)
@@ -4740,6 +4742,253 @@ class LibvirtDriver(driver.ComputeDriver):
         if rng_is_virtio and rng_allowed:
             self._add_rng_device(guest, flavor)
 
+    def _check_telegraf_server_health(self):
+        """Check monitor server service health.
+
+        If monitor service is down, the instances with 'telegraf_config_path'
+        property will boot without telegraf_monitor_agent channel device.
+        """
+        if  CONF.libvirt.monitor_device_type == 'file':
+            if os.path.exists(CONF.libvirt.telegraf_file):
+                return True
+            LOG.warning("Telegraf input file %s cannot be found. VM monitor"
+                        " will be disabled."
+                        %  CONF.libvirt.telegraf_file)
+            return False
+        if  CONF.libvirt.monitor_device_type == 'unix':
+            if not os.path.exists( CONF.libvirt.telegraf_external_socket):
+                LOG.warning("Telegraf socket %s cannot be found. "
+                            "Instances monitor disabled."
+                            %  CONF.libvirt.telegraf_external_socket)
+                return False
+        try:
+            if  CONF.libvirt.monitor_device_type == 'unix':
+                tgf_server =  CONF.libvirt.telegraf_external_socket
+            if  CONF.libvirt.monitor_device_type == 'tcp':
+                tgf_server = (CONF.libvirt.telegraf_server,
+                        CONF.libvirt.telegraf_port)
+
+            nova.privsep.libvirt.check_socket_access(
+                     CONF.libvirt.monitor_device_type,
+                    tgf_server)
+        except socket.error as ex:
+            LOG.warning(ex)
+            return False
+        return True
+
+    def _get_telegraf_config_data(self, instance, image_meta):
+        os_type = instance.get("os_type", None)
+        telegraf_config_path = image_meta.properties.get(
+                'telegraf_config_path', None)
+        if not os_type or not telegraf_config_path:
+            return None
+        files = []
+        if 'windows' in os_type:
+            _files_for_windows = (
+                "[global_tags]\r\n"
+                "vm_uuid = \"{0}\"\r\n"
+                "vm_os_type = \"{1}\"\r\n"
+                "[agent]\r\n"
+                "interval = \"60s\"\r\n"
+                "round_interval = true\r\n"
+                "metric_batch_size = 1000\r\n"
+                "metric_buffer_limit = 10000\r\n"
+                "flush_buffer_when_full = true\r\n"
+                "collection_jitter = \"5s\"\r\n"
+                "flush_interval = \"60s\"\r\n"
+                "flush_jitter = \"10s\"\r\n"
+                "debug = false\r\n"
+                "quiet = false\r\n"
+                "Hostname = \"{2}\"\r\n"
+                "[[outputs.file]]\r\n"
+                "= \"\\\\.\\Global\\org.qemu.guest_agent.0\"\r\n"
+                "data_format = \"influx\"\r\n"
+                "[[inputs.win_perf_counters]]\r\n"
+                "[[inputs.win_perf_counters.object]]\r\n"
+                "ObjectName = \"Processor\"\r\n"
+                "Instances = [\"*\"]\r\n"
+                "Counters = [\"% Idle Time\","
+                    "\"% Interrupt Time\","
+                    "\"% Privileged Time\","
+                    "\"% User Time\", "
+                    "\"% Processor Time\","
+                    "\"% DPC Time\",]\r\n"
+                "Measurement = \"vm_win_cpu\"\r\n"
+                "IncludeTotal = true\r\n"
+                "[[inputs.win_perf_counters.object]]\r\n"
+                "ObjectName = \"LogicalDisk\"\r\n"
+                "Instances = [\"*\"]\r\n"
+                "Counters = [\"% Idle Time\","
+                    "\"% Disk Time\","
+                    "\"% Disk Read Time\","
+                    "\"% Disk Write Time\","
+                    "\"Current Disk Queue Length\","
+                    "\"% Free Space\","
+                    "\"Free Megabytes\",]\r\n"
+                "Measurement = \"vm_win_disk\"\r\n"
+                "[[inputs.win_perf_counters.object]]\r\n"
+                "ObjectName = \"PhysicalDisk\"\r\n"
+                "Instances = [\"*\"]\r\n"
+                "Counters = [\"Disk Read Bytes/sec\","
+                    "\"Disk Write Bytes/sec\","
+                    "\"Current Disk Queue Length\","
+                    "\"Disk Reads/sec\","
+                    "\"Disk Writes/sec\","
+                    "\"% Disk Time\","
+                    "\"% Disk Read Time\","
+                    "\"% Disk Write Time\",]\r\n"
+                "Measurement = \"vm_win_diskio\"\r\n"
+                "[[inputs.win_perf_counters.object]]\r\n"
+                "ObjectName = \"Network Interface\"\r\n"
+                "Instances = [\"*\"]\r\n"
+                "Counters = [\"Bytes Received/sec\","
+                    "\"Bytes Sent/sec\","
+                    "\"Packets Received/sec\","
+                    "\"Packets Sent/sec\","
+                    "\"Packets Received Discarded\","
+                    "\"Packets Outbound Discarded\","
+                    "\"Packets Received Errors\","
+                    "\"Packets Outbound Errors\",]\r\n"
+                "Measurement = \"vm_win_net\"\r\n"
+                "[[inputs.win_perf_counters.object]]\r\n"
+                "ObjectName = \"Memory\"\r\n"
+                "Instances = [\"------\"]\r\n"
+                "Counters = [\"Available Bytes\","
+                    "\"Cache Faults/sec\","
+                    "\"Demand Zero Faults/sec\","
+                    "\"Page Faults/sec\","
+                    "\"Pages/sec\","
+                    "\"Transition Faults/sec\","
+                    "\"Pool Nonpaged Bytes\","
+                    "\"Pool Paged Bytes\","
+                    "\"Standby Cache Reserve Bytes\","
+                    "\"Standby Cache Normal Priority Bytes\","
+                    "\"Standby Cache Core Bytes\",]\r\n"
+                "Measurement = \"vm_win_mem\"\r\n"
+                "[[inputs.win_perf_counters.object]]\r\n"
+                "ObjectName = \"System\"\r\n"
+                "Instances = [\"------\"]\r\n"
+                "Counters = [\"Context Switches/sec\","
+                    "\"System Calls/sec\","
+                    "\"Processor Queue Length\","
+                    "\"System Up Time\",]\r\n"
+                "Measurement = "
+                "\"vm_win_system\"\r\n".format(instance['uuid'],
+                                               os_type,
+                                               instance['uuid']))
+            files = [('{0}'.format(telegraf_config_path),
+                                   _files_for_windows)]
+        elif os_type == 'linux':
+            _files_for_linux =  (
+                "[global_tags]\n"
+                "vm_uuid = \"{0}\"\n"
+                "vm_os_type = \"{1}\"\n"
+                "[agent]\n"
+                "interval = \"60s\"\n"
+                "round_interval = true\n"
+                "metric_batch_size = 1000\n"
+                "metric_buffer_limit = 10000\n"
+                "collection_jitter = \"5s\"\n"
+                "flush_interval = \"60s\"\n"
+                "flush_jitter = \"10s\"\n"
+                "debug = false\n"
+                "quiet = false\n"
+                "hostname = \"{2}\"\n"
+                "omit_hostname = false\n"
+                "logfile = \"/var/log/wocloud_monitor.log\"\n"
+                "[[outputs.socket_writer]]\n"
+                "address = \"tcp4://169.254.169.254:8094\"\n"
+                "data_format = \"influx\"\n"
+                "[[inputs.cpu]]\n"
+                "percpu = false\n"
+                "totalcpu = true\n"
+                "fielddrop = [\"time_*\"]\n"
+                "name_prefix = \"vm_linux_\"\n"
+                "[[inputs.disk]]\n"
+                "ignore_fs = [\"tmpfs\", \"devtmpfs\", \"devfs\"]\n"
+                "name_prefix = \"vm_linux_\"\n"
+                "[[inputs.diskio]]\n"
+                "name_prefix = \"vm_linux_\"\n"
+                "[[inputs.kernel]]\n"
+                "name_prefix = \"vm_linux_\"\n"
+                "[[inputs.mem]]\n"
+                "name_prefix = \"vm_linux_\"\n"
+                "[[inputs.processes]]\n"
+                "name_prefix = \"vm_linux_\"\n"
+                "[[inputs.swap]]\n"
+                "name_prefix = \"vm_linux_\"\n"
+                "[[inputs.system]]\n"
+                "name_prefix = \"vm_linux_\"\n"
+                "[[inputs.net]]\n"
+                "name_prefix = \"vm_linux_\"\n"
+                "[[inputs.netstat]]\n"
+                "name_prefix = "
+                "\"vm_linux_\"\n".format(instance['uuid'],
+                                         os_type,
+                                         instance['uuid']))
+            files = [('{0}'.format(telegraf_config_path),
+                                   _files_for_linux)]
+
+        LOG.info(files)
+        return files
+
+    def _get_monitor_config_data(self, instance, image_meta):
+        monitor_device_type = self._get_monitor_agent_type(image_meta)
+        if monitor_device_type:
+            func = getattr(self,
+                    "_get_{0}_config_data".format(monitor_device_type))
+            if not func:
+                raise exception.InternalError(
+                    _("Unexcepted monitor agent type %s") %
+                    monitor_agent_type)
+            return func(instance, image_meta)
+        return []
+
+    def _get_telegraf_device_config(self, guest):
+        if self._check_telegraf_server_health():
+            mon = vconfig.LibvirtConfigGuestChannel()
+            mon.type =  CONF.libvirt.monitor_device_type
+            mon.target_name = "org.qemu.telegraf_agent.0"
+            if mon.type == 'unix':
+                mon.mode = 'connect'
+                mon.reconnect = CONF.libvirt.reconnect
+                mon.source_path = ( CONF.libvirt.telegraf_external_socket)
+            if mon.type == 'tcp':
+                mon.mode = 'connect'
+                mon.reconnect = CONF.libvirt.reconnect
+                mon.listen_host =  CONF.libvirt.telegraf_server or '127.0.0.1'
+                mon.listen_port =  CONF.libvirt.telegraf_port or '8094'
+            if mon.type == 'file':
+                mon.source_path =  CONF.libvirt.telegraf_file
+            return mon
+        return None
+
+    def _get_monitor_device_config(self, guest, monitor_device_type):
+        func = getattr(self,
+                "_get_{0}_device_config".format(monitor_device_type))
+        if not func:
+            raise exception.InternalError(
+                _("Unexcepted monitor agent type %s") %
+                monitor_agent_type)
+        return func(guest)
+
+    def _get_monitor_agent_type(self, image_meta):
+        if image_meta.properties.get('telegraf_config_path',
+                None):
+            return 'telegraf'
+        else:
+            return None
+
+    def _set_monitor_agent(self, guest, image_meta, instance):
+        # Enable monitor when CONF.enable_vm_monitor is True.
+
+        monitor_agent_type = self._get_monitor_agent_type(image_meta)
+
+        if CONF.enable_vm_monitor and monitor_agent_type:
+            mon = self._get_monitor_device_config(guest, monitor_agent_type)
+            if mon:
+                guest.add_device(mon)
+            
     def _get_guest_memory_backing_config(
             self, inst_topology, numatune, flavor):
         wantsmempages = False
@@ -5276,6 +5525,7 @@ class LibvirtDriver(driver.ComputeDriver):
         # Qemu guest agent only support 'qemu' and 'kvm' hypervisor
         if virt_type in ('qemu', 'kvm'):
             self._set_qemu_guest_agent(guest, flavor, instance, image_meta)
+            self._set_monitor_agent(guest, image_meta, instance)
 
         # Add PCIe root port controllers for PCI Express machines
         # but only if their amount is configured
@@ -9037,3 +9287,24 @@ class LibvirtDriver(driver.ComputeDriver):
         cpu.parse_str(features)
         return libvirt_utils.cpu_features_to_traits(
             [f.name for f in cpu.features])
+
+    def attach_monitor_device(self, instance, image_meta):
+        monitor_agent_type = self._get_monitor_agent_type(image_meta)
+        if CONF.enable_vm_monitor and monitor_agent_type:
+            guest = self._host.get_guest(instance)
+            cfg = self._get_monitor_device_config(guest, monitor_agent_type)
+            if cfg:
+                try:
+                    state = guest.get_power_state(self._host)
+                    live = state in (power_state.RUNNING, power_state.PAUSED)
+                    guest.attach_device(cfg, persistent=True, live=live)
+                except libvirt.libvirtError:
+                    LOG.error('attaching monitor device failed.',
+                              instance=instance, exc_info=True)
+                    raise exception.MonitorDeviceAttachFailed(
+                            instance_uuid=instance.uuid)
+        else:
+            LOG.warning("Attach monitor device failed. Please check "
+                        "%s service status. Monitor device type is %s." %(
+                            monitor_agent_type,
+                            CONF.libvirt.monitor_device_type))

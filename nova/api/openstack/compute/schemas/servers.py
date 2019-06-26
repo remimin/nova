@@ -501,6 +501,17 @@ trigger_crash_dump = {
     'additionalProperties': False
 }
 
+attach_monitor_device = {
+    'type': 'object',
+    'properties': {
+        'attach_monitor_device': {
+            'type': 'null'
+        }
+    },
+    'required': ['attach_monitor_device'],
+    'additionalProperties': False
+}
+
 
 JOINED_TABLE_QUERY_PARAMS_SERVERS = {
     'block_device_mapping': parameter_types.common_query_param,

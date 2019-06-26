@@ -1154,6 +1154,27 @@ class ServersController(wsgi.Controller):
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                 'trigger_crash_dump', id)
 
+    @wsgi.response(202)
+    @wsgi.expected_errors((404, 409))
+    @wsgi.action('attach_monitor_device')
+    @validation.schema(schema_servers.attach_monitor_device)
+    def _action_attach_monitor_device(self, req, id, body):
+        """Enable instance monitor device"""
+        context = req.environ['nova.context']
+        instance = self._get_instance(context, id)
+        context.can(server_policies.SERVERS % 'attach_monitor_device',
+                    target={'user_id': instance.user_id,
+                            'project_id': instance.project_id})
+        try:
+            self.compute_api.attach_monitor_device(context, instance)
+        except (exception.InstanceNotReady, exception.InstanceIsLocked) as e:
+            raise webob.exc.HTTPConflict(explanation=e.format_message())
+        except exception.InstanceUnknownCell as e:
+            raise exc.HTTPNotFound(explanation=e.format_message())
+        except exception.InstanceInvalidState as state_error:
+            common.raise_http_conflict_for_instance_invalid_state(state_error,
+                'attach_monitor_device', id)
+
 
 def remove_invalid_options(context, search_options, allowed_search_options):
     """Remove search options that are not valid for non-admin API/context."""

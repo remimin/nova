@@ -1243,6 +1243,50 @@ maximum number of retry attempts that can be made to discover the NVMe device.
 """),
 ]
 
+libvirt_monitor_opts = [
+    cfg.StrOpt('monitor_device_type',
+        default='unix',
+        choices=('unix', 'tcp', 'file'),
+        help='Monitor agent socket type.'),
+    cfg.StrOpt('telegraf_external_socket',
+        default='/var/lib/libvirt/qemu/telegraf.sock',
+        help="""
+Monitor input unix socket path.
+
+Related values:
+
+* [DEFAULT]/enable_vm_monitor
+* monitor_agent_type
+
+This option only work with enable_vm_monitor=True and
+monitor_device_type='unix'.
+"""),
+    cfg.StrOpt('telegraf_server',
+        default='127.0.0.1',
+        help="""
+The host which monitor service running on.
+
+Related values:
+
+* [DEFAULT]/enable_vm_monitor
+* monitor_device_type
+* telegraf_port
+
+This option only work with enable_vm_monitor=True and
+monitor_device_type='tcp'. telegraf_port set monitor service
+listen port.
+"""),
+    cfg.PortOpt('telegraf_port',
+        default=None,
+        help='Monitor service listen port'),
+    cfg.StrOpt('telegraf_file',
+        default='/tmp/vm_metrics',
+        help='Monitor input file path.'),
+    cfg.IntOpt('reconnect',
+        default=5,
+        help='Qemu monitor socket reconnect interval secondes.'),
+]
+
 ALL_OPTS = list(itertools.chain(
     libvirt_general_opts,
     libvirt_imagebackend_opts,
@@ -1262,6 +1306,7 @@ ALL_OPTS = list(itertools.chain(
     libvirt_volume_vzstorage_opts,
     libvirt_virtio_queue_sizes,
     libvirt_volume_nvmeof_opts,
+    libvirt_monitor_opts,
 ))
 
 

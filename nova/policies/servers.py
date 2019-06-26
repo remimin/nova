@@ -312,6 +312,16 @@ will be changed to default to ``rule:admin_api`` in a subsequent release.
                 'path': '/servers/{server_id}/action (trigger_crash_dump)'
             }
         ]),
+    policy.DocumentedRuleDefault(
+        SERVERS % 'attach_monitor_device',
+        RULE_AOO,
+        "Attach monitor device in a server.",
+        [
+            {
+                'method': 'POST',
+                'path': '/servers/{server_id}/action (attach_monitor_device)'
+            }
+        ]),
 ]
 
 

@@ -1090,3 +1090,9 @@ class ComputeAPI(object):
         cctxt = client.prepare(server=_compute_host(None, instance),
                 version=version)
         return cctxt.cast(ctxt, "trigger_crash_dump", instance=instance)
+
+    def attach_monitor_device(self, ctxt, instance):
+        version = '5.0'
+        cctxt = self.router.client(ctxt).prepare(
+                server=_compute_host(None, instance), version=version)
+        cctxt.cast(ctxt, 'attach_monitor_device', instance=instance)
