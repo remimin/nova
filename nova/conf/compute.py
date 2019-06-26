@@ -1201,6 +1201,15 @@ Possible values:
 """),
 ]
 
+monitor_opts = [
+    cfg.BoolOpt('enable_vm_monitor',
+        default=True,
+        help="""
+Virtual machine monitor metrics are collected by monitor service.
+Monitor agent must be running in vm.
+"""),
+]
+
 
 ALL_OPTS = (compute_opts +
             resource_tracker_opts +
@@ -1210,7 +1219,8 @@ ALL_OPTS = (compute_opts +
             timeout_opts +
             running_deleted_opts +
             instance_cleaning_opts +
-            db_opts)
+            db_opts +
+            monitor_opts)
 
 
 def register_opts(conf):

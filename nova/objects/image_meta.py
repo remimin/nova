@@ -170,12 +170,15 @@ class ImageMetaProps(base.NovaObject):
     # Version 1.18: Pull signature properties from cursive library
     # Version 1.19: Added 'img_hide_hypervisor_id' type field
     # Version 1.20: Added 'traits_required' list field
-    VERSION = '1.20'
+    # Version 1.21: Added 'telegraf_config_path' field
+    VERSION = '1.21'
 
     def obj_make_compatible(self, primitive, target_version):
         super(ImageMetaProps, self).obj_make_compatible(primitive,
                                                         target_version)
         target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (1, 21):
+            primitive.pop('telegraf_config_path', None)
         if target_version < (1, 20):
             primitive.pop('traits_required', None)
         if target_version < (1, 19):
@@ -469,6 +472,10 @@ class ImageMetaProps(base.NovaObject):
         # for trait in image_meta.traits_required:
         # will yield trait strings such as 'HW_CPU_X86_AVX2'
         'traits_required': fields.ListOfStringsField(),
+
+        # telgeraf config path in instance OS.
+        'telegraf_config_path': fields.StringField()
+
     }
 
     # The keys are the legacy property names and

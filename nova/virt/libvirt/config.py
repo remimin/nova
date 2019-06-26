@@ -1829,6 +1829,8 @@ class LibvirtConfigGuestCharBase(LibvirtConfigGuestDevice):
         self.listen_port = None
         self.listen_host = None
         self.log = None
+        self.mode = None
+        self.reconnect = None
 
     def format_dom(self):
         dev = super(LibvirtConfigGuestCharBase, self).format_dom()
@@ -1838,13 +1840,22 @@ class LibvirtConfigGuestCharBase(LibvirtConfigGuestDevice):
         if self.type == "file":
             dev.append(etree.Element("source", path=self.source_path))
         elif self.type == "unix":
-            dev.append(etree.Element("source", mode="bind",
-                                    path=self.source_path))
+            mode = self.mode or "bind"
+            source_elem = etree.Element("source", mode=mode,
+                                        path=self.source_path)
+            if self.reconnect:
+                source_elem.append(etree.Element("reconnect", enabled="yes",
+                                   timeout=str(self.reconnect)))
+            dev.append(source_elem)
         elif self.type == "tcp":
-            dev.append(etree.Element("source", mode="bind",
-                                     host=self.listen_host,
-                                     service=str(self.listen_port)))
-
+            mode = self.mode or "bind"
+            source_elem = etree.Element("source", mode=mode,
+                                        host=self.listen_host,
+                                        service=str(self.listen_port))
+            if self.reconnect:
+                source_elem.append(etree.Element("reconnect", enabled="yes",
+                                   timeout=str(self.reconnect)))
+            dev.append(source_elem)
         if self.log:
             dev.append(self.log.format_dom())
 
