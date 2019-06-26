@@ -1,4 +1,4 @@
-# Copyright (c) 2013 Hewlett-Packard Development Company, L.P.
+# Copyright (c) 2019 Red Hat, Inc.
 # All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -13,12 +13,4 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import eventlet
-
-from nova import debugger
-
-if debugger.enabled():
-    # turn off thread patching to enable the remote debugger
-    eventlet.monkey_patch(os=False, thread=False)
-else:
-    eventlet.monkey_patch(os=False)
+import nova.monkey_patch  # noqa

@@ -19,29 +19,33 @@
 Scheduler base class that all Schedulers should inherit from
 """
 
-from oslo_config import cfg
-from oslo_utils import importutils
+import abc
 
-from nova import db
-from nova.i18n import _
+import six
+
+from nova import objects
+from nova.scheduler import host_manager
 from nova import servicegroup
 
-scheduler_driver_opts = [
-    cfg.StrOpt('scheduler_host_manager',
-               default='nova.scheduler.host_manager.HostManager',
-               help='The scheduler host manager class to use'),
-    ]
 
-CONF = cfg.CONF
-CONF.register_opts(scheduler_driver_opts)
-
-
+@six.add_metaclass(abc.ABCMeta)
 class Scheduler(object):
     """The base class that all Scheduler classes should inherit from."""
 
+    # TODO(mriedem): We should remove this flag now so that all scheduler
+    # drivers, both in-tree and out-of-tree, must rely on placement for
+    # scheduling decisions. We're likely going to have more and more code
+    # over time that relies on the scheduler creating allocations and it
+    # will not be sustainable to try and keep compatibility code around for
+    # scheduler drivers that do not create allocations in Placement.
+    USES_ALLOCATION_CANDIDATES = True
+    """Indicates that the scheduler driver calls the Placement API for
+    allocation candidates and uses those allocation candidates in its
+    decision-making.
+    """
+
     def __init__(self):
-        self.host_manager = importutils.import_object(
-                CONF.scheduler_host_manager)
+        self.host_manager = host_manager.HostManager()
         self.servicegroup_api = servicegroup.API()
 
     def run_periodic_tasks(self, context):
@@ -51,16 +55,16 @@ class Scheduler(object):
     def hosts_up(self, context, topic):
         """Return the list of hosts that have a running service for topic."""
 
-        services = db.service_get_all_by_topic(context, topic)
-        return [service['host']
+        services = objects.ServiceList.get_by_topic(context, topic)
+        return [service.host
                 for service in services
                 if self.servicegroup_api.service_is_up(service)]
 
-    def select_destinations(self, context, request_spec, filter_properties):
-        """Must override select_destinations method.
-
-        :return: A list of dicts with 'host', 'nodename' and 'limits' as keys
-            that satisfies the request_spec and filter_properties.
+    @abc.abstractmethod
+    def select_destinations(self, context, spec_obj, instance_uuids,
+            alloc_reqs_by_rp_uuid, provider_summaries,
+            allocation_request_version=None, return_alternates=False):
+        """Returns a list of lists of Selection objects that have been chosen
+        by the scheduler driver, one for each requested instance.
         """
-        msg = _("Driver must implement select_destinations")
-        raise NotImplementedError(msg)
+        return []

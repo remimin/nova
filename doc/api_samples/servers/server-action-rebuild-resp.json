@@ -1,7 +1,8 @@
 {
     "server": {
         "accessIPv4": "1.2.3.4",
-        "accessIPv6": "fe80::100",
+        "accessIPv6": "80fe::",
+        "OS-DCF:diskConfig": "AUTO",
         "addresses": {
             "private": [
                 {
@@ -11,45 +12,45 @@
             ]
         },
         "adminPass": "seekr3t",
-        "created": "2012-09-12T17:20:36Z",
+        "created": "2013-11-14T06:29:00Z",
         "flavor": {
             "id": "1",
             "links": [
                 {
-                    "href": "http://openstack.example.com/openstack/flavors/1",
+                    "href": "http://openstack.example.com/6f70656e737461636b20342065766572/flavors/1",
                     "rel": "bookmark"
                 }
             ]
         },
-        "hostId": "1e3da81662354c25560b7e5ea6d8123031f67168b6992f20bb84df69",
-        "id": "075e40fe-9f03-4652-ba8e-5f8e2547899a",
+        "hostId": "28d8d56f0e3a77e20891f455721cbb68032e017045e20aa5dfc6cb66",
+        "id": "a0a80a94-3d81-4a10-822a-daa0cf9e870b",
         "image": {
             "id": "70a599e0-31e7-49b7-b260-868f441e862b",
             "links": [
                 {
-                    "href": "http://openstack.example.com/openstack/images/70a599e0-31e7-49b7-b260-868f441e862b",
+                    "href": "http://openstack.example.com/6f70656e737461636b20342065766572/images/70a599e0-31e7-49b7-b260-868f441e862b",
                     "rel": "bookmark"
                 }
             ]
         },
         "links": [
             {
-                "href": "http://openstack.example.com/v2/openstack/servers/075e40fe-9f03-4652-ba8e-5f8e2547899a",
+                "href": "http://openstack.example.com/v2/6f70656e737461636b20342065766572/servers/a0a80a94-3d81-4a10-822a-daa0cf9e870b",
                 "rel": "self"
             },
             {
-                "href": "http://openstack.example.com/openstack/servers/075e40fe-9f03-4652-ba8e-5f8e2547899a",
+                "href": "http://openstack.example.com/6f70656e737461636b20342065766572/servers/a0a80a94-3d81-4a10-822a-daa0cf9e870b",
                 "rel": "bookmark"
             }
         ],
         "metadata": {
-            "meta var": "meta val"
+            "meta_var": "meta_val"
         },
         "name": "foobar",
         "progress": 0,
         "status": "ACTIVE",
-        "tenant_id": "openstack",
-        "updated": "2012-09-12T17:20:37Z",
+        "tenant_id": "6f70656e737461636b20342065766572",
+        "updated": "2013-11-14T06:29:02Z",
         "user_id": "fake"
     }
 }

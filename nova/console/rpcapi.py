@@ -16,25 +16,17 @@
 Client side of the console RPC API.
 """
 
-from oslo_config import cfg
 import oslo_messaging as messaging
 
+import nova.conf
+from nova import profiler
 from nova import rpc
 
-rpcapi_opts = [
-    cfg.StrOpt('console_topic',
-               default='console',
-               help='The topic console proxy nodes listen on'),
-]
-
-CONF = cfg.CONF
-CONF.register_opts(rpcapi_opts)
-
-rpcapi_cap_opt = cfg.StrOpt('console',
-        help='Set a version cap for messages sent to console services')
-CONF.register_opt(rpcapi_cap_opt, 'upgrade_levels')
+CONF = nova.conf.CONF
+RPC_TOPIC = "console"
 
 
+@profiler.trace_cls("rpc")
 class ConsoleAPI(object):
     '''Client side of the console rpc API.
 
@@ -49,9 +41,11 @@ class ConsoleAPI(object):
 
         2.0 - Major API rev for Icehouse
 
-        ... Icehouse and Juno support message version 2.0.  So, any changes to
-        existing methods in 2.x after that point should be done such that they
-        can handle the version_cap being set to 2.0.
+        ... Icehouse, Juno, Kilo, Liberty, Mitaka, Newton, and Ocata support
+        message version 2.0. So, any changes to existing methods in 2.x after
+        that point should be done such that they can handle the version_cap
+        being set to 2.0.
+
     '''
 
     VERSION_ALIASES = {
@@ -59,11 +53,16 @@ class ConsoleAPI(object):
         'havana': '1.1',
         'icehouse': '2.0',
         'juno': '2.0',
+        'kilo': '2.0',
+        'liberty': '2.0',
+        'mitaka': '2.0',
+        'newton': '2.0',
+        'ocata': '2.0',
     }
 
     def __init__(self, topic=None, server=None):
         super(ConsoleAPI, self).__init__()
-        topic = topic if topic else CONF.console_topic
+        topic = topic if topic else RPC_TOPIC
         target = messaging.Target(topic=topic, server=server, version='2.0')
         version_cap = self.VERSION_ALIASES.get(CONF.upgrade_levels.console,
                                                CONF.upgrade_levels.console)

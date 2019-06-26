@@ -12,9 +12,9 @@
 
 """Tests for expectations of behaviour from the Xen driver."""
 
-from oslo_config import cfg
-from oslo_utils import importutils
+import mock
 
+from nova.compute import manager
 from nova.compute import power_state
 from nova import context
 from nova import objects
@@ -24,21 +24,17 @@ from nova.tests.unit import fake_instance
 from nova.tests.unit.virt.xenapi import stubs
 from nova.virt.xenapi import vm_utils
 
-CONF = cfg.CONF
-CONF.import_opt('compute_manager', 'nova.service')
-CONF.import_opt('compute_driver', 'nova.virt.driver')
-
 
 class ComputeXenTestCase(stubs.XenAPITestBaseNoDB):
     def setUp(self):
         super(ComputeXenTestCase, self).setUp()
         self.flags(compute_driver='xenapi.XenAPIDriver')
-        self.flags(connection_url='test_url',
+        self.flags(connection_url='http://localhost',
                    connection_password='test_pass',
                    group='xenserver')
 
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
-        self.compute = importutils.import_object(CONF.compute_manager)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
+        self.compute = manager.ComputeManager()
         # execute power syncing synchronously for testing:
         self.compute._sync_power_pool = eventlet_utils.SyncPool()
 
@@ -49,20 +45,27 @@ class ComputeXenTestCase(stubs.XenAPITestBaseNoDB):
                 objects.InstanceList(), [db_instance], None)
         instance = instance_list[0]
 
-        self.mox.StubOutWithMock(objects.InstanceList, 'get_by_host')
-        self.mox.StubOutWithMock(self.compute.driver, 'get_num_instances')
-        self.mox.StubOutWithMock(vm_utils, 'lookup')
-        self.mox.StubOutWithMock(self.compute, '_sync_instance_power_state')
+        @mock.patch.object(vm_utils, 'lookup')
+        @mock.patch.object(objects.InstanceList, 'get_by_host')
+        @mock.patch.object(self.compute.driver, 'get_num_instances')
+        @mock.patch.object(self.compute, '_sync_instance_power_state')
+        def do_test(mock_compute_sync_powerstate,
+              mock_compute_get_num_instances,
+              mock_instance_list_get_by_host,
+              mock_vm_utils_lookup):
+            mock_instance_list_get_by_host.return_value = instance_list
+            mock_compute_get_num_instances.return_value = 1
+            mock_vm_utils_lookup.return_value = None
 
-        objects.InstanceList.get_by_host(ctxt,
-                self.compute.host, expected_attrs=[],
-                use_slave=True).AndReturn(instance_list)
-        self.compute.driver.get_num_instances().AndReturn(1)
-        vm_utils.lookup(self.compute.driver._session, instance['name'],
-                False).AndReturn(None)
-        self.compute._sync_instance_power_state(ctxt, instance,
-                power_state.NOSTATE)
+            self.compute._sync_power_states(ctxt)
 
-        self.mox.ReplayAll()
+            mock_instance_list_get_by_host.assert_called_once_with(
+               ctxt, self.compute.host, expected_attrs=[], use_slave=True)
+            mock_compute_get_num_instances.assert_called_once_with()
+            mock_compute_sync_powerstate.assert_called_once_with(
+               ctxt, instance, power_state.NOSTATE, use_slave=True)
+            mock_vm_utils_lookup.assert_called_once_with(
+               self.compute.driver._session, instance['name'],
+               False)
 
-        self.compute._sync_power_states(ctxt)
+        do_test()

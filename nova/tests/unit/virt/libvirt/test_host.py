@@ -14,21 +14,30 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import uuid
-
 import eventlet
 from eventlet import greenthread
 import mock
+from oslo_utils.fixture import uuidsentinel as uuids
+from oslo_utils import uuidutils
+import six
+import testtools
 
+from nova.compute import vm_states
 from nova import exception
 from nova import objects
+from nova.objects import fields as obj_fields
 from nova import test
 from nova.tests.unit.virt.libvirt import fakelibvirt
 from nova.virt import event
 from nova.virt.libvirt import config as vconfig
+from nova.virt.libvirt import driver as libvirt_driver
+from nova.virt.libvirt import guest as libvirt_guest
 from nova.virt.libvirt import host
 
-host.libvirt = fakelibvirt
+
+class StringMatcher(object):
+    def __eq__(self, other):
+        return isinstance(other, six.string_types)
 
 
 class FakeVirtDomain(object):
@@ -36,7 +45,7 @@ class FakeVirtDomain(object):
     def __init__(self, id=-1, name=None):
         self._id = id
         self._name = name
-        self._uuid = str(uuid.uuid4())
+        self._uuid = uuidutils.generate_uuid()
 
     def name(self):
         return self._name
@@ -56,6 +65,12 @@ class HostTestCase(test.NoDBTestCase):
         self.useFixture(fakelibvirt.FakeLibvirtFixture())
         self.host = host.Host("qemu:///system")
 
+    @mock.patch("nova.virt.libvirt.host.Host._init_events")
+    def test_repeat_initialization(self, mock_init_events):
+        for i in range(3):
+            self.host.initialize()
+        mock_init_events.assert_called_once_with()
+
     @mock.patch.object(fakelibvirt.virConnect, "registerCloseCallback")
     def test_close_callback(self, mock_close):
         self.close_callback = None
@@ -67,27 +82,6 @@ class HostTestCase(test.NoDBTestCase):
         # verify that the driver registers for the close callback
         self.host.get_connection()
         self.assertTrue(self.close_callback)
-
-    @mock.patch.object(fakelibvirt.virConnect, "registerCloseCallback")
-    def test_close_callback_bad_signature(self, mock_close):
-        '''Validates that a connection to libvirt exist,
-           even when registerCloseCallback method has a different
-           number of arguments in the libvirt python library.
-        '''
-        mock_close.side_effect = TypeError('dd')
-        connection = self.host.get_connection()
-        self.assertTrue(connection)
-
-    @mock.patch.object(fakelibvirt.virConnect, "registerCloseCallback")
-    def test_close_callback_not_defined(self, mock_close):
-        '''Validates that a connection to libvirt exist,
-           even when registerCloseCallback method missing from
-           the libvirt python library.
-        '''
-        mock_close.side_effect = AttributeError('dd')
-
-        connection = self.host.get_connection()
-        self.assertTrue(connection)
 
     @mock.patch.object(fakelibvirt.virConnect, "getLibVersion")
     def test_broken_connection(self, mock_ver):
@@ -115,7 +109,8 @@ class HostTestCase(test.NoDBTestCase):
         self.assertEqual(0, len(log_mock.method_calls),
                          'LOG should not be used in _connect_auth_cb.')
 
-    def test_event_dispatch(self):
+    @mock.patch.object(greenthread, 'spawn_after')
+    def test_event_dispatch(self, mock_spawn_after):
         # Validate that the libvirt self-pipe for forwarding
         # events between threads is working sanely
         def handler(event):
@@ -151,19 +146,25 @@ class HostTestCase(test.NoDBTestCase):
         hostimpl._queue_event(event4)
         hostimpl._dispatch_events()
 
-        want_events = [event1, event2, event3, event4]
+        want_events = [event1, event2, event3]
         self.assertEqual(want_events, got_events)
+
+        # STOPPED is delayed so it's handled separately
+        mock_spawn_after.assert_called_once_with(
+            hostimpl._lifecycle_delay, hostimpl._event_emit, event4)
 
     def test_event_lifecycle(self):
         got_events = []
 
         # Validate that libvirt events are correctly translated
         # to Nova events
-        def handler(event):
-            got_events.append(event)
+        def spawn_after(seconds, func, *args, **kwargs):
+            got_events.append(args[0])
+            return mock.Mock(spec=greenthread.GreenThread)
 
+        greenthread.spawn_after = mock.Mock(side_effect=spawn_after)
         hostimpl = host.Host("qemu:///system",
-                             lifecycle_event_handler=handler)
+                             lifecycle_event_handler=lambda e: None)
         conn = hostimpl.get_connection()
 
         hostimpl._init_events_pipe()
@@ -191,30 +192,63 @@ class HostTestCase(test.NoDBTestCase):
         self.assertEqual(got_events[0].transition,
                          event.EVENT_LIFECYCLE_STOPPED)
 
-    def test_event_emit_delayed_call_now(self):
-        got_events = []
+    def test_event_lifecycle_callback_suspended_postcopy(self):
+        """Tests the suspended lifecycle event with libvirt with post-copy"""
+        hostimpl = mock.MagicMock()
+        conn = mock.MagicMock()
+        fake_dom_xml = """
+                <domain type='kvm'>
+                  <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
+                </domain>
+            """
+        dom = fakelibvirt.Domain(conn, fake_dom_xml, running=True)
+        host.Host._event_lifecycle_callback(
+            conn, dom, fakelibvirt.VIR_DOMAIN_EVENT_SUSPENDED,
+            detail=fakelibvirt.VIR_DOMAIN_EVENT_SUSPENDED_POSTCOPY,
+            opaque=hostimpl)
+        expected_event = hostimpl._queue_event.call_args[0][0]
+        self.assertEqual(event.EVENT_LIFECYCLE_POSTCOPY_STARTED,
+                         expected_event.transition)
 
-        def handler(event):
-            got_events.append(event)
+    def test_event_lifecycle_callback_suspended_migrated(self):
+        """Tests the suspended lifecycle event with libvirt with migrated"""
+        hostimpl = mock.MagicMock()
+        conn = mock.MagicMock()
+        fake_dom_xml = """
+                <domain type='kvm'>
+                  <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
+                </domain>
+            """
+        dom = fakelibvirt.Domain(conn, fake_dom_xml, running=True)
+        # See https://libvirt.org/html/libvirt-libvirt-domain.html for values.
+        VIR_DOMAIN_EVENT_SUSPENDED_MIGRATED = 1
+        with mock.patch.object(host.libvirt,
+                               'VIR_DOMAIN_EVENT_SUSPENDED_MIGRATED', new=1,
+                               create=True):
+            host.Host._event_lifecycle_callback(
+                conn, dom, fakelibvirt.VIR_DOMAIN_EVENT_SUSPENDED,
+                detail=VIR_DOMAIN_EVENT_SUSPENDED_MIGRATED, opaque=hostimpl)
+        expected_event = hostimpl._queue_event.call_args[0][0]
+        # FIXME(mriedem): This should be EVENT_LIFECYCLE_MIGRATION_COMPLETED
+        # once bug 1788014 is fixed and we properly check job status for the
+        # VIR_DOMAIN_EVENT_SUSPENDED_MIGRATED case.
+        # self.assertEqual(event.EVENT_LIFECYCLE_MIGRATION_COMPLETED,
+        #                  expected_event.transition)
+        self.assertEqual(event.EVENT_LIFECYCLE_PAUSED,
+                         expected_event.transition)
 
-        hostimpl = host.Host("qemu:///system",
-                             lifecycle_event_handler=handler)
+    def test_event_emit_delayed_call_delayed(self):
         ev = event.LifecycleEvent(
             "cef19ce0-0ca2-11df-855d-b19fbce37686",
             event.EVENT_LIFECYCLE_STOPPED)
-        hostimpl._event_emit_delayed(ev)
-        self.assertEqual(1, len(got_events))
-        self.assertEqual(ev, got_events[0])
-
-    @mock.patch.object(greenthread, 'spawn_after')
-    def test_event_emit_delayed_call_delayed(self, spawn_after_mock):
-        hostimpl = host.Host("xen:///",
-                             lifecycle_event_handler=lambda e: None)
-        ev = event.LifecycleEvent(
-            "cef19ce0-0ca2-11df-855d-b19fbce37686",
-            event.EVENT_LIFECYCLE_STOPPED)
-        hostimpl._event_emit_delayed(ev)
-        spawn_after_mock.assert_called_once_with(15, hostimpl._event_emit, ev)
+        for uri in ("qemu:///system", "xen:///"):
+            spawn_after_mock = mock.Mock()
+            greenthread.spawn_after = spawn_after_mock
+            hostimpl = host.Host(uri,
+                                 lifecycle_event_handler=lambda e: None)
+            hostimpl._event_emit_delayed(ev)
+            spawn_after_mock.assert_called_once_with(
+                15, hostimpl._event_emit, ev)
 
     @mock.patch.object(greenthread, 'spawn_after')
     def test_event_emit_delayed_call_delayed_pending(self, spawn_after_mock):
@@ -304,77 +338,164 @@ class HostTestCase(test.NoDBTestCase):
         self.assertEqual(self.connect_calls, 1)
         self.assertEqual(self.register_calls, 1)
 
-    @mock.patch.object(fakelibvirt.virConnect, "lookupByID")
-    def test_get_domain_by_id(self, fake_lookup):
+    @mock.patch.object(host.Host, "_connect")
+    def test_conn_event(self, mock_conn):
+        handler = mock.MagicMock()
+        h = host.Host("qemu:///system", conn_event_handler=handler)
+
+        h.get_connection()
+        h._dispatch_conn_event()
+
+        handler.assert_called_once_with(True, None)
+
+    @mock.patch.object(host.Host, "_connect")
+    def test_conn_event_fail(self, mock_conn):
+        handler = mock.MagicMock()
+        h = host.Host("qemu:///system", conn_event_handler=handler)
+        mock_conn.side_effect = fakelibvirt.libvirtError('test')
+
+        self.assertRaises(exception.HypervisorUnavailable, h.get_connection)
+        h._dispatch_conn_event()
+
+        handler.assert_called_once_with(False, StringMatcher())
+
+        # Attempt to get a second connection, and assert that we don't add
+        # queue a second callback. Note that we can't call
+        # _dispatch_conn_event() and assert no additional call to the handler
+        # here as above. This is because we haven't added an event, so it would
+        # block. We mock the helper method which queues an event for callback
+        # instead.
+        with mock.patch.object(h, '_queue_conn_event_handler') as mock_queue:
+            self.assertRaises(exception.HypervisorUnavailable,
+                              h.get_connection)
+            mock_queue.assert_not_called()
+
+    @mock.patch.object(host.Host, "_test_connection")
+    @mock.patch.object(host.Host, "_connect")
+    def test_conn_event_up_down(self, mock_conn, mock_test_conn):
+        handler = mock.MagicMock()
+        h = host.Host("qemu:///system", conn_event_handler=handler)
+        mock_conn.side_effect = (mock.MagicMock(),
+                                 fakelibvirt.libvirtError('test'))
+        mock_test_conn.return_value = False
+
+        h.get_connection()
+        self.assertRaises(exception.HypervisorUnavailable, h.get_connection)
+        h._dispatch_conn_event()
+        h._dispatch_conn_event()
+
+        handler.assert_has_calls([
+            mock.call(True, None),
+            mock.call(False, StringMatcher())
+        ])
+
+    @mock.patch.object(host.Host, "_connect")
+    def test_conn_event_thread(self, mock_conn):
+        event = eventlet.event.Event()
+        h = host.Host("qemu:///system", conn_event_handler=event.send)
+        h.initialize()
+
+        h.get_connection()
+        event.wait()
+        # This test will timeout if it fails. Success is implicit in a
+        # timely return from wait(), indicating that the connection event
+        # handler was called.
+
+    @mock.patch.object(fakelibvirt.virConnect, "getLibVersion")
+    @mock.patch.object(fakelibvirt.virConnect, "getVersion")
+    @mock.patch.object(fakelibvirt.virConnect, "getType")
+    def test_has_min_version(self, fake_hv_type, fake_hv_ver, fake_lv_ver):
+        fake_lv_ver.return_value = 1002003
+        fake_hv_ver.return_value = 4005006
+        fake_hv_type.return_value = 'xyz'
+
+        lv_ver = (1, 2, 3)
+        hv_ver = (4, 5, 6)
+        hv_type = 'xyz'
+        self.assertTrue(self.host.has_min_version(lv_ver, hv_ver, hv_type))
+
+        self.assertFalse(self.host.has_min_version(lv_ver, hv_ver, 'abc'))
+        self.assertFalse(self.host.has_min_version(lv_ver, (4, 5, 7), hv_type))
+        self.assertFalse(self.host.has_min_version((1, 3, 3), hv_ver, hv_type))
+
+        self.assertTrue(self.host.has_min_version(lv_ver, hv_ver, None))
+        self.assertTrue(self.host.has_min_version(lv_ver, None, hv_type))
+        self.assertTrue(self.host.has_min_version(None, hv_ver, hv_type))
+
+    @mock.patch.object(fakelibvirt.virConnect, "getLibVersion")
+    @mock.patch.object(fakelibvirt.virConnect, "getVersion")
+    @mock.patch.object(fakelibvirt.virConnect, "getType")
+    def test_has_version(self, fake_hv_type, fake_hv_ver, fake_lv_ver):
+        fake_lv_ver.return_value = 1002003
+        fake_hv_ver.return_value = 4005006
+        fake_hv_type.return_value = 'xyz'
+
+        lv_ver = (1, 2, 3)
+        hv_ver = (4, 5, 6)
+        hv_type = 'xyz'
+        self.assertTrue(self.host.has_version(lv_ver, hv_ver, hv_type))
+
+        for lv_ver_ in [(1, 2, 2), (1, 2, 4)]:
+            self.assertFalse(self.host.has_version(lv_ver_, hv_ver, hv_type))
+        for hv_ver_ in [(4, 4, 6), (4, 6, 6)]:
+            self.assertFalse(self.host.has_version(lv_ver, hv_ver_, hv_type))
+        self.assertFalse(self.host.has_version(lv_ver, hv_ver, 'abc'))
+
+        self.assertTrue(self.host.has_version(lv_ver, hv_ver, None))
+        self.assertTrue(self.host.has_version(lv_ver, None, hv_type))
+        self.assertTrue(self.host.has_version(None, hv_ver, hv_type))
+
+    @mock.patch.object(fakelibvirt.virConnect, "lookupByUUIDString")
+    def test_get_domain(self, fake_lookup):
+        uuid = uuidutils.generate_uuid()
         dom = fakelibvirt.virDomain(self.host.get_connection(),
                                     "<domain id='7'/>")
-
+        instance = objects.Instance(id="124", uuid=uuid)
         fake_lookup.return_value = dom
 
-        self.assertEqual(dom, self.host._get_domain_by_id(7))
+        self.assertEqual(dom, self.host._get_domain(instance))
+        fake_lookup.assert_called_once_with(uuid)
 
-        fake_lookup.assert_called_once_with(7)
-
-    @mock.patch.object(fakelibvirt.virConnect, "lookupByID")
-    def test_get_domain_by_id_raises(self, fake_lookup):
-        fake_lookup.side_effect = fakelibvirt.make_libvirtError(
-            fakelibvirt.libvirtError,
-            'Domain not found: no domain with matching id 7',
-            error_code=fakelibvirt.VIR_ERR_NO_DOMAIN,
-            error_domain=fakelibvirt.VIR_FROM_QEMU)
-
-        self.assertRaises(exception.InstanceNotFound,
-                          self.host._get_domain_by_id,
-                          7)
-
-        fake_lookup.assert_called_once_with(7)
-
-    @mock.patch.object(fakelibvirt.virConnect, "lookupByName")
-    def test_get_domain_by_name(self, fake_lookup):
-        dom = fakelibvirt.virDomain(self.host.get_connection(),
-                                    "<domain id='7'/>")
-
-        fake_lookup.return_value = dom
-
-        self.assertEqual(dom, self.host._get_domain_by_name("wibble"))
-
-        fake_lookup.assert_called_once_with("wibble")
-
-    @mock.patch.object(fakelibvirt.virConnect, "lookupByName")
-    def test_get_domain_by_name_raises(self, fake_lookup):
+    @mock.patch.object(fakelibvirt.virConnect, "lookupByUUIDString")
+    def test_get_domain_raises(self, fake_lookup):
+        instance = objects.Instance(uuid=uuids.instance,
+                                    vm_state=vm_states.ACTIVE)
         fake_lookup.side_effect = fakelibvirt.make_libvirtError(
             fakelibvirt.libvirtError,
             'Domain not found: no domain with matching name',
             error_code=fakelibvirt.VIR_ERR_NO_DOMAIN,
             error_domain=fakelibvirt.VIR_FROM_QEMU)
 
-        self.assertRaises(exception.InstanceNotFound,
-                          self.host._get_domain_by_name,
-                          "wibble")
+        with testtools.ExpectedException(exception.InstanceNotFound):
+            self.host._get_domain(instance)
 
-        fake_lookup.assert_called_once_with("wibble")
+        fake_lookup.assert_called_once_with(uuids.instance)
 
-    @mock.patch.object(host.Host, "_get_domain_by_name")
-    def test_get_domain(self, fake_get_domain):
+    @mock.patch.object(fakelibvirt.virConnect, "lookupByUUIDString")
+    def test_get_guest(self, fake_lookup):
+        uuid = uuidutils.generate_uuid()
         dom = fakelibvirt.virDomain(self.host.get_connection(),
                                     "<domain id='7'/>")
 
-        fake_get_domain.return_value = dom
-        instance = objects.Instance(id="124")
+        fake_lookup.return_value = dom
+        instance = objects.Instance(id="124", uuid=uuid)
 
-        self.assertEqual(dom, self.host.get_domain(instance))
+        guest = self.host.get_guest(instance)
+        self.assertEqual(dom, guest._domain)
+        self.assertIsInstance(guest, libvirt_guest.Guest)
 
-        fake_get_domain.assert_called_once_with("instance-0000007c")
+        fake_lookup.assert_called_once_with(uuid)
 
     @mock.patch.object(fakelibvirt.Connection, "listAllDomains")
-    def test_list_instance_domains_fast(self, mock_list_all):
+    def test_list_instance_domains(self, mock_list_all):
+        vm0 = FakeVirtDomain(id=0, name="Domain-0")  # Xen dom-0
         vm1 = FakeVirtDomain(id=3, name="instance00000001")
         vm2 = FakeVirtDomain(id=17, name="instance00000002")
         vm3 = FakeVirtDomain(name="instance00000003")
         vm4 = FakeVirtDomain(name="instance00000004")
 
         def fake_list_all(flags):
-            vms = []
+            vms = [vm0]
             if flags & fakelibvirt.VIR_CONNECT_LIST_DOMAINS_ACTIVE:
                 vms.extend([vm1, vm2])
             if flags & fakelibvirt.VIR_CONNECT_LIST_DOMAINS_INACTIVE:
@@ -383,7 +504,7 @@ class HostTestCase(test.NoDBTestCase):
 
         mock_list_all.side_effect = fake_list_all
 
-        doms = self.host._list_instance_domains_fast()
+        doms = self.host.list_instance_domains()
 
         mock_list_all.assert_called_once_with(
             fakelibvirt.VIR_CONNECT_LIST_DOMAINS_ACTIVE)
@@ -393,11 +514,12 @@ class HostTestCase(test.NoDBTestCase):
         self.assertEqual(doms[0].name(), vm1.name())
         self.assertEqual(doms[1].name(), vm2.name())
 
-        doms = self.host._list_instance_domains_fast(only_running=False)
+        doms = self.host.list_instance_domains(only_running=False)
 
         mock_list_all.assert_called_once_with(
             fakelibvirt.VIR_CONNECT_LIST_DOMAINS_ACTIVE |
             fakelibvirt.VIR_CONNECT_LIST_DOMAINS_INACTIVE)
+        mock_list_all.reset_mock()
 
         self.assertEqual(len(doms), 4)
         self.assertEqual(doms[0].name(), vm1.name())
@@ -405,148 +527,28 @@ class HostTestCase(test.NoDBTestCase):
         self.assertEqual(doms[2].name(), vm3.name())
         self.assertEqual(doms[3].name(), vm4.name())
 
-    @mock.patch.object(fakelibvirt.Connection, "numOfDomains")
-    @mock.patch.object(fakelibvirt.Connection, "listDefinedDomains")
-    @mock.patch.object(fakelibvirt.Connection, "listDomainsID")
-    @mock.patch.object(host.Host, "_get_domain_by_name")
-    @mock.patch.object(host.Host, "_get_domain_by_id")
-    def test_list_instance_domains_slow(self,
-                                        mock_get_id, mock_get_name,
-                                        mock_list_ids, mock_list_names,
-                                        mock_num_ids):
-        vm1 = FakeVirtDomain(id=3, name="instance00000001")
-        vm2 = FakeVirtDomain(id=17, name="instance00000002")
-        vm3 = FakeVirtDomain(name="instance00000003")
-        vm4 = FakeVirtDomain(name="instance00000004")
-        vms = [vm1, vm2, vm3, vm4]
-
-        def fake_get_domain_by_id(id):
-            for vm in vms:
-                if vm.ID() == id:
-                    return vm
-            raise exception.InstanceNotFound(instance_id=id)
-
-        def fake_get_domain_by_name(name):
-            for vm in vms:
-                if vm.name() == name:
-                    return vm
-            raise exception.InstanceNotFound(instance_id=name)
-
-        def fake_list_ids():
-            # Include one ID that no longer exists
-            return [vm1.ID(), vm2.ID(), 666]
-
-        def fake_list_names():
-            # Include one name that no longer exists and
-            # one dup from running list to show race in
-            # transition from inactive -> running
-            return [vm1.name(), vm3.name(), vm4.name(), "fishfood"]
-
-        mock_get_id.side_effect = fake_get_domain_by_id
-        mock_get_name.side_effect = fake_get_domain_by_name
-        mock_list_ids.side_effect = fake_list_ids
-        mock_list_names.side_effect = fake_list_names
-        mock_num_ids.return_value = 2
-
-        doms = self.host._list_instance_domains_slow()
-
-        mock_list_ids.assert_called_once_with()
-        mock_num_ids.assert_called_once_with()
-        self.assertFalse(mock_list_names.called)
-        mock_list_ids.reset_mock()
-        mock_list_names.reset_mock()
-        mock_num_ids.reset_mock()
-
-        self.assertEqual(len(doms), 2)
-        self.assertEqual(doms[0].name(), vm1.name())
-        self.assertEqual(doms[1].name(), vm2.name())
-
-        doms = self.host._list_instance_domains_slow(only_running=False)
-
-        mock_list_ids.assert_called_once_with()
-        mock_num_ids.assert_called_once_with()
-        mock_list_names.assert_called_once_with()
-
-        self.assertEqual(len(doms), 4)
-        self.assertEqual(doms[0].name(), vm1.name())
-        self.assertEqual(doms[1].name(), vm2.name())
-        self.assertEqual(doms[2].name(), vm3.name())
-        self.assertEqual(doms[3].name(), vm4.name())
-
-    @mock.patch.object(fakelibvirt.Connection, "listAllDomains")
-    @mock.patch.object(fakelibvirt.Connection, "numOfDomains")
-    @mock.patch.object(fakelibvirt.Connection, "listDomainsID")
-    @mock.patch.object(host.Host, "_get_domain_by_id")
-    def test_list_instance_domains_fallback(self,
-                                            mock_get_id, mock_list_ids,
-                                            mock_num_ids, mock_list_all):
-        vm1 = FakeVirtDomain(id=3, name="instance00000001")
-        vm2 = FakeVirtDomain(id=17, name="instance00000002")
-        vms = [vm1, vm2]
-
-        def fake_get_domain_by_id(id):
-            for vm in vms:
-                if vm.ID() == id:
-                    return vm
-            raise exception.InstanceNotFound(instance_id=id)
-
-        def fake_list_doms():
-            return [vm1.ID(), vm2.ID()]
-
-        def fake_list_all(flags):
-            ex = fakelibvirt.make_libvirtError(
-                fakelibvirt.libvirtError,
-                "API is not supported",
-                error_code=fakelibvirt.VIR_ERR_NO_SUPPORT)
-            raise ex
-
-        mock_get_id.side_effect = fake_get_domain_by_id
-        mock_list_ids.side_effect = fake_list_doms
-        mock_num_ids.return_value = 2
-        mock_list_all.side_effect = fake_list_all
-
-        doms = self.host.list_instance_domains()
+        doms = self.host.list_instance_domains(only_guests=False)
 
         mock_list_all.assert_called_once_with(
             fakelibvirt.VIR_CONNECT_LIST_DOMAINS_ACTIVE)
-        mock_list_ids.assert_called_once_with()
-        mock_num_ids.assert_called_once_with()
+        mock_list_all.reset_mock()
 
-        self.assertEqual(len(doms), 2)
-        self.assertEqual(doms[0].ID(), vm1.ID())
-        self.assertEqual(doms[1].ID(), vm2.ID())
-
-    @mock.patch.object(host.Host, "_list_instance_domains_fast")
-    def test_list_instance_domains_filtering(self, mock_list):
-        vm0 = FakeVirtDomain(id=0, name="Domain-0")  # Xen dom-0
-        vm1 = FakeVirtDomain(id=3, name="instance00000001")
-        vm2 = FakeVirtDomain(id=17, name="instance00000002")
-        vm3 = FakeVirtDomain(name="instance00000003")
-        vm4 = FakeVirtDomain(name="instance00000004")
-
-        mock_list.return_value = [vm0, vm1, vm2]
-        doms = self.host.list_instance_domains()
-        self.assertEqual(len(doms), 2)
-        self.assertEqual(doms[0].name(), vm1.name())
-        self.assertEqual(doms[1].name(), vm2.name())
-        mock_list.assert_called_with(True)
-
-        mock_list.return_value = [vm0, vm1, vm2, vm3, vm4]
-        doms = self.host.list_instance_domains(only_running=False)
-        self.assertEqual(len(doms), 4)
-        self.assertEqual(doms[0].name(), vm1.name())
-        self.assertEqual(doms[1].name(), vm2.name())
-        self.assertEqual(doms[2].name(), vm3.name())
-        self.assertEqual(doms[3].name(), vm4.name())
-        mock_list.assert_called_with(False)
-
-        mock_list.return_value = [vm0, vm1, vm2]
-        doms = self.host.list_instance_domains(only_guests=False)
         self.assertEqual(len(doms), 3)
         self.assertEqual(doms[0].name(), vm0.name())
         self.assertEqual(doms[1].name(), vm1.name())
         self.assertEqual(doms[2].name(), vm2.name())
-        mock_list.assert_called_with(True)
+
+    @mock.patch.object(host.Host, "list_instance_domains")
+    def test_list_guests(self, mock_list_domains):
+        dom0 = mock.Mock(spec=fakelibvirt.virDomain)
+        dom1 = mock.Mock(spec=fakelibvirt.virDomain)
+        mock_list_domains.return_value = [
+            dom0, dom1]
+        result = self.host.list_guests(True, False)
+        mock_list_domains.assert_called_once_with(
+            only_running=True, only_guests=False)
+        self.assertEqual(dom0, result[0]._domain)
+        self.assertEqual(dom1, result[1]._domain)
 
     def test_cpu_features_bug_1217630(self):
         self.host.get_connection()
@@ -614,12 +616,69 @@ class HostTestCase(test.NoDBTestCase):
             self.assertRaises(fakelibvirt.libvirtError,
                               self.host.get_capabilities)
 
-    def test_lxc_get_host_capabilities_failed(self):
-        with mock.patch.object(fakelibvirt.virConnect, 'baselineCPU',
-                               return_value=-1):
+    def test_get_capabilities_no_host_cpu_model(self):
+        """Tests that cpu features are not retrieved when the host cpu model
+        is not in the capabilities.
+        """
+        fake_caps_xml = '''
+<capabilities>
+  <host>
+    <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
+    <cpu>
+      <arch>x86_64</arch>
+      <vendor>Intel</vendor>
+    </cpu>
+  </host>
+</capabilities>'''
+        with mock.patch.object(fakelibvirt.virConnect, 'getCapabilities',
+                               return_value=fake_caps_xml):
             caps = self.host.get_capabilities()
             self.assertEqual(vconfig.LibvirtConfigCaps, type(caps))
-            self.assertNotIn('aes', [x.name for x in caps.host.cpu.features])
+            self.assertIsNone(caps.host.cpu.model)
+            self.assertEqual(0, len(caps.host.cpu.features))
+
+    def _test_get_domain_capabilities(self):
+        caps = self.host.get_domain_capabilities()
+        self.assertIn('x86_64', caps.keys())
+        self.assertEqual(['q35'], list(caps['x86_64']))
+        return caps['x86_64']['q35']
+
+    def test_get_domain_capabilities(self):
+        caps = self._test_get_domain_capabilities()
+        self.assertEqual(vconfig.LibvirtConfigDomainCaps, type(caps))
+        # There is a <gic supported='no'/> feature in the fixture but
+        # we don't parse that because nothing currently cares about it.
+        self.assertEqual(0, len(caps.features))
+
+    @mock.patch.object(fakelibvirt.virConnect, '_domain_capability_features',
+                       new='')
+    def test_get_domain_capabilities_no_features(self):
+        caps = self._test_get_domain_capabilities()
+        self.assertEqual(vconfig.LibvirtConfigDomainCaps, type(caps))
+        features = caps.features
+        self.assertEqual([], features)
+
+    def _test_get_domain_capabilities_sev(self, supported):
+        caps = self._test_get_domain_capabilities()
+        self.assertEqual(vconfig.LibvirtConfigDomainCaps, type(caps))
+        features = caps.features
+        self.assertEqual(1, len(features))
+        sev = features[0]
+        self.assertEqual(vconfig.LibvirtConfigDomainCapsFeatureSev, type(sev))
+        self.assertEqual(supported, sev.supported)
+
+    @mock.patch.object(
+        fakelibvirt.virConnect, '_domain_capability_features', new=
+        fakelibvirt.virConnect._domain_capability_features_with_SEV_unsupported
+    )
+    def test_get_domain_capabilities_sev_unsupported(self):
+        self._test_get_domain_capabilities_sev(False)
+
+    @mock.patch.object(
+        fakelibvirt.virConnect, '_domain_capability_features',
+        new=fakelibvirt.virConnect._domain_capability_features_with_SEV)
+    def test_get_domain_capabilities_sev_supported(self):
+        self._test_get_domain_capabilities_sev(True)
 
     @mock.patch.object(fakelibvirt.virConnect, "getHostname")
     def test_get_hostname_caching(self, mock_hostname):
@@ -694,196 +753,261 @@ class HostTestCase(test.NoDBTestCase):
         mock_find_secret.return_value = None
         self.host.delete_secret("rbd", "rbdvol")
 
+    def test_get_cpu_count(self):
+        with mock.patch.object(host.Host, "get_connection") as mock_conn:
+            mock_conn().getInfo.return_value = ['zero', 'one', 'two']
+            self.assertEqual('two', self.host.get_cpu_count())
 
-class DomainJobInfoTestCase(test.NoDBTestCase):
+    def test_get_memory_total(self):
+        with mock.patch.object(host.Host, "get_connection") as mock_conn:
+            mock_conn().getInfo.return_value = ['zero', 'one', 'two']
+            self.assertEqual('one', self.host.get_memory_mb_total())
 
-    def setUp(self):
-        super(DomainJobInfoTestCase, self).setUp()
+    def test_get_memory_total_file_backed(self):
+        self.flags(file_backed_memory=1048576, group="libvirt")
+        self.assertEqual(1048576, self.host.get_memory_mb_total())
 
-        self.useFixture(fakelibvirt.FakeLibvirtFixture())
+    def test_get_memory_used(self):
+        m = mock.mock_open(read_data="""
+MemTotal:       16194180 kB
+MemFree:          233092 kB
+MemAvailable:    8892356 kB
+Buffers:          567708 kB
+Cached:          8362404 kB
+SwapCached:            0 kB
+Active:          8381604 kB
+""")
+        with test.nested(
+                mock.patch.object(six.moves.builtins, "open", m, create=True),
+                mock.patch.object(host.Host,
+                                  "get_connection"),
+                mock.patch('sys.platform', 'linux2'),
+                ) as (mock_file, mock_conn, mock_platform):
+            mock_conn().getInfo.return_value = [
+                obj_fields.Architecture.X86_64, 15814, 8, 1208, 1, 1, 4, 2]
 
-        self.conn = fakelibvirt.openAuth("qemu:///system",
-                                         [[], lambda: True])
-        xml = ("<domain type='kvm'>"
-               "  <name>instance-0000000a</name>"
-               "</domain>")
-        self.dom = self.conn.createXML(xml, 0)
-        host.DomainJobInfo._have_job_stats = True
+            self.assertEqual(6866, self.host.get_memory_mb_used())
 
-    @mock.patch.object(fakelibvirt.virDomain, "jobInfo")
-    @mock.patch.object(fakelibvirt.virDomain, "jobStats")
-    def test_job_stats(self, mock_stats, mock_info):
-        mock_stats.return_value = {
-            "type": fakelibvirt.VIR_DOMAIN_JOB_UNBOUNDED,
-            "memory_total": 75,
-            "memory_processed": 50,
-            "memory_remaining": 33,
-            "some_new_libvirt_stat_we_dont_know_about": 83
-        }
+    def test_sum_domain_memory_mb_xen(self):
+        class DiagFakeDomain(object):
+            def __init__(self, id, memmb):
+                self.id = id
+                self.memmb = memmb
 
-        info = host.DomainJobInfo.for_domain(self.dom)
+            def info(self):
+                return [0, 0, self.memmb * 1024]
 
-        self.assertIsInstance(info, host.DomainJobInfo)
-        self.assertEqual(fakelibvirt.VIR_DOMAIN_JOB_UNBOUNDED, info.type)
-        self.assertEqual(75, info.memory_total)
-        self.assertEqual(50, info.memory_processed)
-        self.assertEqual(33, info.memory_remaining)
-        self.assertEqual(0, info.disk_total)
-        self.assertEqual(0, info.disk_processed)
-        self.assertEqual(0, info.disk_remaining)
+            def ID(self):
+                return self.id
 
-        mock_stats.assert_called_once_with()
-        self.assertFalse(mock_info.called)
+            def name(self):
+                return "instance000001"
 
-    @mock.patch.object(fakelibvirt.virDomain, "jobInfo")
-    @mock.patch.object(fakelibvirt.virDomain, "jobStats")
-    def test_job_info_no_support(self, mock_stats, mock_info):
-        mock_stats.side_effect = fakelibvirt.make_libvirtError(
-            fakelibvirt.libvirtError,
-            "virDomainGetJobStats not implemented",
-            fakelibvirt.VIR_ERR_NO_SUPPORT)
+            def UUIDString(self):
+                return uuids.fake
 
-        mock_info.return_value = [
-            fakelibvirt.VIR_DOMAIN_JOB_UNBOUNDED,
-            100, 99, 10, 11, 12, 75, 50, 33, 1, 2, 3]
+        m = mock.mock_open(read_data="""
+MemTotal:       16194180 kB
+MemFree:          233092 kB
+MemAvailable:    8892356 kB
+Buffers:          567708 kB
+Cached:          8362404 kB
+SwapCached:            0 kB
+Active:          8381604 kB
+""")
 
-        info = host.DomainJobInfo.for_domain(self.dom)
+        with test.nested(
+                mock.patch.object(six.moves.builtins, "open", m, create=True),
+                mock.patch.object(host.Host,
+                                  "list_guests"),
+                mock.patch.object(libvirt_driver.LibvirtDriver,
+                                  "_conn"),
+                mock.patch('sys.platform', 'linux2'),
+                ) as (mock_file, mock_list, mock_conn, mock_platform):
+            mock_list.return_value = [
+                libvirt_guest.Guest(DiagFakeDomain(0, 15814)),
+                libvirt_guest.Guest(DiagFakeDomain(1, 750)),
+                libvirt_guest.Guest(DiagFakeDomain(2, 1042))]
+            mock_conn.getInfo.return_value = [
+                obj_fields.Architecture.X86_64, 15814, 8, 1208, 1, 1, 4, 2]
 
-        self.assertIsInstance(info, host.DomainJobInfo)
-        self.assertEqual(fakelibvirt.VIR_DOMAIN_JOB_UNBOUNDED, info.type)
-        self.assertEqual(100, info.time_elapsed)
-        self.assertEqual(99, info.time_remaining)
-        self.assertEqual(10, info.data_total)
-        self.assertEqual(11, info.data_processed)
-        self.assertEqual(12, info.data_remaining)
-        self.assertEqual(75, info.memory_total)
-        self.assertEqual(50, info.memory_processed)
-        self.assertEqual(33, info.memory_remaining)
-        self.assertEqual(1, info.disk_total)
-        self.assertEqual(2, info.disk_processed)
-        self.assertEqual(3, info.disk_remaining)
+            self.assertEqual(8657, self.host._sum_domain_memory_mb())
+            mock_list.assert_called_with(only_guests=False)
 
-        mock_stats.assert_called_once_with()
-        mock_info.assert_called_once_with()
+    def test_get_memory_used_xen(self):
+        self.flags(virt_type='xen', group='libvirt')
+        with test.nested(
+                mock.patch.object(self.host, "_sum_domain_memory_mb"),
+                mock.patch('sys.platform', 'linux2')
+                ) as (mock_sumDomainMemory, mock_platform):
+            mock_sumDomainMemory.return_value = 8192
+            self.assertEqual(8192, self.host.get_memory_mb_used())
+            mock_sumDomainMemory.assert_called_once_with(include_host=True)
 
-    @mock.patch.object(fakelibvirt.virDomain, "jobInfo")
-    @mock.patch.object(fakelibvirt.virDomain, "jobStats")
-    def test_job_info_attr_error(self, mock_stats, mock_info):
-        mock_stats.side_effect = AttributeError("No such API")
+    def test_sum_domain_memory_mb_file_backed(self):
+        class DiagFakeDomain(object):
+            def __init__(self, id, memmb):
+                self.id = id
+                self.memmb = memmb
 
-        mock_info.return_value = [
-            fakelibvirt.VIR_DOMAIN_JOB_UNBOUNDED,
-            100, 99, 10, 11, 12, 75, 50, 33, 1, 2, 3]
+            def info(self):
+                return [0, 0, self.memmb * 1024]
 
-        info = host.DomainJobInfo.for_domain(self.dom)
+            def ID(self):
+                return self.id
 
-        self.assertIsInstance(info, host.DomainJobInfo)
-        self.assertEqual(fakelibvirt.VIR_DOMAIN_JOB_UNBOUNDED, info.type)
-        self.assertEqual(100, info.time_elapsed)
-        self.assertEqual(99, info.time_remaining)
-        self.assertEqual(10, info.data_total)
-        self.assertEqual(11, info.data_processed)
-        self.assertEqual(12, info.data_remaining)
-        self.assertEqual(75, info.memory_total)
-        self.assertEqual(50, info.memory_processed)
-        self.assertEqual(33, info.memory_remaining)
-        self.assertEqual(1, info.disk_total)
-        self.assertEqual(2, info.disk_processed)
-        self.assertEqual(3, info.disk_remaining)
+            def name(self):
+                return "instance000001"
 
-        mock_stats.assert_called_once_with()
-        mock_info.assert_called_once_with()
+            def UUIDString(self):
+                return uuids.fake
 
-    @mock.patch.object(fakelibvirt.virDomain, "jobInfo")
-    @mock.patch.object(fakelibvirt.virDomain, "jobStats")
-    def test_job_stats_no_domain(self, mock_stats, mock_info):
-        mock_stats.side_effect = fakelibvirt.make_libvirtError(
-            fakelibvirt.libvirtError,
-            "No such domain with UUID blah",
-            fakelibvirt.VIR_ERR_NO_DOMAIN)
+        with test.nested(
+                mock.patch.object(host.Host,
+                                  "list_guests"),
+                mock.patch('sys.platform', 'linux2'),
+        ) as (mock_list, mock_platform):
+            mock_list.return_value = [
+                libvirt_guest.Guest(DiagFakeDomain(0, 4096)),
+                libvirt_guest.Guest(DiagFakeDomain(1, 2048)),
+                libvirt_guest.Guest(DiagFakeDomain(2, 1024)),
+                libvirt_guest.Guest(DiagFakeDomain(3, 1024))]
 
-        info = host.DomainJobInfo.for_domain(self.dom)
+            self.assertEqual(8192,
+                    self.host._sum_domain_memory_mb(include_host=False))
 
-        self.assertIsInstance(info, host.DomainJobInfo)
-        self.assertEqual(fakelibvirt.VIR_DOMAIN_JOB_COMPLETED, info.type)
-        self.assertEqual(0, info.time_elapsed)
-        self.assertEqual(0, info.time_remaining)
-        self.assertEqual(0, info.memory_total)
-        self.assertEqual(0, info.memory_processed)
-        self.assertEqual(0, info.memory_remaining)
+    def test_get_memory_used_file_backed(self):
+        self.flags(file_backed_memory=1048576,
+                   group='libvirt')
 
-        mock_stats.assert_called_once_with()
-        self.assertFalse(mock_info.called)
+        with test.nested(
+                mock.patch.object(self.host, "_sum_domain_memory_mb"),
+                mock.patch('sys.platform', 'linux2')
+                ) as (mock_sumDomainMemory, mock_platform):
+            mock_sumDomainMemory.return_value = 8192
+            self.assertEqual(8192, self.host.get_memory_mb_used())
+            mock_sumDomainMemory.assert_called_once_with(include_host=False)
 
-    @mock.patch.object(fakelibvirt.virDomain, "jobInfo")
-    @mock.patch.object(fakelibvirt.virDomain, "jobStats")
-    def test_job_info_no_domain(self, mock_stats, mock_info):
-        mock_stats.side_effect = fakelibvirt.make_libvirtError(
-            fakelibvirt.libvirtError,
-            "virDomainGetJobStats not implemented",
-            fakelibvirt.VIR_ERR_NO_SUPPORT)
+    def test_get_cpu_stats(self):
+        stats = self.host.get_cpu_stats()
+        self.assertEqual(
+            {'kernel': 5664160000000,
+             'idle': 1592705190000000,
+             'frequency': 800,
+             'user': 26728850000000,
+             'iowait': 6121490000000},
+            stats)
 
-        mock_info.side_effect = fakelibvirt.make_libvirtError(
-            fakelibvirt.libvirtError,
-            "No such domain with UUID blah",
-            fakelibvirt.VIR_ERR_NO_DOMAIN)
+    @mock.patch.object(fakelibvirt.virConnect, "defineXML")
+    def test_write_instance_config(self, mock_defineXML):
+        fake_dom_xml = """
+                <domain type='kvm'>
+                  <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
+                  <devices>
+                    <disk type='file'>
+                      <source file='filename'/>
+                    </disk>
+                  </devices>
+                </domain>
+            """
+        conn = self.host.get_connection()
+        dom = fakelibvirt.Domain(conn,
+                                 fake_dom_xml,
+                                 False)
+        mock_defineXML.return_value = dom
+        guest = self.host.write_instance_config(fake_dom_xml)
+        mock_defineXML.assert_called_once_with(fake_dom_xml)
+        self.assertIsInstance(guest, libvirt_guest.Guest)
 
-        info = host.DomainJobInfo.for_domain(self.dom)
+    def test_write_instance_config_unicode(self):
+        fake_dom_xml = u"""
+                <domain type='kvm'>
+                  <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
+                  <devices>
+                    <disk type='file'>
+                      <source file='\u4e2d\u6587'/>
+                    </disk>
+                  </devices>
+                </domain>
+            """
 
-        self.assertIsInstance(info, host.DomainJobInfo)
-        self.assertEqual(fakelibvirt.VIR_DOMAIN_JOB_COMPLETED, info.type)
-        self.assertEqual(0, info.time_elapsed)
-        self.assertEqual(0, info.time_remaining)
-        self.assertEqual(0, info.memory_total)
-        self.assertEqual(0, info.memory_processed)
-        self.assertEqual(0, info.memory_remaining)
+        def emulate_defineXML(xml):
+            conn = self.host.get_connection()
+            # Emulate the decoding behavior of defineXML in Python2
+            if six.PY2:
+                xml = xml.decode("utf-8")
+            dom = fakelibvirt.Domain(conn, xml, False)
+            return dom
+        with mock.patch.object(fakelibvirt.virConnect, "defineXML"
+                               ) as mock_defineXML:
+            mock_defineXML.side_effect = emulate_defineXML
+            guest = self.host.write_instance_config(fake_dom_xml)
+            self.assertIsInstance(guest, libvirt_guest.Guest)
 
-        mock_stats.assert_called_once_with()
-        mock_info.assert_called_once_with()
+    @mock.patch.object(fakelibvirt.virConnect, "nodeDeviceLookupByName")
+    def test_device_lookup_by_name(self, mock_nodeDeviceLookupByName):
+        self.host.device_lookup_by_name("foo")
+        mock_nodeDeviceLookupByName.assert_called_once_with("foo")
 
-    @mock.patch.object(fakelibvirt.virDomain, "jobInfo")
-    @mock.patch.object(fakelibvirt.virDomain, "jobStats")
-    def test_job_stats_operation_invalid(self, mock_stats, mock_info):
-        mock_stats.side_effect = fakelibvirt.make_libvirtError(
-            fakelibvirt.libvirtError,
-            "Domain is not running",
-            fakelibvirt.VIR_ERR_OPERATION_INVALID)
+    @mock.patch.object(fakelibvirt.virConnect, "listDevices")
+    def test_list_pci_devices(self, mock_listDevices):
+        self.host.list_pci_devices(8)
+        mock_listDevices.assert_called_once_with('pci', 8)
 
-        info = host.DomainJobInfo.for_domain(self.dom)
+    def test_list_mdev_capable_devices(self):
+        with mock.patch.object(self.host, "_list_devices") as mock_listDevices:
+            self.host.list_mdev_capable_devices(8)
+        mock_listDevices.assert_called_once_with('mdev_types', flags=8)
 
-        self.assertIsInstance(info, host.DomainJobInfo)
-        self.assertEqual(fakelibvirt.VIR_DOMAIN_JOB_COMPLETED, info.type)
-        self.assertEqual(0, info.time_elapsed)
-        self.assertEqual(0, info.time_remaining)
-        self.assertEqual(0, info.memory_total)
-        self.assertEqual(0, info.memory_processed)
-        self.assertEqual(0, info.memory_remaining)
+    def test_list_mediated_devices(self):
+        with mock.patch.object(self.host, "_list_devices") as mock_listDevices:
+            self.host.list_mediated_devices(8)
+        mock_listDevices.assert_called_once_with('mdev', flags=8)
 
-        mock_stats.assert_called_once_with()
-        self.assertFalse(mock_info.called)
+    @mock.patch.object(fakelibvirt.virConnect, "listDevices")
+    def test_list_devices(self, mock_listDevices):
+        self.host._list_devices('mdev', 8)
+        mock_listDevices.assert_called_once_with('mdev', 8)
 
-    @mock.patch.object(fakelibvirt.virDomain, "jobInfo")
-    @mock.patch.object(fakelibvirt.virDomain, "jobStats")
-    def test_job_info_operation_invalid(self, mock_stats, mock_info):
-        mock_stats.side_effect = fakelibvirt.make_libvirtError(
-            fakelibvirt.libvirtError,
-            "virDomainGetJobStats not implemented",
-            fakelibvirt.VIR_ERR_NO_SUPPORT)
+    @mock.patch.object(fakelibvirt.virConnect, "listDevices")
+    def test_list_devices_unsupported(self, mock_listDevices):
+        not_supported_exc = fakelibvirt.make_libvirtError(
+                fakelibvirt.libvirtError,
+                'this function is not supported by the connection driver:'
+                ' listDevices',
+                error_code=fakelibvirt.VIR_ERR_NO_SUPPORT)
+        mock_listDevices.side_effect = not_supported_exc
+        self.assertEqual([], self.host._list_devices('mdev', 8))
 
-        mock_info.side_effect = fakelibvirt.make_libvirtError(
-            fakelibvirt.libvirtError,
-            "Domain is not running",
-            fakelibvirt.VIR_ERR_OPERATION_INVALID)
+    @mock.patch.object(fakelibvirt.virConnect, "listDevices")
+    def test_list_devices_other_exc(self, mock_listDevices):
+        mock_listDevices.side_effect = fakelibvirt.libvirtError('test')
+        self.assertRaises(fakelibvirt.libvirtError,
+                          self.host._list_devices, 'mdev', 8)
 
-        info = host.DomainJobInfo.for_domain(self.dom)
+    @mock.patch.object(fakelibvirt.virConnect, "compareCPU")
+    def test_compare_cpu(self, mock_compareCPU):
+        self.host.compare_cpu("cpuxml")
+        mock_compareCPU.assert_called_once_with("cpuxml", 0)
 
-        self.assertIsInstance(info, host.DomainJobInfo)
-        self.assertEqual(fakelibvirt.VIR_DOMAIN_JOB_COMPLETED, info.type)
-        self.assertEqual(0, info.time_elapsed)
-        self.assertEqual(0, info.time_remaining)
-        self.assertEqual(0, info.memory_total)
-        self.assertEqual(0, info.memory_processed)
-        self.assertEqual(0, info.memory_remaining)
+    def test_is_cpu_control_policy_capable_ok(self):
+        m = mock.mock_open(
+            read_data="""cg /cgroup/cpu,cpuacct cg opt1,cpu,opt3 0 0
+cg /cgroup/memory cg opt1,opt2 0 0
+""")
+        with mock.patch(
+                "six.moves.builtins.open", m, create=True):
+            self.assertTrue(self.host.is_cpu_control_policy_capable())
 
-        mock_stats.assert_called_once_with()
-        mock_info.assert_called_once_with()
+    def test_is_cpu_control_policy_capable_ko(self):
+        m = mock.mock_open(
+            read_data="""cg /cgroup/cpu,cpuacct cg opt1,opt2,opt3 0 0
+cg /cgroup/memory cg opt1,opt2 0 0
+""")
+        with mock.patch(
+                "six.moves.builtins.open", m, create=True):
+            self.assertFalse(self.host.is_cpu_control_policy_capable())
+
+    @mock.patch('six.moves.builtins.open', side_effect=IOError)
+    def test_is_cpu_control_policy_capable_ioerror(self, mock_open):
+        self.assertFalse(self.host.is_cpu_control_policy_capable())

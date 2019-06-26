@@ -15,4 +15,9 @@
 
 QOS_QUEUE = 'QoS Queue'
 NET_EXTERNAL = 'router:external'
-PORTBINDING_EXT = 'Port Binding'
+VNIC_INDEX_EXT = 'VNIC Index'
+DNS_INTEGRATION = 'DNS Integration'
+MULTI_NET_EXT = 'Multi Provider Network'
+SUBSTR_PORT_FILTERING = 'IP address substring filtering'
+PORT_BINDING_EXTENDED = 'Port Bindings Extended'
+LIVE_MIGRATION = 'live-migration'

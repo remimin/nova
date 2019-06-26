@@ -15,7 +15,7 @@
 import textwrap
 
 import mock
-import pep8
+import pycodestyle
 
 from nova.hacking import checks
 from nova import test
@@ -23,10 +23,10 @@ from nova import test
 
 class HackingTestCase(test.NoDBTestCase):
     """This class tests the hacking checks in nova.hacking.checks by passing
-    strings to the check methods like the pep8/flake8 parser would. The parser
-    loops over each line in the file and then passes the parameters to the
-    check method. The parameter names in the check method dictate what type of
-    object is passed to the check method. The parameter types are::
+    strings to the check methods like the pycodestyle/flake8 parser would. The
+    parser loops over each line in the file and then passes the parameters to
+    the check method. The parameter names in the check method dictate what type
+    of object is passed to the check method. The parameter types are::
 
         logical_line: A processed line with the following modifications:
             - Multi-line statements converted to a single line.
@@ -43,7 +43,7 @@ class HackingTestCase(test.NoDBTestCase):
         indent_level: indentation (with tabs expanded to multiples of 8)
         previous_indent_level: indentation on previous line
         previous_logical: previous logical line
-        filename: Path of the file being run through pep8
+        filename: Path of the file being run through pycodestyle
 
     When running a test on a check method the return will be False/None if
     there is no violation in the sample input. If there is an error a tuple is
@@ -81,30 +81,6 @@ class HackingTestCase(test.NoDBTestCase):
             "CONF.import_opt('volume_drivers', "
             "'nova.virt.libvirt.driver', group='libvirt')",
             "./nova/virt/libvirt/volume.py"))
-
-    def test_no_vi_headers(self):
-
-        lines = ['Line 1\n', 'Line 2\n', 'Line 3\n', 'Line 4\n', 'Line 5\n',
-                 'Line 6\n', 'Line 7\n', 'Line 8\n', 'Line 9\n', 'Line 10\n',
-                 'Line 11\n', 'Line 12\n', 'Line 13\n', 'Line14\n', 'Line15\n']
-
-        self.assertIsNone(checks.no_vi_headers(
-            "Test string foo", 1, lines))
-        self.assertEqual(len(list(checks.no_vi_headers(
-            "# vim: et tabstop=4 shiftwidth=4 softtabstop=4",
-            2, lines))), 2)
-        self.assertIsNone(checks.no_vi_headers(
-            "# vim: et tabstop=4 shiftwidth=4 softtabstop=4",
-            6, lines))
-        self.assertIsNone(checks.no_vi_headers(
-            "# vim: et tabstop=4 shiftwidth=4 softtabstop=4",
-            9, lines))
-        self.assertEqual(len(list(checks.no_vi_headers(
-            "# vim: et tabstop=4 shiftwidth=4 softtabstop=4",
-            14, lines))), 2)
-        self.assertIsNone(checks.no_vi_headers(
-            "Test end string for vi",
-            15, lines))
 
     def test_assert_true_instance(self):
         self.assertEqual(len(list(checks.assert_true_instance(
@@ -158,19 +134,7 @@ class HackingTestCase(test.NoDBTestCase):
         self.assertEqual(len(list(checks.assert_equal_in(
             "self.assertEqual(False, any(a==1 for a in b))"))), 0)
 
-    def test_assert_equal_none(self):
-        self.assertEqual(len(list(checks.assert_equal_none(
-            "self.assertEqual(A, None)"))), 1)
-
-        self.assertEqual(len(list(checks.assert_equal_none(
-            "self.assertEqual(None, A)"))), 1)
-
-        self.assertEqual(
-            len(list(checks.assert_equal_none("self.assertIsNone()"))), 0)
-
     def test_assert_true_or_false_with_in_or_not_in(self):
-        self.assertEqual(len(list(checks.assert_equal_none(
-            "self.assertEqual(A, None)"))), 1)
         self.assertEqual(len(list(checks.assert_true_or_false_with_in(
             "self.assertTrue(A in B)"))), 1)
 
@@ -194,9 +158,6 @@ class HackingTestCase(test.NoDBTestCase):
 
         self.assertEqual(len(list(checks.assert_true_or_false_with_in(
             "self.assertFalse(A not in B, 'some message')"))), 1)
-
-        self.assertEqual(len(list(checks.assert_true_or_false_with_in(
-            "self.assertTrue(A in 'some string with spaces')"))), 1)
 
         self.assertEqual(len(list(checks.assert_true_or_false_with_in(
             "self.assertTrue(A in 'some string with spaces')"))), 1)
@@ -247,36 +208,7 @@ class HackingTestCase(test.NoDBTestCase):
         self.assertEqual(len(list(checks.no_setting_conf_directly_in_tests(
             "CONF.option = 1", "nova/compute/foo.py"))), 0)
 
-    def test_log_translations(self):
-        logs = ['audit', 'error', 'info', 'warning', 'critical', 'warn',
-                'exception']
-        levels = ['_LI', '_LW', '_LE', '_LC']
-        debug = "LOG.debug('OK')"
-        self.assertEqual(
-            0, len(list(checks.validate_log_translations(debug, debug, 'f'))))
-        for log in logs:
-            bad = 'LOG.%s("Bad")' % log
-            self.assertEqual(1,
-                len(list(
-                    checks.validate_log_translations(bad, bad, 'f'))))
-            ok = "LOG.%s('OK')    # noqa" % log
-            self.assertEqual(0,
-                len(list(
-                    checks.validate_log_translations(ok, ok, 'f'))))
-            ok = "LOG.%s(variable)" % log
-            self.assertEqual(0,
-                len(list(
-                    checks.validate_log_translations(ok, ok, 'f'))))
-            for level in levels:
-                ok = "LOG.%s(%s('OK'))" % (log, level)
-                self.assertEqual(0,
-                    len(list(
-                        checks.validate_log_translations(ok, ok, 'f'))))
-
     def test_no_mutable_default_args(self):
-        self.assertEqual(1, len(list(checks.no_mutable_default_args(
-            " def fake_suds_context(calls={}):"))))
-
         self.assertEqual(1, len(list(checks.no_mutable_default_args(
             "def get_info_from_bdm(virt_type, bdm, mapping=[])"))))
 
@@ -336,17 +268,21 @@ class HackingTestCase(test.NoDBTestCase):
             len(list(checks.use_jsonutils("json.dumb",
                                  "./nova/virt/xenapi/driver.py"))))
 
-    # We are patching pep8 so that only the check under test is actually
+    # We are patching pycodestyle so that only the check under test is actually
     # installed.
-    @mock.patch('pep8._checks',
+    @mock.patch('pycodestyle._checks',
                 {'physical_line': {}, 'logical_line': {}, 'tree': {}})
     def _run_check(self, code, checker, filename=None):
-        pep8.register_check(checker)
+        pycodestyle.register_check(checker)
 
-        lines = textwrap.dedent(code).strip().splitlines(True)
+        lines = textwrap.dedent(code).lstrip().splitlines(True)
 
-        checker = pep8.Checker(filename=filename, lines=lines)
-        checker.check_all()
+        checker = pycodestyle.Checker(filename=filename, lines=lines)
+        # NOTE(sdague): the standard reporter has printing to stdout
+        # as a normal part of check_all, which bleeds through to the
+        # test output stream in an unhelpful way. This blocks that printing.
+        with mock.patch('pycodestyle.StandardReport.get_file_results'):
+            checker.check_all()
         checker.report._deferred_print.sort()
         return checker.report._deferred_print
 
@@ -434,27 +370,6 @@ class HackingTestCase(test.NoDBTestCase):
         self._assert_has_errors(code, checks.check_api_version_decorator,
                                 expected_errors=[(2, 0, "N332")])
 
-    def test_oslo_namespace_imports_check(self):
-        code = """
-               from oslo.concurrency import processutils
-               """
-        self._assert_has_errors(code, checks.check_oslo_namespace_imports,
-                                expected_errors=[(1, 0, "N333")])
-
-    def test_oslo_namespace_imports_check_2(self):
-        code = """
-               from oslo import i18n
-               """
-        self._assert_has_errors(code, checks.check_oslo_namespace_imports,
-                                expected_errors=[(1, 0, "N333")])
-
-    def test_oslo_namespace_imports_check_3(self):
-        code = """
-               import oslo.messaging
-               """
-        self._assert_has_errors(code, checks.check_oslo_namespace_imports,
-                                expected_errors=[(1, 0, "N333")])
-
     def test_oslo_assert_raises_regexp(self):
         code = """
                self.assertRaisesRegexp(ValueError,
@@ -466,13 +381,22 @@ class HackingTestCase(test.NoDBTestCase):
                                 expected_errors=[(1, 0, "N335")])
 
     def test_api_version_decorator_check_no_errors(self):
-        code = """
-               class ControllerClass():
-                   @wsgi.api_version("2.5")
-                   def my_method():
-                       pass
-               """
-        self._assert_has_no_errors(code, checks.check_api_version_decorator)
+        codelist = [
+            """
+            class ControllerClass():
+                @wsgi.api_version("2.5")
+                def my_method():
+                    pass
+            """,
+            """
+            @some_other_decorator
+            @mock.patch('foo', return_value=api_versions.APIVersion("2.5"))
+            def my_method():
+                pass
+            """]
+        for code in codelist:
+            self._assert_has_no_errors(
+                code, checks.check_api_version_decorator)
 
     def test_trans_add(self):
 
@@ -536,3 +460,456 @@ class HackingTestCase(test.NoDBTestCase):
 
         self.assertEqual(0, len(list(checks.dict_constructor_with_list_copy(
             "      self._render_dict(xml, data_el, data.__dict__)"))))
+
+    def test_check_http_not_implemented(self):
+        code = """
+               except NotImplementedError:
+                   common.raise_http_not_implemented_error()
+               """
+        filename = "nova/api/openstack/compute/v21/test.py"
+        self._assert_has_no_errors(code, checks.check_http_not_implemented,
+                                   filename=filename)
+
+        code = """
+               except NotImplementedError:
+                   msg = _("Unable to set password on instance")
+                   raise exc.HTTPNotImplemented(explanation=msg)
+               """
+        errors = [(3, 4, 'N339')]
+        self._assert_has_errors(code, checks.check_http_not_implemented,
+                                expected_errors=errors, filename=filename)
+
+    def test_check_contextlib_use(self):
+        code = """
+               with test.nested(
+                   mock.patch.object(network_model.NetworkInfo, 'hydrate'),
+                   mock.patch.object(objects.InstanceInfoCache, 'save'),
+               ) as (
+                   hydrate_mock, save_mock
+               )
+               """
+        filename = "nova/api/openstack/compute/v21/test.py"
+        self._assert_has_no_errors(code, checks.check_no_contextlib_nested,
+                                   filename=filename)
+        code = """
+               with contextlib.nested(
+                   mock.patch.object(network_model.NetworkInfo, 'hydrate'),
+                   mock.patch.object(objects.InstanceInfoCache, 'save'),
+               ) as (
+                   hydrate_mock, save_mock
+               )
+               """
+        filename = "nova/api/openstack/compute/legacy_v2/test.py"
+        errors = [(1, 0, 'N341')]
+        self._assert_has_errors(code, checks.check_no_contextlib_nested,
+                                expected_errors=errors, filename=filename)
+
+    def test_check_greenthread_spawns(self):
+        errors = [(1, 0, "N340")]
+
+        code = "greenthread.spawn(func, arg1, kwarg1=kwarg1)"
+        self._assert_has_errors(code, checks.check_greenthread_spawns,
+                                expected_errors=errors)
+
+        code = "greenthread.spawn_n(func, arg1, kwarg1=kwarg1)"
+        self._assert_has_errors(code, checks.check_greenthread_spawns,
+                                expected_errors=errors)
+
+        code = "eventlet.greenthread.spawn(func, arg1, kwarg1=kwarg1)"
+        self._assert_has_errors(code, checks.check_greenthread_spawns,
+                                expected_errors=errors)
+
+        code = "eventlet.spawn(func, arg1, kwarg1=kwarg1)"
+        self._assert_has_errors(code, checks.check_greenthread_spawns,
+                                expected_errors=errors)
+
+        code = "eventlet.spawn_n(func, arg1, kwarg1=kwarg1)"
+        self._assert_has_errors(code, checks.check_greenthread_spawns,
+                                expected_errors=errors)
+
+        code = "nova.utils.spawn(func, arg1, kwarg1=kwarg1)"
+        self._assert_has_no_errors(code, checks.check_greenthread_spawns)
+
+        code = "nova.utils.spawn_n(func, arg1, kwarg1=kwarg1)"
+        self._assert_has_no_errors(code, checks.check_greenthread_spawns)
+
+    def test_config_option_regex_match(self):
+        def should_match(code):
+            self.assertTrue(checks.cfg_opt_re.match(code))
+
+        def should_not_match(code):
+            self.assertFalse(checks.cfg_opt_re.match(code))
+
+        should_match("opt = cfg.StrOpt('opt_name')")
+        should_match("opt = cfg.IntOpt('opt_name')")
+        should_match("opt = cfg.DictOpt('opt_name')")
+        should_match("opt = cfg.Opt('opt_name')")
+        should_match("opts=[cfg.Opt('opt_name')]")
+        should_match("   cfg.Opt('opt_name')")
+        should_not_match("opt_group = cfg.OptGroup('opt_group_name')")
+
+    def test_check_config_option_in_central_place(self):
+        errors = [(1, 0, "N342")]
+        code = """
+        opts = [
+            cfg.StrOpt('random_opt',
+                       default='foo',
+                       help='I am here to do stuff'),
+            ]
+        """
+        # option at the right place in the tree
+        self._assert_has_no_errors(code,
+                                   checks.check_config_option_in_central_place,
+                                   filename="nova/conf/serial_console.py")
+        # option at the wrong place in the tree
+        self._assert_has_errors(code,
+                                checks.check_config_option_in_central_place,
+                                filename="nova/cmd/serialproxy.py",
+                                expected_errors=errors)
+
+        # option at a location which is marked as an exception
+        # TODO(macsz) remove testing exceptions as they are removed from
+        # check_config_option_in_central_place
+        self._assert_has_no_errors(code,
+                                   checks.check_config_option_in_central_place,
+                                   filename="nova/cmd/manage.py")
+        self._assert_has_no_errors(code,
+                                   checks.check_config_option_in_central_place,
+                                   filename="nova/tests/dummy_test.py")
+
+    def test_check_doubled_words(self):
+        errors = [(1, 0, "N343")]
+
+        # Explicit addition of line-ending here and below since this isn't a
+        # block comment and without it we trigger #1804062. Artificial break is
+        # necessary to stop flake8 detecting the test
+        code = "'This is the" + " the best comment'\n"
+        self._assert_has_errors(code, checks.check_doubled_words,
+                                expected_errors=errors)
+
+        code = "'This is the then best comment'\n"
+        self._assert_has_no_errors(code, checks.check_doubled_words)
+
+    def test_dict_iteritems(self):
+        self.assertEqual(1, len(list(checks.check_python3_no_iteritems(
+            "obj.iteritems()"))))
+
+        self.assertEqual(0, len(list(checks.check_python3_no_iteritems(
+            "six.iteritems(ob))"))))
+
+    def test_dict_iterkeys(self):
+        self.assertEqual(1, len(list(checks.check_python3_no_iterkeys(
+            "obj.iterkeys()"))))
+
+        self.assertEqual(0, len(list(checks.check_python3_no_iterkeys(
+            "six.iterkeys(ob))"))))
+
+    def test_dict_itervalues(self):
+        self.assertEqual(1, len(list(checks.check_python3_no_itervalues(
+            "obj.itervalues()"))))
+
+        self.assertEqual(0, len(list(checks.check_python3_no_itervalues(
+            "six.itervalues(ob))"))))
+
+    def test_no_os_popen(self):
+        code = """
+               import os
+
+               foobar_cmd = "foobar -get -beer"
+               answer = os.popen(foobar_cmd).read()
+
+               if answer == nok":
+                   try:
+                       os.popen(os.popen('foobar -beer -please')).read()
+
+                   except ValueError:
+                       go_home()
+               """
+        errors = [(4, 0, 'N348'), (8, 8, 'N348')]
+        self._assert_has_errors(code, checks.no_os_popen,
+                                expected_errors=errors)
+
+    def test_no_log_warn(self):
+        code = """
+                  LOG.warn("LOG.warn is deprecated")
+               """
+        errors = [(1, 0, 'N352')]
+        self._assert_has_errors(code, checks.no_log_warn,
+                                expected_errors=errors)
+        code = """
+                  LOG.warning("LOG.warn is deprecated")
+               """
+        self._assert_has_no_errors(code, checks.no_log_warn)
+
+    def test_uncalled_closures(self):
+
+        checker = checks.CheckForUncalledTestClosure
+        code = """
+               def test_fake_thing():
+                   def _test():
+                       pass
+               """
+        self._assert_has_errors(code, checker,
+                expected_errors=[(1, 0, 'N349')])
+
+        code = """
+               def test_fake_thing():
+                   def _test():
+                       pass
+                   _test()
+               """
+        self._assert_has_no_errors(code, checker)
+
+        code = """
+               def test_fake_thing():
+                   def _test():
+                       pass
+                   self.assertRaises(FakeExcepion, _test)
+               """
+        self._assert_has_no_errors(code, checker)
+
+    def test_check_policy_registration_in_central_place(self):
+        errors = [(3, 0, "N350")]
+        code = """
+        from nova import policy
+
+        policy.RuleDefault('context_is_admin', 'role:admin')
+        """
+        # registration in the proper place
+        self._assert_has_no_errors(
+            code, checks.check_policy_registration_in_central_place,
+            filename="nova/policies/base.py")
+        # option at a location which is not in scope right now
+        self._assert_has_errors(
+            code, checks.check_policy_registration_in_central_place,
+            filename="nova/api/openstack/compute/non_existent.py",
+            expected_errors=errors)
+
+    def test_check_policy_enforce(self):
+        errors = [(3, 0, "N351")]
+        code = """
+        from nova import policy
+
+        policy._ENFORCER.enforce('context_is_admin', target, credentials)
+        """
+        self._assert_has_errors(code, checks.check_policy_enforce,
+                                expected_errors=errors)
+
+    def test_check_policy_enforce_does_not_catch_other_enforce(self):
+        # Simulate a different enforce method defined in Nova
+        code = """
+        from nova import foo
+
+        foo.enforce()
+        """
+        self._assert_has_no_errors(code, checks.check_policy_enforce)
+
+    def test_check_python3_xrange(self):
+        func = checks.check_python3_xrange
+        self.assertEqual(1, len(list(func('for i in xrange(10)'))))
+        self.assertEqual(1, len(list(func('for i in xrange    (10)'))))
+        self.assertEqual(0, len(list(func('for i in range(10)'))))
+        self.assertEqual(0, len(list(func('for i in six.moves.range(10)'))))
+
+    def test_log_context(self):
+        code = """
+                  LOG.info(_LI("Rebooting instance"),
+                            context=context, instance=instance)
+               """
+        errors = [(1, 0, 'N353')]
+        self._assert_has_errors(code, checks.check_context_log,
+                                expected_errors=errors)
+        code = """
+                  LOG.info(_LI("Rebooting instance"),
+                            context=admin_context, instance=instance)
+               """
+        errors = [(1, 0, 'N353')]
+        self._assert_has_errors(code, checks.check_context_log,
+                                expected_errors=errors)
+        code = """
+                  LOG.info(_LI("Rebooting instance"),
+                            instance=instance)
+               """
+        self._assert_has_no_errors(code, checks.check_context_log)
+
+    def test_no_assert_equal_true_false(self):
+        code = """
+                  self.assertEqual(context_is_admin, True)
+                  self.assertEqual(context_is_admin, False)
+                  self.assertEqual(True, context_is_admin)
+                  self.assertEqual(False, context_is_admin)
+                  self.assertNotEqual(context_is_admin, True)
+                  self.assertNotEqual(context_is_admin, False)
+                  self.assertNotEqual(True, context_is_admin)
+                  self.assertNotEqual(False, context_is_admin)
+               """
+        errors = [(1, 0, 'N355'), (2, 0, 'N355'), (3, 0, 'N355'),
+                  (4, 0, 'N355'), (5, 0, 'N355'), (6, 0, 'N355'),
+                  (7, 0, 'N355'), (8, 0, 'N355')]
+        self._assert_has_errors(code, checks.no_assert_equal_true_false,
+                                expected_errors=errors)
+        code = """
+                  self.assertEqual(context_is_admin, stuff)
+                  self.assertNotEqual(context_is_admin, stuff)
+               """
+        self._assert_has_no_errors(code, checks.no_assert_equal_true_false)
+
+    def test_no_assert_true_false_is_not(self):
+        code = """
+                  self.assertTrue(test is None)
+                  self.assertTrue(False is my_variable)
+                  self.assertFalse(None is test)
+                  self.assertFalse(my_variable is False)
+               """
+        errors = [(1, 0, 'N356'), (2, 0, 'N356'), (3, 0, 'N356'),
+                  (4, 0, 'N356')]
+        self._assert_has_errors(code, checks.no_assert_true_false_is_not,
+                                expected_errors=errors)
+
+    def test_check_uuid4(self):
+        code = """
+                  fake_uuid = uuid.uuid4()
+                  hex_uuid = uuid.uuid4().hex
+               """
+        errors = [(1, 0, 'N357'), (2, 0, 'N357')]
+        self._assert_has_errors(code, checks.check_uuid4,
+                                expected_errors=errors)
+        code = """
+                  int_uuid = uuid.uuid4().int
+                  urn_uuid = uuid.uuid4().urn
+                  variant_uuid = uuid.uuid4().variant
+                  version_uuid = uuid.uuid4().version
+               """
+        self._assert_has_no_errors(code, checks.check_uuid4)
+
+    def test_return_followed_by_space(self):
+        code = """
+                  return(42)
+                  return(a, b)
+                  return(' some string ')
+               """
+        errors = [(1, 0, 'N358'), (2, 0, 'N358'), (3, 0, 'N358')]
+        self._assert_has_errors(code, checks.return_followed_by_space,
+                                expected_errors=errors)
+        code = """
+                  return
+                  return 42
+                  return (a, b)
+                  return a, b
+                  return ' some string '
+               """
+        self._assert_has_no_errors(code, checks.return_followed_by_space)
+
+    def test_no_redundant_import_alias(self):
+        code = """
+                  from x import y as y
+                  import x as x
+                  import x.y.z as z
+                  import x.y.z as y.z
+               """
+        errors = [(x + 1, 0, 'N359') for x in range(4)]
+        self._assert_has_errors(code, checks.no_redundant_import_alias,
+                                expected_errors=errors)
+        code = """
+                  from x import y
+                  import x
+                  from x.y import z
+                  from a import bcd as cd
+                  import ab.cd.efg as fg
+                  import ab.cd.efg as d.efg
+               """
+        self._assert_has_no_errors(code, checks.no_redundant_import_alias)
+
+    def test_yield_followed_by_space(self):
+        code = """
+                  yield(x, y)
+                  yield{"type": "test"}
+                  yield[a, b, c]
+                  yield"test"
+                  yield'test'
+               """
+        errors = [(x + 1, 0, 'N360') for x in range(5)]
+        self._assert_has_errors(code, checks.yield_followed_by_space,
+                                expected_errors=errors)
+        code = """
+                  yield x
+                  yield (x, y)
+                  yield {"type": "test"}
+                  yield [a, b, c]
+                  yield "test"
+                  yield 'test'
+                  yieldx_func(a, b)
+               """
+        self._assert_has_no_errors(code, checks.yield_followed_by_space)
+
+    def test_assert_regexpmatches(self):
+        code = """
+                   self.assertRegexpMatches("Test", output)
+                   self.assertNotRegexpMatches("Notmatch", output)
+               """
+        errors = [(x + 1, 0, 'N361') for x in range(2)]
+        self._assert_has_errors(code, checks.assert_regexpmatches,
+                                expected_errors=errors)
+        code = """
+                   self.assertRegexpMatchesfoo("Test", output)
+                   self.assertNotRegexpMatchesbar("Notmatch", output)
+               """
+        self._assert_has_no_errors(code, checks.assert_regexpmatches)
+
+    def test_import_alias_privsep(self):
+        code = """
+                  from nova import privsep
+                  import nova.privsep as nova_privsep
+                  from nova.privsep import linux_net
+                  import nova.privsep.linux_net as privsep_linux_net
+               """
+        errors = [(x + 1, 0, 'N362') for x in range(4)]
+        bad_filenames = ('nova/foo/bar.py',
+                         'nova/foo/privsep.py',
+                         'nova/privsep_foo/bar.py')
+        for filename in bad_filenames:
+            self._assert_has_errors(
+                code, checks.privsep_imports_not_aliased,
+                expected_errors=errors,
+                filename=filename)
+        good_filenames = ('nova/privsep.py',
+                          'nova/privsep/__init__.py',
+                          'nova/privsep/foo.py')
+        for filename in good_filenames:
+            self._assert_has_no_errors(
+                code, checks.privsep_imports_not_aliased, filename=filename)
+        code = """
+                  import nova.privsep
+                  import nova.privsep.foo
+                  import nova.privsep.foo.bar
+                  import nova.foo.privsep
+                  import nova.foo.privsep.bar
+                  import nova.tests.unit.whatever
+               """
+        for filename in (good_filenames + bad_filenames):
+            self._assert_has_no_errors(
+                code, checks.privsep_imports_not_aliased, filename=filename)
+
+    def test_did_you_mean_tuple(self):
+        code = """
+                    if foo in (bar):
+                    if foo in ('bar'):
+                    if foo in (path.to.CONST_1234):
+                    if foo in (
+                        bar):
+               """
+        errors = [(x + 1, 0, 'N363') for x in range(4)]
+        self._assert_has_errors(
+            code, checks.did_you_mean_tuple, expected_errors=errors)
+        code = """
+                    def in(this_would_be_weird):
+                        # A match in (any) comment doesn't count
+                        if foo in (bar,)
+                            or foo in ('bar',)
+                            or foo in ("bar",)
+                            or foo in (set1 + set2)
+                            or foo in ("string continuations "
+                                "are probably okay")
+                            or foo in (method_call_should_this_work()):
+               """
+        self._assert_has_no_errors(code, checks.did_you_mean_tuple)

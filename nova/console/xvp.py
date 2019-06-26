@@ -20,38 +20,16 @@ import signal
 
 import jinja2
 from oslo_concurrency import processutils
-from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import excutils
 
+import nova.conf
 from nova import context
-from nova import db
-from nova.i18n import _, _LE
-from nova import paths
-from nova import utils
+from nova.db import api as db
+from nova.i18n import _
 
 
-xvp_opts = [
-    cfg.StrOpt('console_xvp_conf_template',
-               default=paths.basedir_def('nova/console/xvp.conf.template'),
-               help='XVP conf template'),
-    cfg.StrOpt('console_xvp_conf',
-               default='/etc/xvp.conf',
-               help='Generated XVP conf file'),
-    cfg.StrOpt('console_xvp_pid',
-               default='/var/run/xvp.pid',
-               help='XVP master process pid file'),
-    cfg.StrOpt('console_xvp_log',
-               default='/var/log/xvp.log',
-               help='XVP log file'),
-    cfg.IntOpt('console_xvp_multiplex_port',
-               default=5900,
-               help='Port for XVP to multiplex VNC connections on'),
-    ]
-
-CONF = cfg.CONF
-CONF.register_opts(xvp_opts)
-CONF.import_opt('host', 'nova.netconf')
+CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
 
 
@@ -59,7 +37,7 @@ class XVPConsoleProxy(object):
     """Sets up XVP config, and manages XVP daemon."""
 
     def __init__(self):
-        self.xvpconf_template = open(CONF.console_xvp_conf_template).read()
+        self.xvpconf_template = open(CONF.xvp.console_xvp_conf_template).read()
         self.host = CONF.host  # default, set by manager.
         super(XVPConsoleProxy, self).__init__()
 
@@ -72,7 +50,7 @@ class XVPConsoleProxy(object):
         # TODO(mdragon): implement port selection for non multiplex ports,
         #               we are not using that, but someone else may want
         #               it.
-        return CONF.console_xvp_multiplex_port
+        return CONF.xvp.console_xvp_multiplex_port
 
     def setup_console(self, context, console):
         """Sets up actual proxies."""
@@ -105,10 +83,11 @@ class XVPConsoleProxy(object):
             LOG.debug('No console pools!')
             self._xvp_stop()
             return
-        conf_data = {'multiplex_port': CONF.console_xvp_multiplex_port,
+        conf_data = {'multiplex_port': CONF.xvp.console_xvp_multiplex_port,
                      'pools': pools}
         tmpl_path, tmpl_file = os.path.split(CONF.injected_network_template)
-        env = jinja2.Environment(loader=jinja2.FileSystemLoader(tmpl_path))
+        env = jinja2.Environment(  # nosec
+            loader=jinja2.FileSystemLoader(tmpl_path))  # nosec
         env.filters['pass_encode'] = self.fix_console_password
         template = env.get_template(tmpl_file)
         self._write_conf(template.render(conf_data))
@@ -116,12 +95,12 @@ class XVPConsoleProxy(object):
 
     def _write_conf(self, config):
         try:
-            LOG.debug('Re-wrote %s', CONF.console_xvp_conf)
-            with open(CONF.console_xvp_conf, 'w') as cfile:
+            LOG.debug('Re-wrote %s', CONF.xvp.console_xvp_conf)
+            with open(CONF.xvp.console_xvp_conf, 'w') as cfile:
                 cfile.write(config)
         except IOError:
             with excutils.save_and_reraise_exception():
-                LOG.exception(_LE("Failed to write configuration file"))
+                LOG.exception("Failed to write configuration file")
 
     def _xvp_stop(self):
         LOG.debug('Stopping xvp')
@@ -139,12 +118,12 @@ class XVPConsoleProxy(object):
             return
         LOG.debug('Starting xvp')
         try:
-            utils.execute('xvp',
-                          '-p', CONF.console_xvp_pid,
-                          '-c', CONF.console_xvp_conf,
-                          '-l', CONF.console_xvp_log)
+            processutils.execute('xvp',
+                                 '-p', CONF.xvp.console_xvp_pid,
+                                 '-c', CONF.xvp.console_xvp_conf,
+                                 '-l', CONF.xvp.console_xvp_log)
         except processutils.ProcessExecutionError as err:
-            LOG.error(_LE('Error starting xvp: %s'), err)
+            LOG.error('Error starting xvp: %s', err)
 
     def _xvp_restart(self):
         LOG.debug('Restarting xvp')
@@ -157,7 +136,7 @@ class XVPConsoleProxy(object):
 
     def _xvp_pid(self):
         try:
-            with open(CONF.console_xvp_pid, 'r') as pidfile:
+            with open(CONF.xvp.console_xvp_pid, 'r') as pidfile:
                 pid = int(pidfile.read())
         except IOError:
             return None
@@ -198,7 +177,7 @@ class XVPConsoleProxy(object):
             flag = '-x'
         # xvp will blow up on passwords that are too long (mdragon)
         password = password[:maxlen]
-        out, err = utils.execute('xvp', flag, process_input=password)
+        out, err = processutils.execute('xvp', flag, process_input=password)
         if err:
             raise processutils.ProcessExecutionError(_("Failed to run xvp."))
         return out.strip()

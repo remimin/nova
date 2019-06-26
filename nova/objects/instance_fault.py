@@ -16,11 +16,8 @@ import itertools
 
 from oslo_log import log as logging
 
-from nova.cells import opts as cells_opts
-from nova.cells import rpcapi as cells_rpcapi
-from nova import db
+from nova.db import api as db
 from nova import exception
-from nova.i18n import _LE
 from nova import objects
 from nova.objects import base
 from nova.objects import fields
@@ -30,6 +27,7 @@ LOG = logging.getLogger(__name__)
 
 
 # TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
 class InstanceFault(base.NovaPersistentObject, base.NovaObject,
                     base.NovaObjectDictCompat):
     # Version 1.0: Initial version
@@ -78,32 +76,28 @@ class InstanceFault(base.NovaPersistentObject, base.NovaObject,
         db_fault = db.instance_fault_create(self._context, values)
         self._from_db_object(self._context, self, db_fault)
         self.obj_reset_changes()
-        # Cells should only try sending a message over to nova-cells
-        # if cells is enabled and we're not the API cell. Otherwise,
-        # if the API cell is calling this, we could end up with
-        # infinite recursion.
-        if cells_opts.get_cell_type() == 'compute':
-            try:
-                cells_rpcapi.CellsAPI().instance_fault_create_at_top(
-                    self._context, db_fault)
-            except Exception:
-                LOG.exception(_LE("Failed to notify cells of instance fault"))
 
 
+@base.NovaObjectRegistry.register
 class InstanceFaultList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
     #              InstanceFault <= version 1.1
     # Version 1.1: InstanceFault version 1.2
-    VERSION = '1.1'
+    # Version 1.2: Added get_latest_by_instance_uuids() method
+    VERSION = '1.2'
 
     fields = {
         'objects': fields.ListOfObjectsField('InstanceFault'),
         }
-    child_versions = {
-        '1.0': '1.1',
-        # NOTE(danms): InstanceFault was at 1.1 before we added this
-        '1.1': '1.2',
-        }
+
+    @base.remotable_classmethod
+    def get_latest_by_instance_uuids(cls, context, instance_uuids):
+        db_faultdict = db.instance_fault_get_by_instance_uuids(context,
+                                                               instance_uuids,
+                                                               latest=True)
+        db_faultlist = itertools.chain(*db_faultdict.values())
+        return base.obj_make_list(context, cls(context), objects.InstanceFault,
+                                  db_faultlist)
 
     @base.remotable_classmethod
     def get_by_instance_uuids(cls, context, instance_uuids):

@@ -21,46 +21,52 @@ import copy
 import functools
 import os
 import re
-import uuid
 
 import mock
-from mox3 import mox
+from os_xenapi.client import host_management
+from os_xenapi.client import session
+from os_xenapi.client import XenAPI
 from oslo_concurrency import lockutils
-from oslo_config import cfg
 from oslo_config import fixture as config_fixture
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
+from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import importutils
+from oslo_utils import uuidutils
 import testtools
 
 from nova.compute import api as compute_api
-from nova.compute import arch
-from nova.compute import flavors
-from nova.compute import hv_type
+from nova.compute import manager
 from nova.compute import power_state
 from nova.compute import task_states
 from nova.compute import utils as compute_utils
 from nova.compute import vm_states
-from nova.conductor import api as conductor_api
+import nova.conf
 from nova import context
 from nova import crypto
-from nova import db
+from nova.db import api as db
 from nova import exception
+from nova.network import model as network_model
 from nova import objects
 from nova.objects import base
+from nova.objects import fields as obj_fields
 from nova import test
+from nova.tests import fixtures
+from nova.tests.unit.api.openstack import fakes
 from nova.tests.unit.db import fakes as db_fakes
+from nova.tests.unit import fake_diagnostics
+from nova.tests.unit import fake_flavor
 from nova.tests.unit import fake_instance
 from nova.tests.unit import fake_network
 from nova.tests.unit import fake_processutils
 import nova.tests.unit.image.fake as fake_image
 from nova.tests.unit import matchers
 from nova.tests.unit.objects import test_aggregate
+from nova.tests.unit.objects import test_diagnostics
 from nova.tests.unit import utils as test_utils
 from nova.tests.unit.virt.xenapi import stubs
 from nova.virt import fake
 from nova.virt.xenapi import agent
-from nova.virt.xenapi.client import session as xenapi_session
 from nova.virt.xenapi import driver as xenapi_conn
 from nova.virt.xenapi import fake as xenapi_fake
 from nova.virt.xenapi import host
@@ -73,70 +79,71 @@ from nova.virt.xenapi import volume_utils
 
 LOG = logging.getLogger(__name__)
 
-CONF = cfg.CONF
-CONF.import_opt('compute_manager', 'nova.service')
-CONF.import_opt('network_manager', 'nova.service')
-CONF.import_opt('compute_driver', 'nova.virt.driver')
-CONF.import_opt('host', 'nova.netconf')
-CONF.import_opt('default_availability_zone', 'nova.availability_zones')
-CONF.import_opt('login_timeout', 'nova.virt.xenapi.client.session',
-                group="xenserver")
+CONF = nova.conf.CONF
 
-IMAGE_MACHINE = '1'
-IMAGE_KERNEL = '2'
-IMAGE_RAMDISK = '3'
-IMAGE_RAW = '4'
-IMAGE_VHD = '5'
-IMAGE_ISO = '6'
-IMAGE_IPXE_ISO = '7'
-IMAGE_FROM_VOLUME = '8'
+IMAGE_MACHINE = uuids.image_ref
+IMAGE_KERNEL = uuids.image_kernel_id
+IMAGE_RAMDISK = uuids.image_ramdisk_id
+IMAGE_RAW = uuids.image_raw
+IMAGE_VHD = uuids.image_vhd
+IMAGE_ISO = uuids.image_iso
+IMAGE_IPXE_ISO = uuids.image_ipxe_iso
+IMAGE_FROM_VOLUME = uuids.image_from_volume
 
 IMAGE_FIXTURES = {
     IMAGE_MACHINE: {
         'image_meta': {'name': 'fakemachine', 'size': 0,
                        'disk_format': 'ami',
-                       'container_format': 'ami'},
+                       'container_format': 'ami',
+                       'id': 'fake-image'},
     },
     IMAGE_KERNEL: {
         'image_meta': {'name': 'fakekernel', 'size': 0,
                        'disk_format': 'aki',
-                       'container_format': 'aki'},
+                       'container_format': 'aki',
+                       'id': 'fake-kernel'},
     },
     IMAGE_RAMDISK: {
         'image_meta': {'name': 'fakeramdisk', 'size': 0,
                        'disk_format': 'ari',
-                       'container_format': 'ari'},
+                       'container_format': 'ari',
+                       'id': 'fake-ramdisk'},
     },
     IMAGE_RAW: {
         'image_meta': {'name': 'fakeraw', 'size': 0,
                        'disk_format': 'raw',
-                       'container_format': 'bare'},
+                       'container_format': 'bare',
+                       'id': 'fake-image-raw'},
     },
     IMAGE_VHD: {
         'image_meta': {'name': 'fakevhd', 'size': 0,
                        'disk_format': 'vhd',
-                       'container_format': 'ovf'},
+                       'container_format': 'ovf',
+                       'id': 'fake-image-vhd'},
     },
     IMAGE_ISO: {
         'image_meta': {'name': 'fakeiso', 'size': 0,
                        'disk_format': 'iso',
-                       'container_format': 'bare'},
+                       'container_format': 'bare',
+                       'id': 'fake-image-iso'},
     },
     IMAGE_IPXE_ISO: {
         'image_meta': {'name': 'fake_ipxe_iso', 'size': 0,
                        'disk_format': 'iso',
                        'container_format': 'bare',
+                       'id': 'fake-image-pxe',
                        'properties': {'ipxe_boot': 'true'}},
     },
     IMAGE_FROM_VOLUME: {
         'image_meta': {'name': 'fake_ipxe_iso',
+                       'id': 'fake-image-volume',
                        'properties': {'foo': 'bar'}},
     },
 }
 
 
 def get_session():
-    return xenapi_session.XenAPISession('test_url', 'root', 'test_pass')
+    return xenapi_fake.SessionBase('http://localhost', 'root', 'test_pass')
 
 
 def set_image_fixtures():
@@ -175,55 +182,47 @@ def get_fake_device_info():
     return fake
 
 
-def stub_vm_utils_with_vdi_attached_here(function):
-    """vm_utils.with_vdi_attached_here needs to be stubbed out because it
+def stub_vm_utils_with_vdi_attached(function):
+    """vm_utils.with_vdi_attached needs to be stubbed out because it
     calls down to the filesystem to attach a vdi. This provides a
     decorator to handle that.
     """
     @functools.wraps(function)
     def decorated_function(self, *args, **kwargs):
         @contextlib.contextmanager
-        def fake_vdi_attached_here(*args, **kwargs):
+        def fake_vdi_attached(*args, **kwargs):
             fake_dev = 'fakedev'
             yield fake_dev
 
         def fake_image_download(*args, **kwargs):
             pass
 
-        orig_vdi_attached_here = vm_utils.vdi_attached_here
+        orig_vdi_attached = vm_utils.vdi_attached
         orig_image_download = fake_image._FakeImageService.download
         try:
-            vm_utils.vdi_attached_here = fake_vdi_attached_here
+            vm_utils.vdi_attached = fake_vdi_attached
             fake_image._FakeImageService.download = fake_image_download
             return function(self, *args, **kwargs)
         finally:
             fake_image._FakeImageService.download = orig_image_download
-            vm_utils.vdi_attached_here = orig_vdi_attached_here
+            vm_utils.vdi_attached = orig_vdi_attached
 
     return decorated_function
 
 
-def get_create_system_metadata(context, instance_type_id):
-    flavor = db.flavor_get(context, instance_type_id)
-    return flavors.save_flavor_info({}, flavor)
-
-
-def create_instance_with_system_metadata(context, instance_values, obj=False):
+def create_instance_with_system_metadata(context, instance_values):
     inst = objects.Instance(context=context,
                             system_metadata={})
     for k, v in instance_values.items():
         setattr(inst, k, v)
-    with mock.patch.object(inst, 'save'):
-        inst.set_flavor(objects.Flavor.get_by_id(
-            context,
-            instance_values['instance_type_id']))
+    inst.flavor = objects.Flavor.get_by_id(context,
+                                           instance_values['instance_type_id'])
+    inst.old_flavor = None
+    inst.new_flavor = None
     inst.create()
     inst.pci_devices = objects.PciDeviceList(objects=[])
 
-    if obj:
-        return inst
-    else:
-        return base.obj_to_primitive(inst)
+    return inst
 
 
 class XenAPIVolumeTestCase(stubs.XenAPITestBaseNoDB):
@@ -235,7 +234,7 @@ class XenAPIVolumeTestCase(stubs.XenAPITestBaseNoDB):
                             group='oslo_concurrency')
         self.flags(firewall_driver='nova.virt.xenapi.firewall.'
                                    'Dom0IptablesFirewallDriver')
-        self.flags(connection_url='test_url',
+        self.flags(connection_url='http://localhost',
                    connection_password='test_pass',
                    group='xenserver')
 
@@ -255,7 +254,7 @@ class XenAPIVolumeTestCase(stubs.XenAPITestBaseNoDB):
 
     def test_attach_volume(self):
         # This shows how to test Ops classes' methods.
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVolumeTests)
+        stubs.stubout_session(self, stubs.FakeSessionForVolumeTests)
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
         vm = xenapi_fake.create_vm(self.instance['name'], 'Running')
         conn_info = self._make_connection_info()
@@ -271,8 +270,7 @@ class XenAPIVolumeTestCase(stubs.XenAPITestBaseNoDB):
 
     def test_attach_volume_raise_exception(self):
         # This shows how to test when exceptions are raised.
-        stubs.stubout_session(self.stubs,
-                              stubs.FakeSessionForVolumeFailedTests)
+        stubs.stubout_session(self, stubs.FakeSessionForVolumeFailedTests)
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
         xenapi_fake.create_vm(self.instance['name'], 'Running')
         self.assertRaises(exception.VolumeDriverNotFound,
@@ -282,7 +280,8 @@ class XenAPIVolumeTestCase(stubs.XenAPITestBaseNoDB):
 
 
 # FIXME(sirp): convert this to use XenAPITestBaseNoDB
-class XenAPIVMTestCase(stubs.XenAPITestBase):
+class XenAPIVMTestCase(stubs.XenAPITestBase,
+                       test_diagnostics.DiagnosticsComparisonMixin):
     """Unit tests for VM operations."""
     def setUp(self):
         super(XenAPIVMTestCase, self).setUp()
@@ -294,30 +293,28 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
         self.flags(instance_name_template='%d',
                    firewall_driver='nova.virt.xenapi.firewall.'
                                    'Dom0IptablesFirewallDriver')
-        self.flags(connection_url='test_url',
+        self.flags(connection_url='http://localhost',
                    connection_password='test_pass',
                    group='xenserver')
-        db_fakes.stub_out_db_instance_api(self.stubs)
+        db_fakes.stub_out_db_instance_api(self)
         xenapi_fake.create_network('fake', 'fake_br1')
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
-        stubs.stubout_get_this_vm_uuid(self.stubs)
-        stubs.stub_out_vm_methods(self.stubs)
-        fake_processutils.stub_out_processutils_execute(self.stubs)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
+        self.stubout_get_this_vm_uuid()
+        self.stub_out_vm_methods()
+        fake_processutils.stub_out_processutils_execute(self)
         self.user_id = 'fake'
-        self.project_id = 'fake'
+        self.project_id = fakes.FAKE_PROJECT_ID
         self.context = context.RequestContext(self.user_id, self.project_id)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
         self.conn._session.is_local_connection = False
 
-        fake_image.stub_out_image_service(self.stubs)
+        fake_image.stub_out_image_service(self)
         set_image_fixtures()
-        stubs.stubout_image_service_download(self.stubs)
-        stubs.stubout_stream_disk(self.stubs)
+        self.stubout_image_service_download()
+        self.stubout_stream_disk()
 
-        def fake_inject_instance_metadata(self, instance, vm):
-            pass
-        self.stubs.Set(vmops.VMOps, '_inject_instance_metadata',
-                       fake_inject_instance_metadata)
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._inject_instance_metadata',
+                      lambda self, instance, vm: None)
 
         def fake_safe_copy_vdi(session, sr_ref, instance, vdi_to_copy_ref):
             name_label = "fakenamelabel"
@@ -326,11 +323,97 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
             return vm_utils.create_vdi(
                     session, sr_ref, instance, name_label, disk_type,
                     virtual_size)
-        self.stubs.Set(vm_utils, '_safe_copy_vdi', fake_safe_copy_vdi)
+        self.stub_out('nova.virt.xenapi.vm_utils._safe_copy_vdi',
+                      fake_safe_copy_vdi)
+
+        def fake_unpause_and_wait(self, vm_ref, instance, power_on):
+            self._update_last_dom_id(vm_ref)
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._unpause_and_wait',
+                       fake_unpause_and_wait)
 
     def tearDown(self):
         fake_image.FakeImageService_reset()
         super(XenAPIVMTestCase, self).tearDown()
+
+    def stubout_firewall_driver(self):
+        self.stub_out('nova.virt.firewall.IptablesFirewallDriver.'
+                      'prepare_instance_filter', lambda *args: None)
+        self.stub_out('nova.virt.firewall.IptablesFirewallDriver.'
+                      'instance_filter_exists', lambda *args: None)
+
+    def stubout_instance_snapshot(self):
+        self.stub_out('nova.virt.xenapi.vm_utils._fetch_image',
+                      lambda context, session, instance, name_label,
+                      image, type, image_handler: {
+                          'root': dict(uuid=stubs._make_fake_vdi(),
+                                       file=None),
+                          'kernel': dict(uuid=stubs._make_fake_vdi(),
+                                         file=None),
+                          'ramdisk': dict(uuid=stubs._make_fake_vdi(),
+                                          file=None)})
+        self.stub_out('nova.virt.xenapi.vm_utils._wait_for_vhd_coalesce',
+                      lambda *args: ("fakeparent", "fakebase"))
+
+    def stubout_image_service_download(self):
+        self.stub_out('nova.tests.unit.image.fake._FakeImageService.download',
+                      lambda *args, **kwargs: None)
+
+    def stubout_stream_disk(self):
+        self.stub_out('nova.virt.xenapi.vm_utils._stream_disk',
+                      lambda *args, **kwargs: None)
+
+    def stubout_is_snapshot(self):
+        """Always returns true
+
+            xenapi fake driver does not create vmrefs for snapshots.
+        """
+        self.stub_out('nova.virt.xenapi.vm_utils.is_snapshot',
+                      lambda *args: True)
+
+    def stubout_fetch_disk_image(self, raise_failure=False):
+        """Simulates a failure in fetch image_glance_disk."""
+
+        def _fake_fetch_disk_image(context, session, instance, name_label,
+                                   image, image_type):
+            if raise_failure:
+                raise XenAPI.Failure("Test Exception raised by "
+                                     "fake fetch_image_glance_disk")
+            elif image_type == vm_utils.ImageType.KERNEL:
+                filename = "kernel"
+            elif image_type == vm_utils.ImageType.RAMDISK:
+                filename = "ramdisk"
+            else:
+                filename = "unknown"
+
+            vdi_type = vm_utils.ImageType.to_string(image_type)
+            return {vdi_type: dict(uuid=None, file=filename)}
+
+        self.stub_out('nova.virt.xenapi.vm_utils._fetch_disk_image',
+                      _fake_fetch_disk_image)
+
+    def stubout_create_vm(self):
+        """Simulates a failure in create_vm."""
+
+        def f(*args):
+            raise XenAPI.Failure("Test Exception raised by fake create_vm")
+        self.stub_out('nova.virt.xenapi.vm_utils.create_vm', f)
+
+    def stubout_attach_disks(self):
+        """Simulates a failure in _attach_disks."""
+
+        def f(*args):
+            raise XenAPI.Failure("Test Exception raised by fake _attach_disks")
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._attach_disks', f)
+
+    def stub_out_vm_methods(self):
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._acquire_bootlock',
+                      lambda self, vm: None)
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._release_bootlock',
+                      lambda self, vm: None)
+        self.stub_out('nova.virt.xenapi.vm_utils.generate_ephemeral',
+                      lambda *args: None)
+        self.stub_out('nova.virt.xenapi.vm_utils._wait_for_device',
+                      lambda session, dev, dom0, max_seconds: None)
 
     def test_init_host(self):
         session = get_session()
@@ -349,23 +432,21 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
         self.conn.init_host(None)
         self.assertEqual(set(xenapi_fake.get_all('VBD')), set([vbd0, vbd2]))
 
-    def test_instance_exists(self):
-        self.mox.StubOutWithMock(vm_utils, 'lookup')
-        vm_utils.lookup(mox.IgnoreArg(), 'foo').AndReturn(True)
-        self.mox.ReplayAll()
-
-        self.stubs.Set(objects.Instance, 'name', 'foo')
-        instance = objects.Instance(uuid='fake-uuid')
+    @mock.patch.object(objects.Instance, 'name',
+                       new_callable=mock.PropertyMock(return_value='foo'))
+    @mock.patch.object(vm_utils, 'lookup', return_value=True)
+    def test_instance_exists(self, mock_lookup, mock_name):
+        instance = objects.Instance(uuid=uuids.instance)
         self.assertTrue(self.conn.instance_exists(instance))
+        mock_lookup.assert_called_once_with(mock.ANY, 'foo')
 
-    def test_instance_not_exists(self):
-        self.mox.StubOutWithMock(vm_utils, 'lookup')
-        vm_utils.lookup(mox.IgnoreArg(), 'bar').AndReturn(None)
-        self.mox.ReplayAll()
-
-        self.stubs.Set(objects.Instance, 'name', 'bar')
-        instance = objects.Instance(uuid='fake-uuid')
+    @mock.patch.object(objects.Instance, 'name',
+                       new_callable=mock.PropertyMock(return_value='bar'))
+    @mock.patch.object(vm_utils, 'lookup', return_value=None)
+    def test_instance_not_exists(self, mock_lookup, mock_name):
+        instance = objects.Instance(uuid=uuids.instance)
         self.assertFalse(self.conn.instance_exists(instance))
+        mock_lookup.assert_called_once_with(mock.ANY, 'bar')
 
     def test_list_instances_0(self):
         instances = self.conn.list_instances()
@@ -377,7 +458,7 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
 
     def test_list_instance_uuids(self):
         uuids = []
-        for x in xrange(1, 4):
+        for x in range(1, 4):
             instance = self._create_instance()
             uuids.append(instance['uuid'])
         instance_uuids = self.conn.list_instance_uuids()
@@ -407,12 +488,13 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
         'last_update': '1328795567',
     }
 
-    def test_get_diagnostics(self):
+    @mock.patch.object(vm_utils, '_get_rrd')
+    def test_get_diagnostics(self, mock_get_rrd):
         def fake_get_rrd(host, vm_uuid):
             path = os.path.dirname(os.path.realpath(__file__))
             with open(os.path.join(path, 'vm_rrd.xml')) as f:
                 return re.sub(r'\s', '', f.read())
-        self.stubs.Set(vm_utils, '_get_rrd', fake_get_rrd)
+        mock_get_rrd.side_effect = fake_get_rrd
 
         expected = self.expected_raw_diagnostics
         instance = self._create_instance()
@@ -420,41 +502,50 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
         self.assertThat(actual, matchers.DictMatches(expected))
 
     def test_get_instance_diagnostics(self):
-        def fake_get_rrd(host, vm_uuid):
-            path = os.path.dirname(os.path.realpath(__file__))
-            with open(os.path.join(path, 'vm_rrd.xml')) as f:
-                return re.sub(r'\s', '', f.read())
-        self.stubs.Set(vm_utils, '_get_rrd', fake_get_rrd)
+        expected = fake_diagnostics.fake_diagnostics_obj(
+            config_drive=False,
+            state='running',
+            driver='xenapi',
+            cpu_details=[{'id': 0, 'utilisation': 11},
+                         {'id': 1, 'utilisation': 22},
+                         {'id': 2, 'utilisation': 33},
+                         {'id': 3, 'utilisation': 44}],
+            nic_details=[{'mac_address': 'DE:AD:BE:EF:00:01',
+                          'rx_rate': 50,
+                          'tx_rate': 100}],
+            disk_details=[{'read_bytes': 50, 'write_bytes': 100}],
+            memory_details={'maximum': 8192, 'used': 3072})
 
-        expected = {
-            'config_drive': False,
-            'state': 'running',
-            'driver': 'xenapi',
-            'version': '1.0',
-            'uptime': 0,
-            'hypervisor_os': None,
-            'cpu_details': [{'time': 0}, {'time': 0},
-                            {'time': 0}, {'time': 0}],
-            'nic_details': [{'mac_address': '00:00:00:00:00:00',
-                             'rx_drop': 0,
-                             'rx_errors': 0,
-                             'rx_octets': 0,
-                             'rx_packets': 0,
-                             'tx_drop': 0,
-                             'tx_errors': 0,
-                             'tx_octets': 0,
-                             'tx_packets': 0}],
-            'disk_details': [{'errors_count': 0,
-                              'id': '',
-                              'read_bytes': 0,
-                              'read_requests': 0,
-                              'write_bytes': 0,
-                              'write_requests': 0}],
-            'memory_details': {'maximum': 8192, 'used': 0}}
-
-        instance = self._create_instance()
+        instance = self._create_instance(obj=True)
         actual = self.conn.get_instance_diagnostics(instance)
-        self.assertEqual(expected, actual.serialize())
+
+        self.assertDiagnosticsEqual(expected, actual)
+
+    def _test_get_instance_diagnostics_failure(self, **kwargs):
+        instance = self._create_instance(obj=True)
+
+        with mock.patch.object(xenapi_fake.SessionBase, 'VM_query_data_source',
+                               **kwargs):
+            actual = self.conn.get_instance_diagnostics(instance)
+
+        expected = fake_diagnostics.fake_diagnostics_obj(
+                config_drive=False,
+                state='running',
+                driver='xenapi',
+                cpu_details=[{'id': 0}, {'id': 1}, {'id': 2}, {'id': 3}],
+                nic_details=[{'mac_address': 'DE:AD:BE:EF:00:01'}],
+                disk_details=[{}],
+                memory_details={'maximum': None, 'used': None})
+
+        self.assertDiagnosticsEqual(expected, actual)
+
+    def test_get_instance_diagnostics_xenapi_exception(self):
+        self._test_get_instance_diagnostics_failure(
+                side_effect=XenAPI.Failure(''))
+
+    def test_get_instance_diagnostics_nan_value(self):
+        self._test_get_instance_diagnostics_failure(
+                return_value=float('NaN'))
 
     def test_get_vnc_console(self):
         instance = self._create_instance(obj=True)
@@ -504,8 +595,9 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
         self.assertRaises(exception.InstanceNotReady,
                           conn.get_vnc_console, self.context, instance)
 
-    def test_instance_snapshot_fails_with_no_primary_vdi(self):
-
+    @mock.patch.object(vm_utils, 'create_vbd')
+    def test_instance_snapshot_fails_with_no_primary_vdi(
+            self, mock_create_vbd):
         def create_bad_vbd(session, vm_ref, vdi_ref, userdevice,
                            vbd_type='disk', read_only=False, bootable=False,
                            osvol=False):
@@ -517,11 +609,11 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
             xenapi_fake.after_VBD_create(vbd_ref, vbd_rec)
             return vbd_ref
 
-        self.stubs.Set(vm_utils, 'create_vbd', create_bad_vbd)
-        stubs.stubout_instance_snapshot(self.stubs)
+        mock_create_vbd.side_effect = create_bad_vbd
+        self.stubout_instance_snapshot()
         # Stubbing out firewall driver as previous stub sets alters
         # xml rpc result parsing
-        stubs.stubout_firewall_driver(self.stubs, self.conn)
+        self.stubout_firewall_driver()
         instance = self._create_instance()
 
         image_id = "my_snapshot_id"
@@ -529,7 +621,8 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
                           self.context, instance, image_id,
                           lambda *args, **kwargs: None)
 
-    def test_instance_snapshot(self):
+    @mock.patch.object(glance.GlanceStore, 'upload_image')
+    def test_instance_snapshot(self, mock_upload_image):
         expected_calls = [
             {'args': (),
              'kwargs':
@@ -541,25 +634,24 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
         func_call_matcher = matchers.FunctionCallMatcher(expected_calls)
         image_id = "my_snapshot_id"
 
-        stubs.stubout_instance_snapshot(self.stubs)
-        stubs.stubout_is_snapshot(self.stubs)
+        self.stubout_instance_snapshot()
+        self.stubout_is_snapshot()
         # Stubbing out firewall driver as previous stub sets alters
         # xml rpc result parsing
-        stubs.stubout_firewall_driver(self.stubs, self.conn)
+        self.stubout_firewall_driver()
 
         instance = self._create_instance()
 
         self.fake_upload_called = False
 
-        def fake_image_upload(_self, ctx, session, inst, img_id, vdi_uuids):
+        def fake_image_upload(ctx, session, inst, img_id, vdi_uuids):
             self.fake_upload_called = True
             self.assertEqual(ctx, self.context)
             self.assertEqual(inst, instance)
             self.assertIsInstance(vdi_uuids, list)
             self.assertEqual(img_id, image_id)
 
-        self.stubs.Set(glance.GlanceStore, 'upload_image',
-                       fake_image_upload)
+        mock_upload_image.side_effect = fake_image_upload
 
         self.conn.snapshot(self.context, instance, image_id,
                            func_call_matcher.call)
@@ -599,22 +691,20 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
         # Get Nova record for VM
         vm_info = conn.get_info({'name': name})
         # Get XenAPI record for VM
-        vms = [rec for ref, rec
-               in xenapi_fake.get_all_records('VM').iteritems()
+        vms = [rec for rec
+               in xenapi_fake.get_all_records('VM').values()
                if not rec['is_control_domain']]
         vm = vms[0]
         self.vm_info = vm_info
         self.vm = vm
 
     def check_vm_record(self, conn, instance_type_id, check_injection):
-        flavor = db.flavor_get(conn, instance_type_id)
-        mem_kib = long(flavor['memory_mb']) << 10
+        flavor = objects.Flavor.get_by_id(self.context, instance_type_id)
+        mem_kib = int(flavor['memory_mb']) << 10
         mem_bytes = str(mem_kib << 10)
         vcpus = flavor['vcpus']
         vcpu_weight = flavor['vcpu_weight']
 
-        self.assertEqual(self.vm_info.max_mem_kb, mem_kib)
-        self.assertEqual(self.vm_info.mem_kb, mem_kib)
         self.assertEqual(self.vm['memory_static_max'], mem_bytes)
         self.assertEqual(self.vm['memory_dynamic_max'], mem_bytes)
         self.assertEqual(self.vm['memory_dynamic_min'], mem_bytes)
@@ -709,7 +799,9 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
                 else:
                     self.fail('Found unexpected VDI:%s' % vdi_ref)
 
+    @mock.patch.object(vmops.VMOps, '_inject_instance_metadata')
     def _test_spawn(self, image_ref, kernel_id, ramdisk_id,
+                    mock_inject_instance_metadata,
                     instance_type_id="3", os_type="linux",
                     hostname="test", architecture="x86-64", instance_id=1,
                     injected_files=None, check_injection=False,
@@ -719,21 +811,17 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
         if injected_files is None:
             injected_files = []
 
-        # Fake out inject_instance_metadata
-        def fake_inject_instance_metadata(self, instance, vm):
-            pass
-        self.stubs.Set(vmops.VMOps, '_inject_instance_metadata',
-                       fake_inject_instance_metadata)
-
         if create_record:
+            flavor = objects.Flavor.get_by_id(self.context,
+                                              instance_type_id)
             instance = objects.Instance(context=self.context)
             instance.project_id = self.project_id
             instance.user_id = self.user_id
             instance.image_ref = image_ref
             instance.kernel_id = kernel_id
             instance.ramdisk_id = ramdisk_id
-            instance.root_gb = 20
-            instance.ephemeral_gb = 0
+            instance.root_gb = flavor.root_gb
+            instance.ephemeral_gb = flavor.ephemeral_gb
             instance.instance_type_id = instance_type_id
             instance.os_type = os_type
             instance.hostname = hostname
@@ -741,82 +829,115 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
             instance.architecture = architecture
             instance.system_metadata = {}
 
-            flavor = objects.Flavor.get_by_id(self.context,
-                                              instance_type_id)
-            if instance_type_id == 5:
-                # NOTE(danms): xenapi test stubs have flavor 5 with no
-                # vcpu_weight
-                flavor.vcpu_weight = None
-            with mock.patch.object(instance, 'save'):
-                instance.set_flavor(flavor)
+            instance.flavor = flavor
             instance.create()
         else:
-            instance = objects.Instance.get_by_id(self.context, instance_id)
+            instance = objects.Instance.get_by_id(self.context, instance_id,
+                                                  expected_attrs=['flavor'])
 
-        network_info = fake_network.fake_get_instance_nw_info(self.stubs)
+        network_info = fake_network.fake_get_instance_nw_info(self)
         if empty_dns:
             # NOTE(tr3buchet): this is a terrible way to do this...
             network_info[0]['network']['subnets'][0]['dns'] = []
 
-        image_meta = {}
-        if image_ref:
-            image_meta = IMAGE_FIXTURES[image_ref]["image_meta"]
+        image_meta = objects.ImageMeta.from_dict(
+            IMAGE_FIXTURES[image_ref]["image_meta"])
         self.conn.spawn(self.context, instance, image_meta, injected_files,
-                        'herp', network_info, block_device_info)
+                        'herp', {}, network_info, block_device_info)
         self.create_vm_record(self.conn, os_type, instance['name'])
         self.check_vm_record(self.conn, instance_type_id, check_injection)
         self.assertEqual(instance['os_type'], os_type)
         self.assertEqual(instance['architecture'], architecture)
 
-    def test_spawn_ipxe_iso_success(self):
-        self.mox.StubOutWithMock(vm_utils, 'get_sr_path')
-        vm_utils.get_sr_path(mox.IgnoreArg()).AndReturn('/sr/path')
-
+    @mock.patch.object(session.XenAPISession, 'call_plugin_serialized')
+    @mock.patch.object(vm_utils, 'get_sr_path', return_value='/sr/path')
+    def test_spawn_ipxe_iso_success(self, mock_get_sr_path,
+                                    mock_call_plugin_serialized):
         self.flags(ipxe_network_name='test1',
                    ipxe_boot_menu_url='http://boot.example.com',
                    ipxe_mkisofs_cmd='/root/mkisofs',
                    group='xenserver')
-        self.mox.StubOutWithMock(self.conn._session, 'call_plugin_serialized')
-        self.conn._session.call_plugin_serialized(
-            'ipxe', 'inject', '/sr/path', mox.IgnoreArg(),
-            'http://boot.example.com', '192.168.1.100', '255.255.255.0',
-            '192.168.1.1', '192.168.1.3', '/root/mkisofs')
 
-        self.mox.ReplayAll()
         self._test_spawn(IMAGE_IPXE_ISO, None, None)
 
-    def test_spawn_ipxe_iso_no_network_name(self):
+        mock_get_sr_path.assert_called_once_with(mock.ANY)
+        mock_call_plugin_serialized.assert_has_calls([
+            mock.call('ipxe.py', 'inject', '/sr/path', mock.ANY,
+                      'http://boot.example.com', '192.168.1.100',
+                      '255.255.255.0', '192.168.1.1', '192.168.1.3',
+                      '/root/mkisofs'),
+            mock.call('partition_utils.py', 'make_partition',
+                      'fakedev', '2048', '-')])
+
+    @mock.patch.object(session.XenAPISession, 'call_plugin_serialized')
+    def test_spawn_ipxe_iso_no_network_name(self, mock_call_plugin_serialized):
         self.flags(ipxe_network_name=None,
                    ipxe_boot_menu_url='http://boot.example.com',
                    group='xenserver')
 
-        # call_plugin_serialized shouldn't be called
-        self.mox.StubOutWithMock(self.conn._session, 'call_plugin_serialized')
-
-        self.mox.ReplayAll()
         self._test_spawn(IMAGE_IPXE_ISO, None, None)
+        self._check_call_plugin_serialized(mock_call_plugin_serialized)
 
-    def test_spawn_ipxe_iso_no_boot_menu_url(self):
+    @mock.patch.object(session.XenAPISession, 'call_plugin_serialized')
+    def test_spawn_ipxe_iso_no_boot_menu_url(
+            self, mock_call_plugin_serialized):
         self.flags(ipxe_network_name='test1',
                    ipxe_boot_menu_url=None,
                    group='xenserver')
 
-        # call_plugin_serialized shouldn't be called
-        self.mox.StubOutWithMock(self.conn._session, 'call_plugin_serialized')
-
-        self.mox.ReplayAll()
         self._test_spawn(IMAGE_IPXE_ISO, None, None)
+        self._check_call_plugin_serialized(mock_call_plugin_serialized)
 
-    def test_spawn_ipxe_iso_unknown_network_name(self):
+    def _check_call_plugin_serialized(self, mock_call_plugin_serialized):
+        vifs = xenapi_fake.get_all_records('VIF')
+        iface_id = vifs[list(vifs)[0]]['other_config']['neutron-port-id']
+
+        def _get_qbr_name(iface_id):
+            return ("qbr" + iface_id)[:network_model.NIC_NAME_LEN]
+
+        def _get_veth_pair_names(iface_id):
+            return (("qvb%s" % iface_id)[:network_model.NIC_NAME_LEN],
+                    ("qvo%s" % iface_id)[:network_model.NIC_NAME_LEN])
+
+        def _get_patch_port_pair_names(iface_id):
+            return (("vif%s" % iface_id)[:network_model.NIC_NAME_LEN],
+                    ("tap%s" % iface_id)[:network_model.NIC_NAME_LEN])
+
+        # ipxe inject shouldn't be called
+        call1 = mock.call('partition_utils.py', 'make_partition', 'fakedev',
+                          '2048', '-')
+        linux_br_name = _get_qbr_name(iface_id)
+        qvb_name, qvo_name = _get_veth_pair_names(iface_id)
+        patch_port1, tap_name = _get_patch_port_pair_names(iface_id)
+
+        args = {'cmd': 'ip_link_get_dev',
+                'args': {'device_name': linux_br_name}
+                }
+        call2 = mock.call('xenhost.py', 'network_config', args)
+
+        args = {'cmd': 'ip_link_get_dev',
+                'args': {'device_name': qvo_name}
+                }
+        call3 = mock.call('xenhost.py', 'network_config', args)
+
+        args = {'cmd': 'ip_link_get_dev',
+                'args': {'device_name': tap_name}
+                }
+        call4 = mock.call('xenhost.py', 'network_config', args)
+        mock_call_plugin_serialized.assert_has_calls([call1,
+                                                      call2,
+                                                      call3,
+                                                      call4])
+
+    @mock.patch.object(session.XenAPISession, 'call_plugin_serialized')
+    def test_spawn_ipxe_iso_unknown_network_name(
+            self, mock_call_plugin_serialized):
         self.flags(ipxe_network_name='test2',
                    ipxe_boot_menu_url='http://boot.example.com',
                    group='xenserver')
 
-        # call_plugin_serialized shouldn't be called
-        self.mox.StubOutWithMock(self.conn._session, 'call_plugin_serialized')
-
-        self.mox.ReplayAll()
         self._test_spawn(IMAGE_IPXE_ISO, None, None)
+        self._check_call_plugin_serialized(mock_call_plugin_serialized)
 
     def test_spawn_empty_dns(self):
         # Test spawning with an empty dns list.
@@ -826,9 +947,9 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
         self.check_vm_params_for_linux()
 
     def test_spawn_not_enough_memory(self):
-        self.assertRaises(exception.InsufficientFreeMemory,
-                          self._test_spawn,
-                          '1', 2, 3, "4")  # m1.xlarge
+        self.assertRaises(exception.InsufficientFreeMemory, self._test_spawn,
+                          IMAGE_MACHINE, IMAGE_KERNEL,
+                          IMAGE_RAMDISK, instance_type_id="4")  # m1.xlarge
 
     def test_spawn_fail_cleanup_1(self):
         """Simulates an error while downloading an image.
@@ -837,9 +958,9 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
         """
         vdi_recs_start = self._list_vdis()
         start_vms = self._list_vms()
-        stubs.stubout_fetch_disk_image(self.stubs, raise_failure=True)
-        self.assertRaises(xenapi_fake.Failure,
-                          self._test_spawn, '1', 2, 3)
+        self.stubout_fetch_disk_image(raise_failure=True)
+        self.assertRaises(XenAPI.Failure, self._test_spawn,
+                          IMAGE_MACHINE, IMAGE_KERNEL, IMAGE_RAMDISK)
         # No additional VDI should be found.
         vdi_recs_end = self._list_vdis()
         end_vms = self._list_vms()
@@ -854,9 +975,9 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
         """
         vdi_recs_start = self._list_vdis()
         start_vms = self._list_vms()
-        stubs.stubout_create_vm(self.stubs)
-        self.assertRaises(xenapi_fake.Failure,
-                          self._test_spawn, '1', 2, 3)
+        self.stubout_create_vm()
+        self.assertRaises(XenAPI.Failure, self._test_spawn,
+                          IMAGE_MACHINE, IMAGE_KERNEL, IMAGE_RAMDISK)
         # No additional VDI should be found.
         vdi_recs_end = self._list_vdis()
         end_vms = self._list_vms()
@@ -869,11 +990,11 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
 
         Verifies that the VM and VDIs created are properly cleaned up.
         """
-        stubs.stubout_attach_disks(self.stubs)
+        self.stubout_attach_disks()
         vdi_recs_start = self._list_vdis()
         start_vms = self._list_vms()
-        self.assertRaises(xenapi_fake.Failure,
-                          self._test_spawn, '1', 2, 3)
+        self.assertRaises(XenAPI.Failure, self._test_spawn,
+                          IMAGE_MACHINE, IMAGE_KERNEL, IMAGE_RAMDISK)
         # No additional VDI should be found.
         vdi_recs_end = self._list_vdis()
         end_vms = self._list_vms()
@@ -890,7 +1011,8 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
                          os_type="linux", architecture="x86-64")
         self.check_vm_params_for_linux()
 
-    def test_spawn_vhd_glance_windows(self):
+    @mock.patch('nova.privsep.fs.mkfs')
+    def test_spawn_vhd_glance_windows(self, fake_mkfs):
         self._test_spawn(IMAGE_VHD, None, None,
                          os_type="windows", architecture="i386",
                          instance_type_id=5)
@@ -901,7 +1023,8 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
                          os_type="windows", architecture="i386")
         self.check_vm_params_for_windows()
 
-    def test_spawn_glance(self):
+    @mock.patch.object(vm_utils, '_fetch_disk_image')
+    def test_spawn_glance(self, mock_fetch_disk_image):
 
         def fake_fetch_disk_image(context, session, instance, name_label,
                                   image_id, image_type):
@@ -912,18 +1035,12 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
             vdi_role = vm_utils.ImageType.get_role(image_type)
             vdi_uuid = session.call_xenapi("VDI.get_uuid", vdi_ref)
             return {vdi_role: dict(uuid=vdi_uuid, file=None)}
-        self.stubs.Set(vm_utils, '_fetch_disk_image',
-                       fake_fetch_disk_image)
+        mock_fetch_disk_image.side_effect = fake_fetch_disk_image
 
         self._test_spawn(IMAGE_MACHINE,
                          IMAGE_KERNEL,
                          IMAGE_RAMDISK)
         self.check_vm_params_for_linux_with_external_kernel()
-
-    def test_spawn_boot_from_volume_no_image_meta(self):
-        dev_info = get_fake_device_info()
-        self._test_spawn(None, None, None,
-                         block_device_info=dev_info)
 
     def test_spawn_boot_from_volume_no_glance_image_meta(self):
         dev_info = get_fake_device_info()
@@ -937,60 +1054,32 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
 
     @testtools.skipIf(test_utils.is_osx(),
                       'IPv6 pretty-printing broken on OSX, see bug 1409135')
-    def test_spawn_netinject_file(self):
+    @mock.patch.object(nova.privsep.path, 'readlink')
+    @mock.patch.object(nova.privsep.path, 'writefile')
+    @mock.patch.object(nova.privsep.path, 'makedirs')
+    @mock.patch.object(nova.privsep.path, 'chown')
+    @mock.patch.object(nova.privsep.path, 'chmod')
+    @mock.patch.object(nova.privsep.fs, 'mount', return_value=(None, None))
+    @mock.patch.object(nova.privsep.fs, 'umount')
+    def test_spawn_netinject_file(self, umount, mount, chmod, chown, mkdir,
+                                  write_file, read_link):
         self.flags(flat_injected=True)
-        db_fakes.stub_out_db_instance_api(self.stubs, injected=True)
+        db_fakes.stub_out_db_instance_api(self, injected=True)
 
-        self._tee_executed = False
-
-        def _tee_handler(cmd, **kwargs):
-            actual = kwargs.get('process_input', None)
-            expected = """\
-# Injected by Nova on instance boot
-#
-# This file describes the network interfaces available on your system
-# and how to activate them. For more information, see interfaces(5).
-
-# The loopback network interface
-auto lo
-iface lo inet loopback
-
-auto eth0
-iface eth0 inet static
-    hwaddress ether DE:AD:BE:EF:00:01
-    address 192.168.1.100
-    netmask 255.255.255.0
-    broadcast 192.168.1.255
-    gateway 192.168.1.1
-    dns-nameservers 192.168.1.3 192.168.1.4
-iface eth0 inet6 static
-    hwaddress ether DE:AD:BE:EF:00:01
-    address 2001:db8:0:1:dcad:beff:feef:1
-    netmask 64
-    gateway 2001:db8:0:1::1
-"""
-            self.assertEqual(expected, actual)
-            self._tee_executed = True
-            return '', ''
-
-        def _readlink_handler(cmd_parts, **kwargs):
-            return os.path.realpath(cmd_parts[2]), ''
-
-        fake_processutils.fake_execute_set_repliers([
-            # Capture the tee .../etc/network/interfaces command
-            (r'tee.*interfaces', _tee_handler),
-            (r'readlink -nm.*', _readlink_handler),
-        ])
         self._test_spawn(IMAGE_MACHINE,
                          IMAGE_KERNEL,
                          IMAGE_RAMDISK,
                          check_injection=True)
-        self.assertTrue(self._tee_executed)
+        read_link.assert_called()
+        mkdir.assert_called()
+        chown.assert_called()
+        chmod.assert_called()
+        write_file.assert_called()
 
     @testtools.skipIf(test_utils.is_osx(),
                       'IPv6 pretty-printing broken on OSX, see bug 1409135')
     def test_spawn_netinject_xenstore(self):
-        db_fakes.stub_out_db_instance_api(self.stubs, injected=True)
+        db_fakes.stub_out_db_instance_api(self, injected=True)
 
         self._tee_executed = False
 
@@ -1027,33 +1116,41 @@ iface eth0 inet6 static
             (r'mount', _mount_handler),
             (r'umount', _umount_handler),
             (r'tee.*interfaces', _tee_handler)])
-        self._test_spawn('1', 2, 3, check_injection=True)
+        self._test_spawn(IMAGE_MACHINE, IMAGE_KERNEL,
+                         IMAGE_RAMDISK, check_injection=True)
 
         # tee must not run in this case, where an injection-capable
         # guest agent is detected
         self.assertFalse(self._tee_executed)
 
-    def test_spawn_injects_auto_disk_config_to_xenstore(self):
+    @mock.patch.object(vmops.VMOps, '_inject_auto_disk_config')
+    def test_spawn_injects_auto_disk_config_to_xenstore(
+            self, mock_inject_auto_disk_config):
         instance = self._create_instance(spawn=False, obj=True)
-        self.mox.StubOutWithMock(self.conn._vmops, '_inject_auto_disk_config')
-        self.conn._vmops._inject_auto_disk_config(instance, mox.IgnoreArg())
-        self.mox.ReplayAll()
-        self.conn.spawn(self.context, instance,
-                        IMAGE_FIXTURES['1']["image_meta"], [], 'herp', '')
+        image_meta = objects.ImageMeta.from_dict(
+            IMAGE_FIXTURES[IMAGE_MACHINE]["image_meta"])
+        self.conn.spawn(self.context, instance, image_meta, [], 'herp', {}, '')
 
-    def test_spawn_vlanmanager(self):
+        mock_inject_auto_disk_config.assert_called_once_with(instance,
+                                                             mock.ANY)
+
+    @mock.patch.object(vmops.VMOps, '_create_vifs')
+    @mock.patch('nova.privsep.linux_net.add_bridge', return_value=('', ''))
+    @mock.patch('nova.privsep.linux_net.set_device_mtu')
+    @mock.patch('nova.privsep.linux_net.set_device_enabled')
+    @mock.patch('nova.privsep.linux_net.set_device_macaddr')
+    @mock.patch('nova.privsep.linux_net.change_ip')
+    @mock.patch('nova.privsep.linux_net.address_command_deprecated')
+    def test_spawn_vlanmanager(self, mock_address_command_deprecated,
+                               mock_change_ip, mock_set_macaddr,
+                               mock_set_enabled, mock_set_mtu, mock_add_bridge,
+                               mock_create_vifs):
         self.flags(network_manager='nova.network.manager.VlanManager',
                    vlan_interface='fake0')
-
-        def dummy(*args, **kwargs):
-            pass
-
-        self.stubs.Set(vmops.VMOps, '_create_vifs', dummy)
         # Reset network table
         xenapi_fake.reset_table('network')
         # Instance 2 will use vlan network (see db/fakes.py)
         ctxt = self.context.elevated()
-        self.network.conductor_api = conductor_api.LocalAPI()
         inst2 = self._create_instance(False, obj=True)
         networks = self.network.db.network_get_all(ctxt)
         with mock.patch('nova.objects.network.Network._from_db_object'):
@@ -1081,93 +1178,92 @@ iface eth0 inet6 static
         self._create_instance()
         for vif_ref in xenapi_fake.get_all('VIF'):
             vif_rec = xenapi_fake.get_record('VIF', vif_ref)
-            self.assertEqual(vif_rec['qos_algorithm_type'], 'ratelimit')
-            self.assertEqual(vif_rec['qos_algorithm_params']['kbps'],
-                             str(3 * 10 * 1024))
+            self.assertEqual(vif_rec['qos_algorithm_type'], '')
+            self.assertEqual(vif_rec['qos_algorithm_params'], {})
 
-    def test_spawn_ssh_key_injection(self):
+    @mock.patch.object(crypto, 'ssh_encrypt_text')
+    @mock.patch.object(stubs.FakeSessionForVMTests,
+                       '_plugin_agent_inject_file')
+    def test_spawn_ssh_key_injection(self, mock_plugin_agent_inject_file,
+                                     mock_ssh_encrypt_text):
         # Test spawning with key_data on an instance.  Should use
         # agent file injection.
         self.flags(use_agent_default=True,
                    group='xenserver')
         actual_injected_files = []
 
-        def fake_inject_file(self, method, args):
+        def fake_inject_file(method, args):
             path = base64.b64decode(args['b64_path'])
             contents = base64.b64decode(args['b64_contents'])
             actual_injected_files.append((path, contents))
             return jsonutils.dumps({'returncode': '0', 'message': 'success'})
-
-        self.stubs.Set(stubs.FakeSessionForVMTests,
-                       '_plugin_agent_inject_file', fake_inject_file)
+        mock_plugin_agent_inject_file.side_effect = fake_inject_file
 
         def fake_encrypt_text(sshkey, new_pass):
             self.assertEqual("ssh-rsa fake_keydata", sshkey)
             return "fake"
+        mock_ssh_encrypt_text.side_effect = fake_encrypt_text
 
-        self.stubs.Set(crypto, 'ssh_encrypt_text', fake_encrypt_text)
+        expected_data = (b'\n# The following ssh key was injected by '
+                         b'Nova\nssh-rsa fake_keydata\n')
 
-        expected_data = ('\n# The following ssh key was injected by '
-                         'Nova\nssh-rsa fake_keydata\n')
-
-        injected_files = [('/root/.ssh/authorized_keys', expected_data)]
+        injected_files = [(b'/root/.ssh/authorized_keys', expected_data)]
         self._test_spawn(IMAGE_VHD, None, None,
                          os_type="linux", architecture="x86-64",
                          key_data='ssh-rsa fake_keydata')
         self.assertEqual(actual_injected_files, injected_files)
 
-    def test_spawn_ssh_key_injection_non_rsa(self):
+    @mock.patch.object(crypto, 'ssh_encrypt_text',
+                       side_effect=NotImplementedError("Should not be called"))
+    @mock.patch.object(stubs.FakeSessionForVMTests,
+                       '_plugin_agent_inject_file')
+    def test_spawn_ssh_key_injection_non_rsa(
+            self, mock_plugin_agent_inject_file, mock_ssh_encrypt_text):
         # Test spawning with key_data on an instance.  Should use
         # agent file injection.
         self.flags(use_agent_default=True,
                    group='xenserver')
         actual_injected_files = []
 
-        def fake_inject_file(self, method, args):
+        def fake_inject_file(method, args):
             path = base64.b64decode(args['b64_path'])
             contents = base64.b64decode(args['b64_contents'])
             actual_injected_files.append((path, contents))
             return jsonutils.dumps({'returncode': '0', 'message': 'success'})
+        mock_plugin_agent_inject_file.side_effect = fake_inject_file
 
-        self.stubs.Set(stubs.FakeSessionForVMTests,
-                       '_plugin_agent_inject_file', fake_inject_file)
+        expected_data = (b'\n# The following ssh key was injected by '
+                         b'Nova\nssh-dsa fake_keydata\n')
 
-        def fake_encrypt_text(sshkey, new_pass):
-            raise NotImplementedError("Should not be called")
-
-        self.stubs.Set(crypto, 'ssh_encrypt_text', fake_encrypt_text)
-
-        expected_data = ('\n# The following ssh key was injected by '
-                         'Nova\nssh-dsa fake_keydata\n')
-
-        injected_files = [('/root/.ssh/authorized_keys', expected_data)]
+        injected_files = [(b'/root/.ssh/authorized_keys', expected_data)]
         self._test_spawn(IMAGE_VHD, None, None,
                          os_type="linux", architecture="x86-64",
                          key_data='ssh-dsa fake_keydata')
         self.assertEqual(actual_injected_files, injected_files)
 
-    def test_spawn_injected_files(self):
+    @mock.patch.object(stubs.FakeSessionForVMTests,
+                       '_plugin_agent_inject_file')
+    def test_spawn_injected_files(self, mock_plugin_agent_inject_file):
         # Test spawning with injected_files.
         self.flags(use_agent_default=True,
                    group='xenserver')
         actual_injected_files = []
 
-        def fake_inject_file(self, method, args):
+        def fake_inject_file(method, args):
             path = base64.b64decode(args['b64_path'])
             contents = base64.b64decode(args['b64_contents'])
             actual_injected_files.append((path, contents))
             return jsonutils.dumps({'returncode': '0', 'message': 'success'})
-        self.stubs.Set(stubs.FakeSessionForVMTests,
-                       '_plugin_agent_inject_file', fake_inject_file)
+        mock_plugin_agent_inject_file.side_effect = fake_inject_file
 
-        injected_files = [('/tmp/foo', 'foobar')]
+        injected_files = [(b'/tmp/foo', b'foobar')]
         self._test_spawn(IMAGE_VHD, None, None,
                          os_type="linux", architecture="x86-64",
                          injected_files=injected_files)
         self.check_vm_params_for_linux()
         self.assertEqual(actual_injected_files, injected_files)
 
-    @mock.patch('nova.db.agent_build_get_by_triple')
+    @mock.patch('nova.db.api.agent_build_get_by_triple')
     def test_spawn_agent_upgrade(self, mock_get):
         self.flags(use_agent_default=True,
                    group='xenserver')
@@ -1182,7 +1278,7 @@ iface eth0 inet6 static
         self._test_spawn(IMAGE_VHD, None, None,
                          os_type="linux", architecture="x86-64")
 
-    @mock.patch('nova.db.agent_build_get_by_triple')
+    @mock.patch('nova.db.api.agent_build_get_by_triple')
     def test_spawn_agent_upgrade_fails_silently(self, mock_get):
         mock_get.return_value = {"version": "1.1.0", "architecture": "x86-64",
                                  "hypervisor": "xen", "os": "windows",
@@ -1194,51 +1290,45 @@ iface eth0 inet6 static
         self._test_spawn_fails_silently_with(exception.AgentError,
                 method="_plugin_agent_agentupdate", failure="fake_error")
 
-    def test_spawn_with_resetnetwork_alternative_returncode(self):
+    @mock.patch.object(stubs.FakeSessionForVMTests,
+                       '_plugin_agent_resetnetwork')
+    def test_spawn_with_resetnetwork_alternative_returncode(
+            self, mock_plugin_agent_resetnetwork):
         self.flags(use_agent_default=True,
                    group='xenserver')
 
-        def fake_resetnetwork(self, method, args):
-            fake_resetnetwork.called = True
+        def fake_resetnetwork(method, args):
             # NOTE(johngarbutt): as returned by FreeBSD and Gentoo
             return jsonutils.dumps({'returncode': '500',
                                     'message': 'success'})
-        self.stubs.Set(stubs.FakeSessionForVMTests,
-                       '_plugin_agent_resetnetwork', fake_resetnetwork)
-        fake_resetnetwork.called = False
+        mock_plugin_agent_resetnetwork.side_effect = fake_resetnetwork
 
         self._test_spawn(IMAGE_VHD, None, None,
                          os_type="linux", architecture="x86-64")
-        self.assertTrue(fake_resetnetwork.called)
+        self.assertTrue(mock_plugin_agent_resetnetwork.called)
 
+    @mock.patch.object(compute_utils, 'add_instance_fault_from_exc')
     def _test_spawn_fails_silently_with(self, expected_exception_cls,
+                                        mock_add_instance_fault_from_exc,
                                         method="_plugin_agent_version",
                                         failure=None, value=None):
         self.flags(use_agent_default=True,
                    agent_version_timeout=0,
                    group='xenserver')
 
-        def fake_agent_call(self, method, args):
+        def fake_agent_call(method, args):
             if failure:
-                raise xenapi_fake.Failure([failure])
+                raise XenAPI.Failure([failure])
             else:
                 return value
 
-        self.stubs.Set(stubs.FakeSessionForVMTests,
-                       method, fake_agent_call)
-
-        called = {}
-
-        def fake_add_instance_fault(*args, **kwargs):
-            called["fake_add_instance_fault"] = args[2]
-
-        self.stubs.Set(compute_utils, 'add_instance_fault_from_exc',
-                       fake_add_instance_fault)
-
-        self._test_spawn(IMAGE_VHD, None, None,
-                         os_type="linux", architecture="x86-64")
-        actual_exception = called["fake_add_instance_fault"]
-        self.assertIsInstance(actual_exception, expected_exception_cls)
+        with mock.patch.object(stubs.FakeSessionForVMTests, method,
+                               side_effect=fake_agent_call):
+            self._test_spawn(IMAGE_VHD, None, None,
+                             os_type="linux", architecture="x86-64")
+            mock_add_instance_fault_from_exc.assert_called_once_with(
+                mock.ANY, mock.ANY, test.MatchType(expected_exception_cls),
+                exc_info=mock.ANY)
 
     def test_spawn_fails_silently_with_agent_timeout(self):
         self._test_spawn_fails_silently_with(exception.AgentTimeout,
@@ -1256,6 +1346,12 @@ iface eth0 inet6 static
         error = jsonutils.dumps({'returncode': -1, 'message': 'fake'})
         self._test_spawn_fails_silently_with(exception.AgentError,
                                              value=error)
+
+    def test_spawn_sets_last_dom_id(self):
+        self._test_spawn(IMAGE_VHD, None, None,
+                         os_type="linux", architecture="x86-64")
+        self.assertEqual(self.vm['domid'],
+                         self.vm['other_config']['last_dom_id'])
 
     def test_rescue(self):
         instance = self._create_instance(spawn=False, obj=True)
@@ -1278,8 +1374,10 @@ iface eth0 inet6 static
                                other_config={'osvol': True})
 
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
-        image_meta = {'id': IMAGE_VHD,
-                      'disk_format': 'vhd'}
+        image_meta = objects.ImageMeta.from_dict(
+            {'id': IMAGE_VHD,
+             'disk_format': 'vhd',
+             'properties': {'vm_mode': 'xen'}})
         conn.rescue(self.context, instance, [], image_meta, '')
 
         vm = xenapi_fake.get_record('VM', vm_ref)
@@ -1303,26 +1401,26 @@ iface eth0 inet6 static
         # bug #1227898
         instance = self._create_instance(obj=True)
         session = get_session()
-        image_meta = {'id': IMAGE_VHD,
-                      'disk_format': 'vhd'}
-
+        image_meta = objects.ImageMeta.from_dict(
+            {'id': IMAGE_VHD,
+             'disk_format': 'vhd',
+             'properties': {'vm_mode': 'xen'}})
         vm_ref = vm_utils.lookup(session, instance['name'])
         vdi_ref, vdi_rec = vm_utils.get_vdi_for_vm_safely(session, vm_ref)
 
         # raise an error in the spawn setup process and trigger the
         # undo manager logic:
-        def fake_start(*args, **kwargs):
-            raise test.TestingException('Start Error')
+        with mock.patch.object(
+                self.conn._vmops, '_start',
+                side_effect=test.TestingException('Start Error')):
+            self.assertRaises(test.TestingException, self.conn.rescue,
+                              self.context, instance, [], image_meta, '')
 
-        self.stubs.Set(self.conn._vmops, '_start', fake_start)
-
-        self.assertRaises(test.TestingException, self.conn.rescue,
-                          self.context, instance, [], image_meta, '')
-
-        # confirm original disk still exists:
-        vdi_ref2, vdi_rec2 = vm_utils.get_vdi_for_vm_safely(session, vm_ref)
-        self.assertEqual(vdi_ref, vdi_ref2)
-        self.assertEqual(vdi_rec['uuid'], vdi_rec2['uuid'])
+            # confirm original disk still exists:
+            vdi_ref2, vdi_rec2 = vm_utils.get_vdi_for_vm_safely(session,
+                                                                vm_ref)
+            self.assertEqual(vdi_ref, vdi_ref2)
+            self.assertEqual(vdi_rec['uuid'], vdi_rec2['uuid'])
 
     def test_unrescue(self):
         instance = self._create_instance(obj=True)
@@ -1361,15 +1459,14 @@ iface eth0 inet6 static
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
         conn.reboot(self.context, instance, None, "HARD")
 
-    def test_poll_rebooting_instances(self):
-        self.mox.StubOutWithMock(compute_api.API, 'reboot')
-        compute_api.API.reboot(mox.IgnoreArg(), mox.IgnoreArg(),
-                               mox.IgnoreArg())
-        self.mox.ReplayAll()
+    @mock.patch.object(compute_api.API, 'reboot')
+    def test_poll_rebooting_instances(self, mock_reboot):
         instance = self._create_instance()
         instances = [instance]
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
         conn.poll_rebooting_instances(60, instances)
+
+        mock_reboot.assert_called_once_with(mock.ANY, mock.ANY, mock.ANY)
 
     def test_reboot_soft(self):
         instance = self._create_instance()
@@ -1390,7 +1487,7 @@ iface eth0 inet6 static
         instance = self._create_instance(spawn=False)
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
         xenapi_fake.create_vm(instance['name'], 'Unknown')
-        self.assertRaises(xenapi_fake.Failure, conn.reboot, self.context,
+        self.assertRaises(XenAPI.Failure, conn.reboot, self.context,
                           instance, None, "SOFT")
 
     def test_reboot_rescued(self):
@@ -1400,23 +1497,22 @@ iface eth0 inet6 static
 
         real_result = vm_utils.lookup(conn._session, instance['name'])
 
-        self.mox.StubOutWithMock(vm_utils, 'lookup')
-        vm_utils.lookup(conn._session, instance['name'],
-                        True).AndReturn(real_result)
-        self.mox.ReplayAll()
-
-        conn.reboot(self.context, instance, None, "SOFT")
+        with mock.patch.object(vm_utils, 'lookup',
+                               return_value=real_result) as mock_lookup:
+            conn.reboot(self.context, instance, None, "SOFT")
+            mock_lookup.assert_called_once_with(conn._session,
+                                                instance['name'], True)
 
     def test_get_console_output_succeeds(self):
-
         def fake_get_console_output(instance):
             self.assertEqual("instance", instance)
             return "console_log"
-        self.stubs.Set(self.conn._vmops, 'get_console_output',
-                       fake_get_console_output)
 
-        self.assertEqual(self.conn.get_console_output('context', "instance"),
-                         "console_log")
+        with mock.patch.object(self.conn._vmops, 'get_console_output',
+                               side_effect=fake_get_console_output):
+            self.assertEqual(
+                self.conn.get_console_output('context', "instance"),
+                "console_log")
 
     def _test_maintenance_mode(self, find_host, find_aggregate):
         real_call_xenapi = self.conn._session.call_xenapi
@@ -1425,27 +1521,28 @@ iface eth0 inet6 static
 
         # Record all the xenapi calls, and return a fake list of hosts
         # for the host.get_all call
-        def fake_call_xenapi(method, *args):
+        def fake_call_xenapi(self, method, *args):
             api_calls[method] = args
             if method == 'host.get_all':
                 return ['foo', 'bar', 'baz']
             return real_call_xenapi(method, *args)
-        self.stubs.Set(self.conn._session, 'call_xenapi', fake_call_xenapi)
+        self.stub_out('os_xenapi.client.session.XenAPISession.call_xenapi',
+                      fake_call_xenapi)
 
         def fake_aggregate_get(context, host, key):
             if find_aggregate:
                 return [test_aggregate.fake_aggregate]
             else:
                 return []
-        self.stubs.Set(db, 'aggregate_get_by_host',
-                       fake_aggregate_get)
+        self.stub_out('nova.objects.aggregate._get_by_host_from_db',
+                      fake_aggregate_get)
 
         def fake_host_find(context, session, src, dst):
             if find_host:
                 return 'bar'
             else:
                 raise exception.NoValidHost("I saw this one coming...")
-        self.stubs.Set(host, '_host_find', fake_host_find)
+        self.stub_out('nova.virt.xenapi.host._host_find', fake_host_find)
 
         result = self.conn.host_maintenance_mode('bar', 'on_maintenance')
         self.assertEqual(result, 'on_maintenance')
@@ -1472,38 +1569,23 @@ iface eth0 inet6 static
         self.assertRaises(exception.NotFound,
                           self._test_maintenance_mode, True, False)
 
-    def test_uuid_find(self):
-        self.mox.StubOutWithMock(db, 'instance_get_all_by_host')
+    @mock.patch.object(db, 'instance_get_all_by_host')
+    def test_uuid_find(self, mock_instance_get_all_by_host):
         fake_inst = fake_instance.fake_db_instance(id=123)
         fake_inst2 = fake_instance.fake_db_instance(id=456)
-        db.instance_get_all_by_host(self.context, fake_inst['host'],
-                                    columns_to_join=None,
-                                    use_slave=False
-                                    ).AndReturn([fake_inst, fake_inst2])
-        self.mox.ReplayAll()
+        mock_instance_get_all_by_host.return_value = [fake_inst, fake_inst2]
         expected_name = CONF.instance_name_template % fake_inst['id']
+
         inst_uuid = host._uuid_find(self.context, fake_inst['host'],
                                     expected_name)
+
         self.assertEqual(inst_uuid, fake_inst['uuid'])
-
-    def test_session_virtapi(self):
-        was = {'called': False}
-
-        def fake_aggregate_get_by_host(self, *args, **kwargs):
-            was['called'] = True
-            raise test.TestingException()
-        self.stubs.Set(db, "aggregate_get_by_host",
-                       fake_aggregate_get_by_host)
-
-        self.stubs.Set(self.conn._session, "is_slave", True)
-
-        self.assertRaises(test.TestingException,
-                self.conn._session._get_host_uuid)
-        self.assertTrue(was['called'])
+        mock_instance_get_all_by_host.assert_called_once_with(
+            self.context, fake_inst['host'], columns_to_join=None)
 
     def test_per_instance_usage_running(self):
         instance = self._create_instance(spawn=True)
-        flavor = flavors.get_flavor(3)
+        flavor = objects.Flavor.get_by_id(self.context, 3)
 
         expected = {instance['uuid']: {'memory_mb': flavor['memory_mb'],
                                        'uuid': instance['uuid']}}
@@ -1531,13 +1613,13 @@ iface eth0 inet6 static
     def _create_instance(self, spawn=True, obj=False, **attrs):
         """Creates and spawns a test instance."""
         instance_values = {
-            'uuid': str(uuid.uuid4()),
+            'uuid': uuidutils.generate_uuid(),
             'display_name': 'host-',
             'project_id': self.project_id,
             'user_id': self.user_id,
-            'image_ref': 1,
-            'kernel_id': 2,
-            'ramdisk_id': 3,
+            'image_ref': IMAGE_MACHINE,
+            'kernel_id': IMAGE_KERNEL,
+            'ramdisk_id': IMAGE_RAMDISK,
             'root_gb': 80,
             'ephemeral_gb': 0,
             'instance_type_id': '3',  # m1.large
@@ -1548,44 +1630,35 @@ iface eth0 inet6 static
 
         instance = create_instance_with_system_metadata(self.context,
                                                         instance_values)
-        network_info = fake_network.fake_get_instance_nw_info(self.stubs)
-        image_meta = {'id': IMAGE_VHD,
-                      'disk_format': 'vhd'}
-        inst_obj = objects.Instance.get_by_uuid(
-            self.context, instance['uuid'],
-            expected_attrs=['system_metadata', 'metadata', 'info_cache',
-                            'security_groups'])
+        network_info = fake_network.fake_get_instance_nw_info(self)
+        image_meta = objects.ImageMeta.from_dict(
+            {'id': uuids.image_id,
+             'disk_format': 'vhd'})
         if spawn:
-            self.conn.spawn(self.context, inst_obj, image_meta, [], 'herp',
-                            network_info)
+            self.conn.spawn(self.context, instance, image_meta, [], 'herp',
+                            {}, network_info)
         if obj:
-            return inst_obj
-        return instance
+            return instance
+        return base.obj_to_primitive(instance)
 
-    def test_destroy_clean_up_kernel_and_ramdisk(self):
-        def fake_lookup_kernel_ramdisk(session, vm_ref):
-            return "kernel", "ramdisk"
-
-        self.stubs.Set(vm_utils, "lookup_kernel_ramdisk",
-                       fake_lookup_kernel_ramdisk)
-
+    @mock.patch.object(vm_utils, 'destroy_kernel_ramdisk')
+    @mock.patch.object(vm_utils, 'lookup_kernel_ramdisk',
+                       return_value=('kernel', 'ramdisk'))
+    def test_destroy_clean_up_kernel_and_ramdisk(
+            self, mock_lookup_kernel_ramdisk, mock_destroy_kernel_ramdisk):
         def fake_destroy_kernel_ramdisk(session, instance, kernel, ramdisk):
-            fake_destroy_kernel_ramdisk.called = True
             self.assertEqual("kernel", kernel)
             self.assertEqual("ramdisk", ramdisk)
 
-        fake_destroy_kernel_ramdisk.called = False
-
-        self.stubs.Set(vm_utils, "destroy_kernel_ramdisk",
-                       fake_destroy_kernel_ramdisk)
+        mock_destroy_kernel_ramdisk.side_effect = fake_destroy_kernel_ramdisk
 
         instance = self._create_instance(spawn=True, obj=True)
-        network_info = fake_network.fake_get_instance_nw_info(self.stubs)
+        network_info = fake_network.fake_get_instance_nw_info(self)
         self.conn.destroy(self.context, instance, network_info)
 
         vm_ref = vm_utils.lookup(self.conn._session, instance['name'])
         self.assertIsNone(vm_ref)
-        self.assertTrue(fake_destroy_kernel_ramdisk.called)
+        self.assertTrue(mock_destroy_kernel_ramdisk.called)
 
 
 class XenAPIDiffieHellmanTestCase(test.NoDBTestCase):
@@ -1624,7 +1697,7 @@ class XenAPIDiffieHellmanTestCase(test.NoDBTestCase):
         self._test_encryption('\n\nMessage with leading newlines.')
 
     def test_encrypt_really_long_message(self):
-        self._test_encryption(''.join(['abcd' for i in xrange(1024)]))
+        self._test_encryption(''.join(['abcd' for i in range(1024)]))
 
 
 # FIXME(sirp): convert this to use XenAPITestBaseNoDB
@@ -1635,13 +1708,13 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
 
     def setUp(self):
         super(XenAPIMigrateInstance, self).setUp()
-        self.flags(connection_url='test_url',
+        self.flags(connection_url='http://localhost',
                    connection_password='test_pass',
                    group='xenserver')
         self.flags(firewall_driver='nova.virt.xenapi.firewall.'
                                    'Dom0IptablesFirewallDriver')
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
-        db_fakes.stub_out_db_instance_api(self.stubs)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
+        db_fakes.stub_out_db_instance_api(self)
         xenapi_fake.create_network('fake', 'fake_br1')
         self.user_id = 'fake'
         self.project_id = 'fake'
@@ -1649,7 +1722,7 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
         self.instance_values = {
                   'project_id': self.project_id,
                   'user_id': self.user_id,
-                  'image_ref': 1,
+                  'image_ref': IMAGE_MACHINE,
                   'kernel_id': None,
                   'ramdisk_id': None,
                   'root_gb': 80,
@@ -1670,35 +1743,99 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
         self.migration = db.migration_create(
             context.get_admin_context(), migration_values)
 
-        fake_processutils.stub_out_processutils_execute(self.stubs)
-        stubs.stub_out_migration_methods(self.stubs)
-        stubs.stubout_get_this_vm_uuid(self.stubs)
+        fake_processutils.stub_out_processutils_execute(self)
+        self.stub_out_migration_methods()
+        self.stubout_get_this_vm_uuid()
 
         def fake_inject_instance_metadata(self, instance, vm):
             pass
-        self.stubs.Set(vmops.VMOps, '_inject_instance_metadata',
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._inject_instance_metadata',
                        fake_inject_instance_metadata)
 
-    def test_migrate_disk_and_power_off(self):
-        instance = db.instance_create(self.context, self.instance_values)
+        def fake_unpause_and_wait(self, vm_ref, instance, power_on):
+            pass
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._unpause_and_wait',
+                       fake_unpause_and_wait)
+
+    def stub_out_migration_methods(self):
+        fakesr = xenapi_fake.create_sr()
+
+        def fake_import_all_migrated_disks(session, instance,
+                                           import_root=True):
+            vdi_ref = xenapi_fake.create_vdi(instance['name'], fakesr)
+            vdi_rec = xenapi_fake.get_record('VDI', vdi_ref)
+            vdi_rec['other_config']['nova_disk_type'] = 'root'
+            return {"root": {'uuid': vdi_rec['uuid'], 'ref': vdi_ref},
+                    "ephemerals": {}}
+
+        def fake_get_vdi(session, vm_ref, userdevice='0'):
+            vdi_ref_parent = xenapi_fake.create_vdi('derp-parent', fakesr)
+            vdi_rec_parent = xenapi_fake.get_record('VDI', vdi_ref_parent)
+            vdi_ref = fake.create_vdi('derp', fakesr,
+                    sm_config={'vhd-parent': vdi_rec_parent['uuid']})
+            vdi_rec = session.call_xenapi("VDI.get_record", vdi_ref)
+            return vdi_ref, vdi_rec
+
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._destroy',
+                      lambda *args, **kwargs: None)
+        self.stub_out('nova.virt.xenapi.vmops.VMOps.'
+                      '_wait_for_instance_to_start',
+                      lambda self, *args: None)
+        self.stub_out('nova.virt.xenapi.vm_utils.import_all_migrated_disks',
+                      fake_import_all_migrated_disks)
+        self.stub_out('nova.virt.xenapi.vm_utils.scan_default_sr',
+                      lambda session, *args: fakesr)
+        self.stub_out('nova.virt.xenapi.vm_utils.get_vdi_for_vm_safely',
+                      fake_get_vdi)
+        self.stub_out('nova.virt.xenapi.vm_utils.get_sr_path',
+                      lambda *args: 'fake')
+        self.stub_out('nova.virt.xenapi.vm_utils.generate_ephemeral',
+                      lambda *args: None)
+
+    def _create_instance(self, **kw):
+        values = self.instance_values.copy()
+        values.update(kw)
+        instance = objects.Instance(context=self.context, **values)
+        instance.flavor = objects.Flavor(root_gb=80,
+                                         ephemeral_gb=0)
+        instance.create()
+        return instance
+
+    @mock.patch.object(vmops.VMOps, '_migrate_disk_resizing_up')
+    @mock.patch.object(vm_utils, 'get_sr_path')
+    @mock.patch.object(vm_utils, 'lookup')
+    @mock.patch.object(volume_utils, 'is_booted_from_volume')
+    def test_migrate_disk_and_power_off(self, mock_boot_from_volume,
+                                        mock_lookup, mock_sr_path,
+                                        mock_migrate):
+        instance = self._create_instance()
         xenapi_fake.create_vm(instance['name'], 'Running')
-        flavor = {"root_gb": 80, 'ephemeral_gb': 0}
+        flavor = fake_flavor.fake_flavor_obj(self.context, root_gb=80,
+                                             ephemeral_gb=0)
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
-        vm_ref = vm_utils.lookup(conn._session, instance['name'])
-        self.mox.StubOutWithMock(volume_utils, 'is_booted_from_volume')
-        volume_utils.is_booted_from_volume(conn._session, vm_ref)
-        self.mox.ReplayAll()
+        mock_boot_from_volume.return_value = True
+        mock_lookup.return_value = 'fake_vm_ref'
+        mock_sr_path.return_value = 'fake_sr_path'
         conn.migrate_disk_and_power_off(self.context, instance,
                                         '127.0.0.1', flavor, None)
+        mock_lookup.assert_called_once_with(conn._session, instance['name'],
+                                            False)
+        mock_sr_path.assert_called_once_with(conn._session)
+        mock_migrate.assert_called_once_with(self.context, instance,
+                                             '127.0.0.1', 'fake_vm_ref',
+                                             'fake_sr_path')
 
     def test_migrate_disk_and_power_off_passes_exceptions(self):
-        instance = db.instance_create(self.context, self.instance_values)
+        instance = self._create_instance()
         xenapi_fake.create_vm(instance['name'], 'Running')
-        flavor = {"root_gb": 80, 'ephemeral_gb': 0}
+        flavor = fake_flavor.fake_flavor_obj(self.context, root_gb=80,
+                                             ephemeral_gb=0)
 
         def fake_raise(*args, **kwargs):
             raise exception.MigrationError(reason='test failure')
-        self.stubs.Set(vmops.VMOps, "_migrate_disk_resizing_up", fake_raise)
+        self.stub_out(
+            'nova.virt.xenapi.vmops.VMOps._migrate_disk_resizing_up',
+            fake_raise)
 
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
         self.assertRaises(exception.MigrationError,
@@ -1707,33 +1844,44 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
                           '127.0.0.1', flavor, None)
 
     def test_migrate_disk_and_power_off_throws_on_zero_gb_resize_down(self):
-        instance = db.instance_create(self.context, self.instance_values)
-        flavor = {"root_gb": 0, 'ephemeral_gb': 0}
+        instance = self._create_instance()
+        flavor = fake_flavor.fake_flavor_obj(self.context, root_gb=0,
+                                             ephemeral_gb=0)
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
         self.assertRaises(exception.ResizeError,
                           conn.migrate_disk_and_power_off,
                           self.context, instance,
                           'fake_dest', flavor, None)
 
-    def test_migrate_disk_and_power_off_with_zero_gb_old_and_new_works(self):
-        flavor = {"root_gb": 0, 'ephemeral_gb': 0}
-        values = copy.copy(self.instance_values)
-        values["root_gb"] = 0
-        values["ephemeral_gb"] = 0
-        instance = db.instance_create(self.context, values)
+    @mock.patch.object(vmops.VMOps, '_migrate_disk_resizing_up')
+    @mock.patch.object(vm_utils, 'get_sr_path')
+    @mock.patch.object(vm_utils, 'lookup')
+    @mock.patch.object(volume_utils, 'is_booted_from_volume')
+    def test_migrate_disk_and_power_off_with_zero_gb_old_and_new_works(
+            self, mock_boot_from_volume, mock_lookup, mock_sr_path,
+            mock_migrate):
+        flavor = fake_flavor.fake_flavor_obj(self.context, root_gb=0,
+                                             ephemeral_gb=0)
+        instance = self._create_instance(root_gb=0, ephemeral_gb=0)
+        instance.flavor.root_gb = 0
+        instance.flavor.ephemeral_gb = 0
         xenapi_fake.create_vm(instance['name'], 'Running')
+        mock_boot_from_volume.return_value = True
+        mock_lookup.return_value = 'fake_vm_ref'
+        mock_sr_path.return_value = 'fake_sr_path'
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
-        vm_ref = vm_utils.lookup(conn._session, instance['name'])
-        self.mox.StubOutWithMock(volume_utils, 'is_booted_from_volume')
-        volume_utils.is_booted_from_volume(conn._session, vm_ref)
-        self.mox.ReplayAll()
         conn.migrate_disk_and_power_off(self.context, instance,
                                         '127.0.0.1', flavor, None)
+        mock_lookup.assert_called_once_with(conn._session, instance['name'],
+                                            False)
+        mock_sr_path.assert_called_once_with(conn._session)
+        mock_migrate.assert_called_once_with(self.context, instance,
+                                             '127.0.0.1', 'fake_vm_ref',
+                                             'fake_sr_path')
 
     def _test_revert_migrate(self, power_on):
         instance = create_instance_with_system_metadata(self.context,
-                                                        self.instance_values,
-                                                        obj=True)
+                                                        self.instance_values)
         self.called = False
         self.fake_vm_start_called = False
         self.fake_finish_revert_migration_called = False
@@ -1748,19 +1896,20 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
         def fake_finish_revert_migration(*args, **kwargs):
             self.fake_finish_revert_migration_called = True
 
-        self.stubs.Set(stubs.FakeSessionForVMTests,
-                       "VDI_resize_online", fake_vdi_resize)
-        self.stubs.Set(vmops.VMOps, '_start', fake_vm_start)
-        self.stubs.Set(vmops.VMOps, 'finish_revert_migration',
-                       fake_finish_revert_migration)
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests,
+        self.stub_out(
+            'nova.tests.unit.virt.xenapi.stubs.FakeSessionForVMTests'
+            '.VDI_resize_online', fake_vdi_resize)
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._start', fake_vm_start)
+        self.stub_out('nova.virt.xenapi.vmops.VMOps.finish_revert_migration',
+                      fake_finish_revert_migration)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests,
                               product_version=(4, 0, 0),
                               product_brand='XenServer')
-        self.mox.StubOutWithMock(volume_utils, 'is_booted_from_volume')
 
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
-        network_info = fake_network.fake_get_instance_nw_info(self.stubs)
-        image_meta = {'id': instance['image_ref'], 'disk_format': 'vhd'}
+        network_info = fake_network.fake_get_instance_nw_info(self)
+        image_meta = objects.ImageMeta.from_dict(
+            {'id': instance['image_ref'], 'disk_format': 'vhd'})
         base = xenapi_fake.create_vdi('hurr', 'fake')
         base_uuid = xenapi_fake.get_record('VDI', base)['uuid']
         cow = xenapi_fake.create_vdi('durr', 'fake')
@@ -1769,11 +1918,11 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
                               dict(base_copy=base_uuid, cow=cow_uuid),
                               network_info, image_meta, resize_instance=True,
                               block_device_info=None, power_on=power_on)
-        self.assertEqual(self.called, True)
+        self.assertTrue(self.called)
         self.assertEqual(self.fake_vm_start_called, power_on)
 
         conn.finish_revert_migration(context, instance, network_info)
-        self.assertEqual(self.fake_finish_revert_migration_called, True)
+        self.assertTrue(self.fake_finish_revert_migration_called)
 
     def test_revert_migrate_power_on(self):
         self._test_revert_migrate(True)
@@ -1783,8 +1932,7 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
 
     def _test_finish_migrate(self, power_on):
         instance = create_instance_with_system_metadata(self.context,
-                                                        self.instance_values,
-                                                        obj=True)
+                                                        self.instance_values)
         self.called = False
         self.fake_vm_start_called = False
 
@@ -1794,21 +1942,23 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
         def fake_vdi_resize(*args, **kwargs):
             self.called = True
 
-        self.stubs.Set(vmops.VMOps, '_start', fake_vm_start)
-        self.stubs.Set(stubs.FakeSessionForVMTests,
-                       "VDI_resize_online", fake_vdi_resize)
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests,
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._start', fake_vm_start)
+        self.stub_out('nova.tests.unit.virt.xenapi.stubs'
+                      '.FakeSessionForVMTests.VDI_resize_online',
+                      fake_vdi_resize)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests,
                               product_version=(4, 0, 0),
                               product_brand='XenServer')
 
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
-        network_info = fake_network.fake_get_instance_nw_info(self.stubs)
-        image_meta = {'id': instance['image_ref'], 'disk_format': 'vhd'}
+        network_info = fake_network.fake_get_instance_nw_info(self)
+        image_meta = objects.ImageMeta.from_dict(
+            {'id': instance['image_ref'], 'disk_format': 'vhd'})
         conn.finish_migration(self.context, self.migration, instance,
                               dict(base_copy='hurr', cow='durr'),
                               network_info, image_meta, resize_instance=True,
                               block_device_info=None, power_on=power_on)
-        self.assertEqual(self.called, True)
+        self.assertTrue(self.called)
         self.assertEqual(self.fake_vm_start_called, power_on)
 
     def test_finish_migrate_power_on(self):
@@ -1821,89 +1971,98 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
         values = copy.copy(self.instance_values)
         values["root_gb"] = 0
         values["ephemeral_gb"] = 0
-        instance = create_instance_with_system_metadata(self.context, values,
-                                                        obj=True)
+        instance = create_instance_with_system_metadata(self.context, values)
+        instance.flavor.root_gb = 0
+        instance.flavor.ephemeral_gb = 0
 
         def fake_vdi_resize(*args, **kwargs):
             raise Exception("This shouldn't be called")
 
-        self.stubs.Set(stubs.FakeSessionForVMTests,
-                       "VDI_resize_online", fake_vdi_resize)
+        self.stub_out('nova.tests.unit.virt.xenapi.stubs'
+                      '.FakeSessionForVMTests.VDI_resize_online',
+                      fake_vdi_resize)
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
-        network_info = fake_network.fake_get_instance_nw_info(self.stubs)
-        image_meta = {'id': instance['image_ref'], 'disk_format': 'vhd'}
+        network_info = fake_network.fake_get_instance_nw_info(self)
+        image_meta = objects.ImageMeta.from_dict(
+            {'id': instance['image_ref'], 'disk_format': 'vhd'})
         conn.finish_migration(self.context, self.migration, instance,
                               dict(base_copy='hurr', cow='durr'),
                               network_info, image_meta, resize_instance=True)
 
     def test_finish_migrate_no_resize_vdi(self):
         instance = create_instance_with_system_metadata(self.context,
-                                                        self.instance_values,
-                                                        obj=True)
+                                                        self.instance_values)
 
         def fake_vdi_resize(*args, **kwargs):
             raise Exception("This shouldn't be called")
 
-        self.stubs.Set(stubs.FakeSessionForVMTests,
-                       "VDI_resize_online", fake_vdi_resize)
+        self.stub_out('nova.tests.unit.virt.xenapi.stubs'
+                      '.FakeSessionForVMTests.VDI_resize_online',
+                      fake_vdi_resize)
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
-        network_info = fake_network.fake_get_instance_nw_info(self.stubs)
+        network_info = fake_network.fake_get_instance_nw_info(self)
         # Resize instance would be determined by the compute call
-        image_meta = {'id': instance['image_ref'], 'disk_format': 'vhd'}
+        image_meta = objects.ImageMeta.from_dict(
+            {'id': instance['image_ref'], 'disk_format': 'vhd'})
         conn.finish_migration(self.context, self.migration, instance,
                               dict(base_copy='hurr', cow='durr'),
                               network_info, image_meta, resize_instance=False)
 
-    @stub_vm_utils_with_vdi_attached_here
+    @stub_vm_utils_with_vdi_attached
     def test_migrate_too_many_partitions_no_resize_down(self):
-        instance_values = self.instance_values
-        instance = db.instance_create(self.context, instance_values)
+        instance = self._create_instance()
         xenapi_fake.create_vm(instance['name'], 'Running')
-        flavor = db.flavor_get_by_name(self.context, 'm1.small')
+        flavor = objects.Flavor.get_by_name(self.context, 'm1.small')
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
         def fake_get_partitions(partition):
             return [(1, 2, 3, 4, "", ""), (1, 2, 3, 4, "", "")]
 
-        self.stubs.Set(vm_utils, '_get_partitions', fake_get_partitions)
+        self.stub_out('nova.virt.xenapi.vm_utils._get_partitions',
+                      fake_get_partitions)
 
         self.assertRaises(exception.InstanceFaultRollback,
                           conn.migrate_disk_and_power_off,
                           self.context, instance,
                           '127.0.0.1', flavor, None)
 
-    @stub_vm_utils_with_vdi_attached_here
+    @stub_vm_utils_with_vdi_attached
     def test_migrate_bad_fs_type_no_resize_down(self):
-        instance_values = self.instance_values
-        instance = db.instance_create(self.context, instance_values)
+        instance = self._create_instance()
         xenapi_fake.create_vm(instance['name'], 'Running')
-        flavor = db.flavor_get_by_name(self.context, 'm1.small')
+        flavor = objects.Flavor.get_by_name(self.context, 'm1.small')
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
         def fake_get_partitions(partition):
             return [(1, 2, 3, "ext2", "", "boot")]
 
-        self.stubs.Set(vm_utils, '_get_partitions', fake_get_partitions)
+        self.stub_out('nova.virt.xenapi.vm_utils._get_partitions',
+                      fake_get_partitions)
 
         self.assertRaises(exception.InstanceFaultRollback,
                           conn.migrate_disk_and_power_off,
                           self.context, instance,
                           '127.0.0.1', flavor, None)
 
-    def test_migrate_rollback_when_resize_down_fs_fails(self):
+    @mock.patch.object(vmops.VMOps, '_resize_ensure_vm_is_shutdown')
+    @mock.patch.object(vmops.VMOps, '_apply_orig_vm_name_label')
+    @mock.patch.object(vm_utils, 'resize_disk')
+    @mock.patch.object(vm_utils, 'migrate_vhd')
+    @mock.patch.object(vm_utils, 'destroy_vdi')
+    @mock.patch.object(vm_utils, 'get_vdi_for_vm_safely')
+    @mock.patch.object(vmops.VMOps, '_restore_orig_vm_and_cleanup_orphan')
+    def test_migrate_rollback_when_resize_down_fs_fails(self, mock_restore,
+                                                        mock_get_vdi,
+                                                        mock_destroy,
+                                                        mock_migrate,
+                                                        mock_disk,
+                                                        mock_label,
+                                                        mock_resize):
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
         vmops = conn._vmops
-
-        self.mox.StubOutWithMock(vmops, '_resize_ensure_vm_is_shutdown')
-        self.mox.StubOutWithMock(vmops, '_apply_orig_vm_name_label')
-        self.mox.StubOutWithMock(vm_utils, 'resize_disk')
-        self.mox.StubOutWithMock(vm_utils, 'migrate_vhd')
-        self.mox.StubOutWithMock(vm_utils, 'destroy_vdi')
-        self.mox.StubOutWithMock(vm_utils, 'get_vdi_for_vm_safely')
-        self.mox.StubOutWithMock(vmops, '_restore_orig_vm_and_cleanup_orphan')
-
         instance = objects.Instance(context=self.context,
-                                    auto_disk_config=True, uuid='uuid')
+                                    auto_disk_config=True,
+                                    uuid=uuids.instance)
         instance.obj_reset_changes()
         vm_ref = "vm_ref"
         dest = "dest"
@@ -1913,20 +2072,13 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
         vmops._resize_ensure_vm_is_shutdown(instance, vm_ref)
         vmops._apply_orig_vm_name_label(instance, vm_ref)
         old_vdi_ref = "old_ref"
-        vm_utils.get_vdi_for_vm_safely(vmops._session, vm_ref).AndReturn(
-            (old_vdi_ref, None))
+        mock_get_vdi.return_value = (old_vdi_ref, None)
         new_vdi_ref = "new_ref"
         new_vdi_uuid = "new_uuid"
-        vm_utils.resize_disk(vmops._session, instance, old_vdi_ref,
-            flavor).AndReturn((new_vdi_ref, new_vdi_uuid))
-        vm_utils.migrate_vhd(vmops._session, instance, new_vdi_uuid, dest,
-                             sr_path, 0).AndRaise(
-                                exception.ResizeError(reason="asdf"))
-
+        mock_disk.return_value = (new_vdi_ref, new_vdi_uuid)
+        mock_migrate.side_effect = exception.ResizeError(reason="asdf")
         vm_utils.destroy_vdi(vmops._session, new_vdi_ref)
         vmops._restore_orig_vm_and_cleanup_orphan(instance)
-
-        self.mox.ReplayAll()
 
         with mock.patch.object(instance, 'save') as mock_save:
             self.assertRaises(exception.InstanceFaultRollback,
@@ -1935,76 +2087,88 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
             self.assertEqual(3, mock_save.call_count)
             self.assertEqual(60.0, instance.progress)
 
-    def test_resize_ensure_vm_is_shutdown_cleanly(self):
+        mock_resize.assert_any_call(instance, vm_ref)
+        mock_label.assert_any_call(instance, vm_ref)
+        mock_get_vdi.assert_called_once_with(vmops._session, vm_ref)
+        mock_disk.assert_called_once_with(vmops._session, instance,
+                                          old_vdi_ref, flavor)
+        mock_migrate.assert_called_once_with(vmops._session, instance,
+                                             new_vdi_uuid, dest, sr_path, 0)
+        mock_destroy.assert_any_call(vmops._session, new_vdi_ref)
+        mock_restore.assert_any_call(instance)
+
+    @mock.patch.object(vm_utils, 'is_vm_shutdown')
+    @mock.patch.object(vm_utils, 'clean_shutdown_vm')
+    @mock.patch.object(vm_utils, 'hard_shutdown_vm')
+    def test_resize_ensure_vm_is_shutdown_cleanly(self, mock_hard, mock_clean,
+                                                  mock_shutdown):
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
         vmops = conn._vmops
         fake_instance = {'uuid': 'uuid'}
 
-        self.mox.StubOutWithMock(vm_utils, 'is_vm_shutdown')
-        self.mox.StubOutWithMock(vm_utils, 'clean_shutdown_vm')
-        self.mox.StubOutWithMock(vm_utils, 'hard_shutdown_vm')
-
-        vm_utils.is_vm_shutdown(vmops._session, "ref").AndReturn(False)
-        vm_utils.clean_shutdown_vm(vmops._session, fake_instance,
-            "ref").AndReturn(True)
-
-        self.mox.ReplayAll()
+        mock_shutdown.return_value = False
+        mock_clean.return_value = False
 
         vmops._resize_ensure_vm_is_shutdown(fake_instance, "ref")
+        mock_shutdown.assert_called_once_with(vmops._session, "ref")
+        mock_clean.assert_called_once_with(vmops._session, fake_instance,
+                                           "ref")
 
-    def test_resize_ensure_vm_is_shutdown_forced(self):
+    @mock.patch.object(vm_utils, 'is_vm_shutdown')
+    @mock.patch.object(vm_utils, 'clean_shutdown_vm')
+    @mock.patch.object(vm_utils, 'hard_shutdown_vm')
+    def test_resize_ensure_vm_is_shutdown_forced(self, mock_hard, mock_clean,
+                                                 mock_shutdown):
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
         vmops = conn._vmops
         fake_instance = {'uuid': 'uuid'}
 
-        self.mox.StubOutWithMock(vm_utils, 'is_vm_shutdown')
-        self.mox.StubOutWithMock(vm_utils, 'clean_shutdown_vm')
-        self.mox.StubOutWithMock(vm_utils, 'hard_shutdown_vm')
-
-        vm_utils.is_vm_shutdown(vmops._session, "ref").AndReturn(False)
-        vm_utils.clean_shutdown_vm(vmops._session, fake_instance,
-            "ref").AndReturn(False)
-        vm_utils.hard_shutdown_vm(vmops._session, fake_instance,
-            "ref").AndReturn(True)
-
-        self.mox.ReplayAll()
+        mock_shutdown.return_value = False
+        mock_clean.return_value = False
+        mock_hard.return_value = True
 
         vmops._resize_ensure_vm_is_shutdown(fake_instance, "ref")
+        mock_shutdown.assert_called_once_with(vmops._session, "ref")
+        mock_clean.assert_called_once_with(vmops._session, fake_instance,
+                                           "ref")
+        mock_hard.assert_called_once_with(vmops._session, fake_instance,
+                                          "ref")
 
-    def test_resize_ensure_vm_is_shutdown_fails(self):
+    @mock.patch.object(vm_utils, 'is_vm_shutdown')
+    @mock.patch.object(vm_utils, 'clean_shutdown_vm')
+    @mock.patch.object(vm_utils, 'hard_shutdown_vm')
+    def test_resize_ensure_vm_is_shutdown_fails(self, mock_hard, mock_clean,
+                                                 mock_shutdown):
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
         vmops = conn._vmops
         fake_instance = {'uuid': 'uuid'}
 
-        self.mox.StubOutWithMock(vm_utils, 'is_vm_shutdown')
-        self.mox.StubOutWithMock(vm_utils, 'clean_shutdown_vm')
-        self.mox.StubOutWithMock(vm_utils, 'hard_shutdown_vm')
-
-        vm_utils.is_vm_shutdown(vmops._session, "ref").AndReturn(False)
-        vm_utils.clean_shutdown_vm(vmops._session, fake_instance,
-            "ref").AndReturn(False)
-        vm_utils.hard_shutdown_vm(vmops._session, fake_instance,
-            "ref").AndReturn(False)
-
-        self.mox.ReplayAll()
+        mock_shutdown.return_value = False
+        mock_clean.return_value = False
+        mock_hard.return_value = False
 
         self.assertRaises(exception.ResizeError,
             vmops._resize_ensure_vm_is_shutdown, fake_instance, "ref")
+        mock_shutdown.assert_called_once_with(vmops._session, "ref")
+        mock_clean.assert_called_once_with(vmops._session, fake_instance,
+                                           "ref")
+        mock_hard.assert_called_once_with(vmops._session, fake_instance,
+                                          "ref")
 
-    def test_resize_ensure_vm_is_shutdown_already_shutdown(self):
+    @mock.patch.object(vm_utils, 'is_vm_shutdown')
+    @mock.patch.object(vm_utils, 'clean_shutdown_vm')
+    @mock.patch.object(vm_utils, 'hard_shutdown_vm')
+    def test_resize_ensure_vm_is_shutdown_already_shutdown(self, mock_hard,
+                                                           mock_clean,
+                                                           mock_shutdown):
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
         vmops = conn._vmops
         fake_instance = {'uuid': 'uuid'}
 
-        self.mox.StubOutWithMock(vm_utils, 'is_vm_shutdown')
-        self.mox.StubOutWithMock(vm_utils, 'clean_shutdown_vm')
-        self.mox.StubOutWithMock(vm_utils, 'hard_shutdown_vm')
-
-        vm_utils.is_vm_shutdown(vmops._session, "ref").AndReturn(True)
-
-        self.mox.ReplayAll()
+        mock_shutdown.return_value = True
 
         vmops._resize_ensure_vm_is_shutdown(fake_instance, "ref")
+        mock_shutdown.assert_called_once_with(vmops._session, "ref")
 
 
 class XenAPIImageTypeTestCase(test.NoDBTestCase):
@@ -2044,20 +2208,19 @@ class XenAPIDetermineDiskImageTestCase(test.NoDBTestCase):
         self.assertEqual(expected_disk_type, actual)
 
     def test_machine(self):
-        image_meta = {'id': 'a', 'disk_format': 'ami'}
+        image_meta = objects.ImageMeta.from_dict(
+            {'disk_format': 'ami'})
         self.assert_disk_type(image_meta, vm_utils.ImageType.DISK)
 
     def test_raw(self):
-        image_meta = {'id': 'a', 'disk_format': 'raw'}
+        image_meta = objects.ImageMeta.from_dict(
+            {'disk_format': 'raw'})
         self.assert_disk_type(image_meta, vm_utils.ImageType.DISK_RAW)
 
     def test_vhd(self):
-        image_meta = {'id': 'a', 'disk_format': 'vhd'}
+        image_meta = objects.ImageMeta.from_dict(
+            {'disk_format': 'vhd'})
         self.assert_disk_type(image_meta, vm_utils.ImageType.DISK_VHD)
-
-    def test_none(self):
-        image_meta = None
-        self.assert_disk_type(image_meta, None)
 
 
 # FIXME(sirp): convert this to use XenAPITestBaseNoDB
@@ -2068,20 +2231,20 @@ class XenAPIHostTestCase(stubs.XenAPITestBase):
 
     def setUp(self):
         super(XenAPIHostTestCase, self).setUp()
-        self.flags(connection_url='test_url',
+        self.flags(connection_url='http://localhost',
                    connection_password='test_pass',
                    group='xenserver')
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.context = context.get_admin_context()
-        self.flags(use_local=True, group='conductor')
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
         self.instance = fake_instance.fake_db_instance(name='foo')
+        self.useFixture(fixtures.SingleCellSimple())
 
     def test_host_state(self):
         stats = self.conn.host_state.get_host_stats(False)
         # Values from fake.create_local_srs (ext SR)
         self.assertEqual(stats['disk_total'], 40000)
-        self.assertEqual(stats['disk_used'], 20000)
+        self.assertEqual(stats['disk_used'], 0)
         # Values from fake._plugin_xenhost_host_data
         self.assertEqual(stats['host_memory_total'], 10)
         self.assertEqual(stats['host_memory_overhead'], 20)
@@ -2128,13 +2291,12 @@ class XenAPIHostTestCase(stubs.XenAPITestBase):
         # before introducing the stub which raises the error
         hs = self.conn.host_state
 
-        def fake_safe_find_sr(session):
-            raise exception.StorageRepositoryNotFound('not there')
-
-        self.stubs.Set(vm_utils, 'safe_find_sr', fake_safe_find_sr)
-        self.assertRaises(exception.StorageRepositoryNotFound,
-                          hs.get_host_stats,
-                          refresh=True)
+        with mock.patch.object(
+                vm_utils, 'safe_find_sr',
+                side_effect=exception.StorageRepositoryNotFound('not there')):
+            self.assertRaises(exception.StorageRepositoryNotFound,
+                              hs.get_host_stats,
+                              refresh=True)
 
     def _test_host_action(self, method, action, expected=None):
         result = method('host', action)
@@ -2173,7 +2335,7 @@ class XenAPIHostTestCase(stubs.XenAPITestBase):
                                         True, 'enabled')
         service = db.service_get_by_host_and_binary(self.context, 'fake-mini',
                                                     'nova-compute')
-        self.assertEqual(service.disabled, False)
+        self.assertFalse(service.disabled)
 
     def test_set_enable_host_disable(self):
         _create_service_entries(self.context, values={'nova': ['fake-mini']})
@@ -2181,7 +2343,7 @@ class XenAPIHostTestCase(stubs.XenAPITestBase):
                                         False, 'disabled')
         service = db.service_get_by_host_and_binary(self.context, 'fake-mini',
                                                     'nova-compute')
-        self.assertEqual(service.disabled, True)
+        self.assertTrue(service.disabled)
 
     def test_get_host_uptime(self):
         result = self.conn.get_host_uptime()
@@ -2191,20 +2353,27 @@ class XenAPIHostTestCase(stubs.XenAPITestBase):
         stats = self.conn.host_state.get_host_stats(False)
         self.assertIn('supported_instances', stats)
 
-    def test_supported_instances_is_calculated_by_to_supported_instances(self):
-
-        def to_supported_instances(somedata):
-            return "SOMERETURNVALUE"
-        self.stubs.Set(host, 'to_supported_instances', to_supported_instances)
-
+    @mock.patch.object(host, 'to_supported_instances',
+                       return_value='SOMERETURNVALUE')
+    def test_supported_instances_is_calculated_by_to_supported_instances(
+            self, mock_to_supported_instances):
         stats = self.conn.host_state.get_host_stats(False)
         self.assertEqual("SOMERETURNVALUE", stats['supported_instances'])
+        mock_to_supported_instances.assert_called_once_with(
+            ['xen-3.0-x86_64', 'xen-3.0-x86_32p', 'hvm-3.0-x86_32',
+             'hvm-3.0-x86_32p', 'hvm-3.0-x86_64'])
 
-    def test_update_stats_caches_hostname(self):
-        self.mox.StubOutWithMock(host, 'call_xenhost')
-        self.mox.StubOutWithMock(vm_utils, 'scan_default_sr')
-        self.mox.StubOutWithMock(vm_utils, 'list_vms')
-        self.mox.StubOutWithMock(self.conn._session, 'call_xenapi')
+    @mock.patch.object(host.HostState, 'get_disk_used')
+    @mock.patch.object(host.HostState, '_get_passthrough_devices')
+    @mock.patch.object(host.HostState, '_get_vgpu_stats')
+    @mock.patch.object(jsonutils, 'loads')
+    @mock.patch.object(vm_utils, 'list_vms')
+    @mock.patch.object(vm_utils, 'scan_default_sr')
+    @mock.patch.object(host_management, 'get_host_data')
+    def test_update_stats_caches_hostname(self, mock_host_data, mock_scan_sr,
+                                          mock_list_vms, mock_loads,
+                                          mock_vgpus_stats,
+                                          mock_devices, mock_dis_used):
         data = {'disk_total': 0,
                 'disk_used': 0,
                 'disk_available': 0,
@@ -2218,22 +2387,94 @@ class XenAPIHostTestCase(stubs.XenAPITestBase):
             'physical_utilisation': 0,
             'virtual_allocation': 0,
             }
+        mock_loads.return_value = data
+        mock_host_data.return_value = data
+        mock_scan_sr.return_value = 'ref'
+        mock_list_vms.return_value = []
+        mock_devices.return_value = "dev1"
+        mock_dis_used.return_value = (0, 0)
+        self.conn._session = mock.Mock()
+        with mock.patch.object(self.conn._session.SR, 'get_record') \
+                as mock_record:
+            mock_record.return_value = sr_rec
+            stats = self.conn.host_state.get_host_stats(refresh=True)
+            self.assertEqual('foo', stats['hypervisor_hostname'])
+            self.assertEqual(2, mock_loads.call_count)
+            self.assertEqual(2, mock_host_data.call_count)
+            self.assertEqual(2, mock_scan_sr.call_count)
+            self.assertEqual(2, mock_devices.call_count)
+            self.assertEqual(2, mock_vgpus_stats.call_count)
+            mock_loads.assert_called_with(data)
+            mock_host_data.assert_called_with(self.conn._session)
+            mock_scan_sr.assert_called_with(self.conn._session)
+            mock_devices.assert_called_with()
+            mock_vgpus_stats.assert_called_with()
 
-        for i in range(3):
-            host.call_xenhost(mox.IgnoreArg(), 'host_data', {}).AndReturn(data)
-            vm_utils.scan_default_sr(self.conn._session).AndReturn("ref")
-            vm_utils.list_vms(self.conn._session).AndReturn([])
-            self.conn._session.call_xenapi('SR.get_record', "ref").AndReturn(
-                sr_rec)
-            if i == 2:
-                # On the third call (the second below) change the hostname
-                data = dict(data, host_hostname='bar')
 
-        self.mox.ReplayAll()
-        stats = self.conn.host_state.get_host_stats(refresh=True)
-        self.assertEqual('foo', stats['hypervisor_hostname'])
-        stats = self.conn.host_state.get_host_stats(refresh=True)
-        self.assertEqual('foo', stats['hypervisor_hostname'])
+@mock.patch.object(host.HostState, 'update_status')
+class XenAPIHostStateTestCase(stubs.XenAPITestBaseNoDB):
+
+    def _test_get_disk_used(self, vdis, attached_vbds):
+        session = mock.MagicMock()
+        host_state = host.HostState(session)
+
+        sr_ref = 'sr_ref'
+
+        session.SR.get_VDIs.return_value = vdis.keys()
+        session.VDI.get_virtual_size.side_effect = \
+            lambda vdi_ref: vdis[vdi_ref]['virtual_size']
+        session.VDI.get_physical_utilisation.side_effect = \
+            lambda vdi_ref: vdis[vdi_ref]['physical_utilisation']
+        session.VDI.get_VBDs.side_effect = \
+            lambda vdi_ref: vdis[vdi_ref]['VBDs']
+        session.VBD.get_currently_attached.side_effect = \
+            lambda vbd_ref: vbd_ref in attached_vbds
+
+        disk_used = host_state.get_disk_used(sr_ref)
+        session.SR.get_VDIs.assert_called_once_with(sr_ref)
+        return disk_used
+
+    def test_get_disk_used_virtual(self, mock_update_status):
+        # Both VDIs are attached
+        attached_vbds = ['vbd_1', 'vbd_2']
+        vdis = {
+            'vdi_1': {'physical_utilisation': 1,
+                      'virtual_size': 100,
+                      'VBDs': ['vbd_1']},
+            'vdi_2': {'physical_utilisation': 1,
+                      'virtual_size': 100,
+                      'VBDs': ['vbd_2']}
+        }
+        disk_used = self._test_get_disk_used(vdis, attached_vbds)
+        self.assertEqual((200, 2), disk_used)
+
+    def test_get_disk_used_physical(self, mock_update_status):
+        # Neither VDIs are attached
+        attached_vbds = []
+        vdis = {
+            'vdi_1': {'physical_utilisation': 1,
+                      'virtual_size': 100,
+                      'VBDs': ['vbd_1']},
+            'vdi_2': {'physical_utilisation': 1,
+                      'virtual_size': 100,
+                      'VBDs': ['vbd_2']}
+        }
+        disk_used = self._test_get_disk_used(vdis, attached_vbds)
+        self.assertEqual((2, 2), disk_used)
+
+    def test_get_disk_used_both(self, mock_update_status):
+        # One VDI is attached
+        attached_vbds = ['vbd_1']
+        vdis = {
+            'vdi_1': {'physical_utilisation': 1,
+                      'virtual_size': 100,
+                      'VBDs': ['vbd_1']},
+            'vdi_2': {'physical_utilisation': 1,
+                      'virtual_size': 100,
+                      'VBDs': ['vbd_2']}
+        }
+        disk_used = self._test_get_disk_used(vdis, attached_vbds)
+        self.assertEqual((101, 2), disk_used)
 
 
 class ToSupportedInstancesTestCase(test.NoDBTestCase):
@@ -2242,18 +2483,20 @@ class ToSupportedInstancesTestCase(test.NoDBTestCase):
             host.to_supported_instances(None))
 
     def test_return_value(self):
-        self.assertEqual([(arch.X86_64, hv_type.XEN, 'xen')],
-             host.to_supported_instances([u'xen-3.0-x86_64']))
+        self.assertEqual(
+            [(obj_fields.Architecture.X86_64, obj_fields.HVType.XEN, 'xen')],
+            host.to_supported_instances([u'xen-3.0-x86_64']))
 
     def test_invalid_values_do_not_break(self):
-        self.assertEqual([(arch.X86_64, hv_type.XEN, 'xen')],
-             host.to_supported_instances([u'xen-3.0-x86_64', 'spam']))
+        self.assertEqual(
+            [(obj_fields.Architecture.X86_64, obj_fields.HVType.XEN, 'xen')],
+            host.to_supported_instances([u'xen-3.0-x86_64', 'spam']))
 
     def test_multiple_values(self):
         self.assertEqual(
             [
-                (arch.X86_64, hv_type.XEN, 'xen'),
-                (arch.I686, hv_type.XEN, 'hvm')
+                (obj_fields.Architecture.X86_64, obj_fields.HVType.XEN, 'xen'),
+                (obj_fields.Architecture.I686, obj_fields.HVType.XEN, 'hvm')
             ],
             host.to_supported_instances([u'xen-3.0-x86_64', 'hvm-3.0-x86_32'])
         )
@@ -2263,12 +2506,12 @@ class ToSupportedInstancesTestCase(test.NoDBTestCase):
 class XenAPIAutoDiskConfigTestCase(stubs.XenAPITestBase):
     def setUp(self):
         super(XenAPIAutoDiskConfigTestCase, self).setUp()
-        self.flags(connection_url='test_url',
+        self.flags(connection_url='http://localhost',
                    connection_password='test_pass',
                    group='xenserver')
         self.flags(firewall_driver='nova.virt.xenapi.firewall.'
                                    'Dom0IptablesFirewallDriver')
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
         self.user_id = 'fake'
@@ -2277,9 +2520,9 @@ class XenAPIAutoDiskConfigTestCase(stubs.XenAPITestBase):
         self.instance_values = {
                   'project_id': self.project_id,
                   'user_id': self.user_id,
-                  'image_ref': 1,
-                  'kernel_id': 2,
-                  'ramdisk_id': 3,
+                  'image_ref': IMAGE_MACHINE,
+                  'kernel_id': IMAGE_KERNEL,
+                  'ramdisk_id': IMAGE_RAMDISK,
                   'root_gb': 80,
                   'ephemeral_gb': 0,
                   'instance_type_id': '3',  # m1.large
@@ -2288,39 +2531,36 @@ class XenAPIAutoDiskConfigTestCase(stubs.XenAPITestBase):
 
         self.context = context.RequestContext(self.user_id, self.project_id)
 
-        def fake_create_vbd(session, vm_ref, vdi_ref, userdevice,
-                            vbd_type='disk', read_only=False, bootable=True,
-                            osvol=False):
-            pass
+        self.stub_out('nova.virt.xenapi.vm_utils.create_vbd',
+                      lambda session, vm_ref, vdi_ref, userdevice,
+                      bootable, osvol: None)
 
-        self.stubs.Set(vm_utils, 'create_vbd', fake_create_vbd)
-
-    def assertIsPartitionCalled(self, called):
-        marker = {"partition_called": False}
-
-        def fake_resize_part_and_fs(dev, start, old_sectors, new_sectors,
-                                    flags):
-            marker["partition_called"] = True
-        self.stubs.Set(vm_utils, "_resize_part_and_fs",
-                       fake_resize_part_and_fs)
-
+    @mock.patch.object(vm_utils, '_resize_part_and_fs')
+    def assertIsPartitionCalled(self, called, mock_resize_part_and_fs):
         context.RequestContext(self.user_id, self.project_id)
         session = get_session()
 
         disk_image_type = vm_utils.ImageType.DISK_VHD
         instance = create_instance_with_system_metadata(self.context,
-                                                        self.instance_values,
-                                                        obj=True)
+                                                        self.instance_values)
         vm_ref = xenapi_fake.create_vm(instance['name'], 'Halted')
         vdi_ref = xenapi_fake.create_vdi(instance['name'], 'fake')
 
         vdi_uuid = session.call_xenapi('VDI.get_record', vdi_ref)['uuid']
         vdis = {'root': {'uuid': vdi_uuid, 'ref': vdi_ref}}
+        image_meta = objects.ImageMeta.from_dict(
+            {'id': uuids.image_id,
+             'disk_format': 'vhd',
+             'properties': {'vm_mode': 'xen'}})
 
-        self.conn._vmops._attach_disks(instance, vm_ref, instance['name'],
-                                       vdis, disk_image_type, "fake_nw_inf")
+        self.conn._vmops._attach_disks(self.context, instance, image_meta,
+                vm_ref, instance['name'], vdis, disk_image_type,
+                "fake_nw_inf")
 
-        self.assertEqual(marker["partition_called"], called)
+        if called:
+            mock_resize_part_and_fs.assert_called()
+        else:
+            mock_resize_part_and_fs.assert_not_called()
 
     def test_instance_not_auto_disk_config(self):
         """Should not partition unless instance is marked as
@@ -2329,55 +2569,49 @@ class XenAPIAutoDiskConfigTestCase(stubs.XenAPITestBase):
         self.instance_values['auto_disk_config'] = False
         self.assertIsPartitionCalled(False)
 
-    @stub_vm_utils_with_vdi_attached_here
-    def test_instance_auto_disk_config_fails_safe_two_partitions(self):
+    @stub_vm_utils_with_vdi_attached
+    @mock.patch.object(vm_utils, '_get_partitions',
+                       return_value=[(1, 0, 100, 'ext4', "", ""),
+                                     (2, 100, 200, 'ext4' "", "")])
+    def test_instance_auto_disk_config_fails_safe_two_partitions(
+            self, mock_get_partitions):
         # Should not partition unless fail safes pass.
         self.instance_values['auto_disk_config'] = True
 
-        def fake_get_partitions(dev):
-            return [(1, 0, 100, 'ext4', "", ""), (2, 100, 200, 'ext4' "", "")]
-        self.stubs.Set(vm_utils, "_get_partitions",
-                       fake_get_partitions)
-
         self.assertIsPartitionCalled(False)
+        mock_get_partitions.assert_called_once_with('fakedev')
 
-    @stub_vm_utils_with_vdi_attached_here
-    def test_instance_auto_disk_config_fails_safe_badly_numbered(self):
+    @stub_vm_utils_with_vdi_attached
+    @mock.patch.object(vm_utils, '_get_partitions',
+                       return_value=[(2, 100, 200, 'ext4', "", "")])
+    def test_instance_auto_disk_config_fails_safe_badly_numbered(
+            self, mock_get_partitions):
         # Should not partition unless fail safes pass.
         self.instance_values['auto_disk_config'] = True
-
-        def fake_get_partitions(dev):
-            return [(2, 100, 200, 'ext4', "", "")]
-        self.stubs.Set(vm_utils, "_get_partitions",
-                       fake_get_partitions)
-
         self.assertIsPartitionCalled(False)
+        mock_get_partitions.assert_called_once_with('fakedev')
 
-    @stub_vm_utils_with_vdi_attached_here
-    def test_instance_auto_disk_config_fails_safe_bad_fstype(self):
+    @stub_vm_utils_with_vdi_attached
+    @mock.patch.object(vm_utils, '_get_partitions',
+                       return_value=[(1, 100, 200, 'asdf', "", "")])
+    def test_instance_auto_disk_config_fails_safe_bad_fstype(
+            self, mock_get_partitions):
         # Should not partition unless fail safes pass.
         self.instance_values['auto_disk_config'] = True
-
-        def fake_get_partitions(dev):
-            return [(1, 100, 200, 'asdf', "", "")]
-        self.stubs.Set(vm_utils, "_get_partitions",
-                       fake_get_partitions)
-
         self.assertIsPartitionCalled(False)
+        mock_get_partitions.assert_called_once_with('fakedev')
 
-    @stub_vm_utils_with_vdi_attached_here
-    def test_instance_auto_disk_config_passes_fail_safes(self):
+    @stub_vm_utils_with_vdi_attached
+    @mock.patch.object(vm_utils, '_get_partitions',
+                       return_value=[(1, 0, 100, 'ext4', "", "boot")])
+    def test_instance_auto_disk_config_passes_fail_safes(
+            self, mock_get_partitions):
         """Should partition if instance is marked as auto_disk_config=True and
         virt-layer specific fail-safe checks pass.
         """
         self.instance_values['auto_disk_config'] = True
-
-        def fake_get_partitions(dev):
-            return [(1, 0, 100, 'ext4', "", "boot")]
-        self.stubs.Set(vm_utils, "_get_partitions",
-                       fake_get_partitions)
-
         self.assertIsPartitionCalled(True)
+        mock_get_partitions.assert_called_once_with('fakedev')
 
 
 # FIXME(sirp): convert this to use XenAPITestBaseNoDB
@@ -2385,13 +2619,13 @@ class XenAPIGenerateLocal(stubs.XenAPITestBase):
     """Test generating of local disks, like swap and ephemeral."""
     def setUp(self):
         super(XenAPIGenerateLocal, self).setUp()
-        self.flags(connection_url='test_url',
+        self.flags(connection_url='http://localhost',
                    connection_password='test_pass',
                    group='xenserver')
         self.flags(firewall_driver='nova.virt.xenapi.firewall.'
                                    'Dom0IptablesFirewallDriver')
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
-        db_fakes.stub_out_db_instance_api(self.stubs)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
+        db_fakes.stub_out_db_instance_api(self)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
         self.user_id = 'fake'
@@ -2400,9 +2634,9 @@ class XenAPIGenerateLocal(stubs.XenAPITestBase):
         self.instance_values = {
                   'project_id': self.project_id,
                   'user_id': self.user_id,
-                  'image_ref': 1,
-                  'kernel_id': 2,
-                  'ramdisk_id': 3,
+                  'image_ref': IMAGE_MACHINE,
+                  'kernel_id': IMAGE_KERNEL,
+                  'ramdisk_id': IMAGE_RAMDISK,
                   'root_gb': 80,
                   'ephemeral_gb': 0,
                   'instance_type_id': '3',  # m1.large
@@ -2417,7 +2651,7 @@ class XenAPIGenerateLocal(stubs.XenAPITestBase):
             return session.call_xenapi('VBD.create', {'VM': vm_ref,
                                                       'VDI': vdi_ref})
 
-        self.stubs.Set(vm_utils, 'create_vbd', fake_create_vbd)
+        self.stub_out('nova.virt.xenapi.vm_utils.create_vbd', fake_create_vbd)
 
     def assertCalled(self, instance,
                      disk_image_type=vm_utils.ImageType.DISK_VHD):
@@ -2433,56 +2667,50 @@ class XenAPIGenerateLocal(stubs.XenAPITestBase):
         if disk_image_type == vm_utils.ImageType.DISK_ISO:
             vdi_key = 'iso'
         vdis = {vdi_key: {'uuid': vdi_uuid, 'ref': vdi_ref}}
+        image_meta = objects.ImageMeta.from_dict(
+            {'id': uuids.image_id,
+             'disk_format': 'vhd',
+             'properties': {'vm_mode': 'xen'}})
+        self.conn._vmops._attach_disks(self.context, instance, image_meta,
+                    vm_ref, instance['name'], vdis, disk_image_type,
+                    "fake_nw_inf")
 
-        self.called = False
-        self.conn._vmops._attach_disks(instance, vm_ref, instance['name'],
-                                       vdis, disk_image_type, "fake_nw_inf")
-        self.assertTrue(self.called)
-
-    def test_generate_swap(self):
+    @mock.patch.object(vm_utils, 'generate_swap')
+    def test_generate_swap(self, mock_generate_swap):
         # Test swap disk generation.
         instance_values = dict(self.instance_values, instance_type_id=5)
         instance = create_instance_with_system_metadata(self.context,
-                                                        instance_values,
-                                                        obj=True)
-
-        def fake_generate_swap(*args, **kwargs):
-            self.called = True
-        self.stubs.Set(vm_utils, 'generate_swap', fake_generate_swap)
-
+                                                        instance_values)
         self.assertCalled(instance)
+        self.assertTrue(mock_generate_swap.called)
 
-    def test_generate_ephemeral(self):
+    @mock.patch.object(vm_utils, 'generate_ephemeral')
+    def test_generate_ephemeral(self, mock_generate_ephemeral):
         # Test ephemeral disk generation.
         instance_values = dict(self.instance_values, instance_type_id=4)
         instance = create_instance_with_system_metadata(self.context,
-                                                        instance_values,
-                                                        obj=True)
-
-        def fake_generate_ephemeral(*args):
-            self.called = True
-        self.stubs.Set(vm_utils, 'generate_ephemeral', fake_generate_ephemeral)
-
+                                                        instance_values)
         self.assertCalled(instance)
+        self.assertTrue(mock_generate_ephemeral.called)
 
-    def test_generate_iso_blank_root_disk(self):
+    @mock.patch.object(
+        uuidutils, 'generate_uuid',
+        new=mock.Mock(return_value='98e2a239-5a96-4a72-840f-2c3836482461'))
+    @mock.patch.object(vm_utils, 'generate_iso_blank_root_disk')
+    @mock.patch.object(vm_utils, 'generate_ephemeral')
+    def test_generate_iso_blank_root_disk(
+            self, mock_generate_ephemeral, mock_generate_iso_blank_root_disk):
         instance_values = dict(self.instance_values, instance_type_id=4)
         instance_values.pop('kernel_id')
         instance_values.pop('ramdisk_id')
         instance = create_instance_with_system_metadata(self.context,
-                                                        instance_values,
-                                                        obj=True)
-
-        def fake_generate_ephemeral(*args):
-            pass
-        self.stubs.Set(vm_utils, 'generate_ephemeral', fake_generate_ephemeral)
-
-        def fake_generate_iso(*args):
-            self.called = True
-        self.stubs.Set(vm_utils, 'generate_iso_blank_root_disk',
-            fake_generate_iso)
-
+                                                        instance_values)
         self.assertCalled(instance, vm_utils.ImageType.DISK_ISO)
+        mock_generate_ephemeral.assert_called_once_with(
+            test.MatchType(session.XenAPISession),
+            instance, '98e2a239-5a96-4a72-840f-2c3836482461', '4',
+            'instance-00000001', 160)
+        self.assertTrue(mock_generate_iso_blank_root_disk.called)
 
 
 class XenAPIBWCountersTestCase(stubs.XenAPITestBaseNoDB):
@@ -2500,48 +2728,42 @@ class XenAPIBWCountersTestCase(stubs.XenAPITestBaseNoDB):
 
     def setUp(self):
         super(XenAPIBWCountersTestCase, self).setUp()
-        self.stubs.Set(vm_utils, 'list_vms',
-                       XenAPIBWCountersTestCase._fake_list_vms)
-        self.flags(connection_url='test_url',
+        self.stub_out('nova.virt.xenapi.vm_utils.list_vms',
+                      XenAPIBWCountersTestCase._fake_list_vms)
+        self.flags(connection_url='http://localhost',
                    connection_password='test_pass',
                    group='xenserver')
         self.flags(firewall_driver='nova.virt.xenapi.firewall.'
                                    'Dom0IptablesFirewallDriver')
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
-        def _fake_get_vif_device_map(vm_rec):
+        def _fake_get_vif_device_map(self, vm_rec):
             return vm_rec['_vifmap']
 
-        self.stubs.Set(self.conn._vmops, "_get_vif_device_map",
-                                         _fake_get_vif_device_map)
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._get_vif_device_map',
+                      _fake_get_vif_device_map)
 
     @classmethod
     def _fake_list_vms(cls, session):
-        return cls.FAKE_VMS.iteritems()
+        return cls.FAKE_VMS.items()
 
     @staticmethod
     def _fake_fetch_bandwidth_mt(session):
         return {}
 
-    @staticmethod
-    def _fake_fetch_bandwidth(session):
-        return {'42':
-                    {'0': {'bw_in': 21024, 'bw_out': 22048},
-                     '1': {'bw_in': 231337, 'bw_out': 221212121}},
-                '12':
-                    {'0': {'bw_in': 1024, 'bw_out': 2048},
-                     '1': {'bw_in': 31337, 'bw_out': 21212121}},
-                }
-
-    def test_get_all_bw_counters(self):
+    @mock.patch.object(vm_utils, 'fetch_bandwidth',
+                       return_value={
+                           '42': {'0': {'bw_in': 21024, 'bw_out': 22048},
+                                  '1': {'bw_in': 231337, 'bw_out': 221212121}},
+                           '12':
+                                 {'0': {'bw_in': 1024, 'bw_out': 2048},
+                                  '1': {'bw_in': 31337, 'bw_out': 21212121}}})
+    def test_get_all_bw_counters(self, mock_fetch_bandwidth):
         instances = [dict(name='test1', uuid='1-2-3'),
                      dict(name='test2', uuid='4-5-6')]
-
-        self.stubs.Set(vm_utils, 'fetch_bandwidth',
-                       self._fake_fetch_bandwidth)
         result = self.conn.get_all_bw_counters(instances)
-        self.assertEqual(len(result), 4)
+        self.assertEqual(4, len(result))
         self.assertIn(dict(uuid='1-2-3',
                            mac_address="a:b:c:d...",
                            bw_in=1024,
@@ -2559,15 +2781,16 @@ class XenAPIBWCountersTestCase(stubs.XenAPITestBaseNoDB):
                            mac_address="e:f:42:q...",
                            bw_in=231337,
                            bw_out=221212121), result)
+        mock_fetch_bandwidth.assert_called_once_with(
+            test.MatchType(session.XenAPISession))
 
+    @mock.patch.object(vm_utils, 'fetch_bandwidth',
+                       new=mock.Mock(return_value={}))
     def test_get_all_bw_counters_in_failure_case(self):
         """Test that get_all_bw_conters returns an empty list when
         no data returned from Xenserver.  c.f. bug #910045.
         """
         instances = [dict(name='instance-0001', uuid='1-2-3-4-5')]
-
-        self.stubs.Set(vm_utils, 'fetch_bandwidth',
-                       self._fake_fetch_bandwidth_mt)
         result = self.conn.get_all_bw_counters(instances)
         self.assertEqual(result, [])
 
@@ -2638,7 +2861,7 @@ class XenAPIDom0IptablesFirewallTestCase(stubs.XenAPITestBase):
 
     def setUp(self):
         super(XenAPIDom0IptablesFirewallTestCase, self).setUp()
-        self.flags(connection_url='test_url',
+        self.flags(connection_url='http://localhost',
                    connection_password='test_pass',
                    group='xenserver')
         self.flags(instance_name_template='%d',
@@ -2646,7 +2869,7 @@ class XenAPIDom0IptablesFirewallTestCase(stubs.XenAPITestBase):
                                    'Dom0IptablesFirewallDriver')
         self.user_id = 'mappin'
         self.project_id = 'fake'
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForFirewallTests,
+        stubs.stubout_session(self, stubs.FakeSessionForFirewallTests,
                               test_case=self)
         self.context = context.RequestContext(self.user_id, self.project_id)
         self.network = importutils.import_object(CONF.network_manager)
@@ -2689,8 +2912,7 @@ class XenAPIDom0IptablesFirewallTestCase(stubs.XenAPITestBase):
         return secgroup
 
     def _validate_security_group(self):
-        in_rules = filter(lambda l: not l.startswith('#'),
-                          self._in_rules)
+        in_rules = [l for l in self._in_rules if not l.startswith('#')]
         for rule in in_rules:
             if 'nova' not in rule:
                 self.assertIn(rule, self._out_rules,
@@ -2715,18 +2937,21 @@ class XenAPIDom0IptablesFirewallTestCase(stubs.XenAPITestBase):
 
         regex = re.compile('\[0\:0\] -A .* -j ACCEPT -p icmp'
                            ' -s 192.168.11.0/24')
-        self.assertTrue(len(filter(regex.match, self._out_rules)) > 0,
-                        "ICMP acceptance rule wasn't added")
+        match_rules = [rule for rule in self._out_rules if regex.match(rule)]
+        self.assertGreater(len(match_rules), 0,
+                           "ICMP acceptance rule wasn't added")
 
         regex = re.compile('\[0\:0\] -A .* -j ACCEPT -p icmp -m icmp'
                            ' --icmp-type 8 -s 192.168.11.0/24')
-        self.assertTrue(len(filter(regex.match, self._out_rules)) > 0,
-                        "ICMP Echo Request acceptance rule wasn't added")
+        match_rules = [rule for rule in self._out_rules if regex.match(rule)]
+        self.assertGreater(len(match_rules), 0,
+                           "ICMP Echo Request acceptance rule wasn't added")
 
         regex = re.compile('\[0\:0\] -A .* -j ACCEPT -p tcp --dport 80:81'
                            ' -s 192.168.10.0/24')
-        self.assertTrue(len(filter(regex.match, self._out_rules)) > 0,
-                        "TCP port 80/81 acceptance rule wasn't added")
+        match_rules = [rule for rule in self._out_rules if regex.match(rule)]
+        self.assertGreater(len(match_rules), 0,
+                           "TCP port 80/81 acceptance rule wasn't added")
 
     def test_static_filters(self):
         instance_ref = self._create_instance_ref()
@@ -2753,11 +2978,10 @@ class XenAPIDom0IptablesFirewallTestCase(stubs.XenAPITestBase):
         instance_ref = db.instance_get(admin_ctxt, instance_ref['id'])
         src_instance_ref = db.instance_get(admin_ctxt, src_instance_ref['id'])
 
-        network_model = fake_network.fake_get_instance_nw_info(self.stubs, 1)
+        network_model = fake_network.fake_get_instance_nw_info(self, 1)
 
-        from nova.compute import utils as compute_utils  # noqa
-        self.stubs.Set(compute_utils, 'get_nw_info_for_instance',
-                       lambda instance: network_model)
+        self.stub_out('nova.objects.Instance.get_network_info',
+                      lambda instance: network_model)
 
         self.fw.prepare_instance_filter(instance_ref, network_model)
         self.fw.apply_instance_filter(instance_ref, network_model)
@@ -2769,21 +2993,23 @@ class XenAPIDom0IptablesFirewallTestCase(stubs.XenAPITestBase):
                 continue
             regex = re.compile('\[0\:0\] -A .* -j ACCEPT -p tcp'
                                ' --dport 80:81 -s %s' % ip['address'])
-            self.assertTrue(len(filter(regex.match, self._out_rules)) > 0,
-                            "TCP port 80/81 acceptance rule wasn't added")
+            match_rules = [rule for rule in self._out_rules
+                           if regex.match(rule)]
+            self.assertGreater(len(match_rules), 0,
+                               "TCP port 80/81 acceptance rule wasn't added")
 
         db.instance_destroy(admin_ctxt, instance_ref['uuid'])
 
     def test_filters_for_instance_with_ip_v6(self):
         self.flags(use_ipv6=True)
-        network_info = fake_network.fake_get_instance_nw_info(self.stubs, 1)
+        network_info = fake_network.fake_get_instance_nw_info(self, 1)
         rulesv4, rulesv6 = self.fw._filters_for_instance("fake", network_info)
         self.assertEqual(len(rulesv4), 2)
         self.assertEqual(len(rulesv6), 1)
 
     def test_filters_for_instance_without_ip_v6(self):
         self.flags(use_ipv6=False)
-        network_info = fake_network.fake_get_instance_nw_info(self.stubs, 1)
+        network_info = fake_network.fake_get_instance_nw_info(self, 1)
         rulesv4, rulesv6 = self.fw._filters_for_instance("fake", network_info)
         self.assertEqual(len(rulesv4), 2)
         self.assertEqual(len(rulesv6), 0)
@@ -2796,7 +3022,7 @@ class XenAPIDom0IptablesFirewallTestCase(stubs.XenAPITestBase):
         networks_count = 5
         instance_ref = self._create_instance_ref()
         _get_instance_nw_info = fake_network.fake_get_instance_nw_info
-        network_info = _get_instance_nw_info(self.stubs,
+        network_info = _get_instance_nw_info(self,
                                              networks_count,
                                              ipv4_addr_per_network)
         network_info[0]['network']['subnets'][0]['meta']['dhcp_server'] = \
@@ -2820,7 +3046,7 @@ class XenAPIDom0IptablesFirewallTestCase(stubs.XenAPITestBase):
     def test_do_refresh_security_group_rules(self):
         admin_ctxt = context.get_admin_context()
         instance_ref = self._create_instance_ref()
-        network_info = fake_network.fake_get_instance_nw_info(self.stubs, 1, 1)
+        network_info = fake_network.fake_get_instance_nw_info(self, 1, 1)
         secgroup = self._create_test_security_group()
         db.instance_add_security_group(admin_ctxt, instance_ref['uuid'],
                                        secgroup['id'])
@@ -2839,66 +3065,10 @@ class XenAPIDom0IptablesFirewallTestCase(stubs.XenAPITestBase):
         self.fw.refresh_security_group_rules(secgroup)
         regex = re.compile('\[0\:0\] -A .* -j ACCEPT -p udp --dport 200:299'
                            ' -s 192.168.99.0/24')
-        self.assertTrue(len(filter(regex.match, self._out_rules)) > 0,
-                        "Rules were not updated properly. "
-                        "The rule for UDP acceptance is missing")
-
-    def test_provider_firewall_rules(self):
-        # setup basic instance data
-        instance_ref = self._create_instance_ref()
-        # FRAGILE: as in libvirt tests
-        # peeks at how the firewall names chains
-        chain_name = 'inst-%s' % instance_ref['id']
-
-        network_info = fake_network.fake_get_instance_nw_info(self.stubs, 1, 1)
-        self.fw.prepare_instance_filter(instance_ref, network_info)
-        self.assertIn('provider', self.fw.iptables.ipv4['filter'].chains)
-        rules = [rule for rule in self.fw.iptables.ipv4['filter'].rules
-                      if rule.chain == 'provider']
-        self.assertEqual(0, len(rules))
-
-        admin_ctxt = context.get_admin_context()
-        # add a rule and send the update message, check for 1 rule
-        db.provider_fw_rule_create(admin_ctxt,
-                                   {'protocol': 'tcp',
-                                    'cidr': '10.99.99.99/32',
-                                    'from_port': 1,
-                                    'to_port': 65535})
-        self.fw.refresh_provider_fw_rules()
-        rules = [rule for rule in self.fw.iptables.ipv4['filter'].rules
-                      if rule.chain == 'provider']
-        self.assertEqual(1, len(rules))
-
-        # Add another, refresh, and make sure number of rules goes to two
-        provider_fw1 = db.provider_fw_rule_create(admin_ctxt,
-                                                  {'protocol': 'udp',
-                                                   'cidr': '10.99.99.99/32',
-                                                   'from_port': 1,
-                                                   'to_port': 65535})
-        self.fw.refresh_provider_fw_rules()
-        rules = [rule for rule in self.fw.iptables.ipv4['filter'].rules
-                      if rule.chain == 'provider']
-        self.assertEqual(2, len(rules))
-
-        # create the instance filter and make sure it has a jump rule
-        self.fw.prepare_instance_filter(instance_ref, network_info)
-        self.fw.apply_instance_filter(instance_ref, network_info)
-        inst_rules = [rule for rule in self.fw.iptables.ipv4['filter'].rules
-                           if rule.chain == chain_name]
-        jump_rules = [rule for rule in inst_rules if '-j' in rule.rule]
-        provjump_rules = []
-        # IptablesTable doesn't make rules unique internally
-        for rule in jump_rules:
-            if 'provider' in rule.rule and rule not in provjump_rules:
-                provjump_rules.append(rule)
-        self.assertEqual(1, len(provjump_rules))
-
-        # remove a rule from the db, cast to compute to refresh rule
-        db.provider_fw_rule_destroy(admin_ctxt, provider_fw1['id'])
-        self.fw.refresh_provider_fw_rules()
-        rules = [rule for rule in self.fw.iptables.ipv4['filter'].rules
-                      if rule.chain == 'provider']
-        self.assertEqual(1, len(rules))
+        match_rules = [rule for rule in self._out_rules if regex.match(rule)]
+        self.assertGreater(len(match_rules), 0,
+                           "Rules were not updated properly. "
+                           "The rule for UDP acceptance is missing")
 
 
 class XenAPISRSelectionTestCase(stubs.XenAPITestBaseNoDB):
@@ -2906,7 +3076,7 @@ class XenAPISRSelectionTestCase(stubs.XenAPITestBaseNoDB):
     def test_safe_find_sr_raise_exception(self):
         # Ensure StorageRepositoryNotFound is raise when wrong filter.
         self.flags(sr_matching_filter='yadayadayada', group='xenserver')
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         session = get_session()
         self.assertRaises(exception.StorageRepositoryNotFound,
                           vm_utils.safe_find_sr, session)
@@ -2915,7 +3085,7 @@ class XenAPISRSelectionTestCase(stubs.XenAPITestBaseNoDB):
         # Ensure the default local-storage is found.
         self.flags(sr_matching_filter='other-config:i18n-key=local-storage',
                    group='xenserver')
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         session = get_session()
         # This test is only guaranteed if there is one host in the pool
         self.assertEqual(len(xenapi_fake.get_all('host')), 1)
@@ -2935,7 +3105,7 @@ class XenAPISRSelectionTestCase(stubs.XenAPITestBaseNoDB):
         # Ensure the SR is found when using a different filter.
         self.flags(sr_matching_filter='other-config:my_fake_sr=true',
                    group='xenserver')
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         session = get_session()
         host_ref = xenapi_fake.get_all('host')[0]
         local_sr = xenapi_fake.create_sr(name_label='Fake Storage',
@@ -2949,7 +3119,7 @@ class XenAPISRSelectionTestCase(stubs.XenAPITestBaseNoDB):
         # Ensure the default SR is found regardless of other-config.
         self.flags(sr_matching_filter='default-sr:true',
                    group='xenserver')
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         session = get_session()
         pool_ref = session.call_xenapi('pool.get_all')[0]
         expected = vm_utils.safe_find_sr(session)
@@ -2960,7 +3130,7 @@ class XenAPISRSelectionTestCase(stubs.XenAPITestBaseNoDB):
 def _create_service_entries(context, values={'avail_zone1': ['fake_host1',
                                                          'fake_host2'],
                                          'avail_zone2': ['fake_host3'], }):
-    for avail_zone, hosts in values.iteritems():
+    for hosts in values.values():
         for service_host in hosts:
             db.service_create(context,
                               {'host': service_host,
@@ -2975,7 +3145,7 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
     """Unit tests for aggregate operations."""
     def setUp(self):
         super(XenAPIAggregateTestCase, self).setUp()
-        self.flags(connection_url='http://test_url',
+        self.flags(connection_url='http://localhost',
                    connection_username='test_user',
                    connection_password='test_pass',
                    group='xenserver')
@@ -2985,81 +3155,68 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
                    host='host',
                    compute_driver='xenapi.XenAPIDriver',
                    default_availability_zone='avail_zone1')
-        self.flags(use_local=True, group='conductor')
         host_ref = xenapi_fake.get_all('host')[0]
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.context = context.get_admin_context()
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
-        self.compute = importutils.import_object(CONF.compute_manager)
+        self.compute = manager.ComputeManager()
         self.api = compute_api.AggregateAPI()
         values = {'name': 'test_aggr',
                   'metadata': {'availability_zone': 'test_zone',
                   pool_states.POOL_FLAG: 'XenAPI'}}
-        self.aggr = db.aggregate_create(self.context, values)
+        self.aggr = objects.Aggregate(context=self.context, id=1,
+                                      **values)
         self.fake_metadata = {pool_states.POOL_FLAG: 'XenAPI',
                               'master_compute': 'host',
                               'availability_zone': 'fake_zone',
                               pool_states.KEY: pool_states.ACTIVE,
                               'host': xenapi_fake.get_record('host',
                                                              host_ref)['uuid']}
+        self.useFixture(fixtures.SingleCellSimple())
 
-    def test_pool_add_to_aggregate_called_by_driver(self):
-
-        calls = []
-
+    @mock.patch('nova.virt.xenapi.pool.ResourcePool.add_to_aggregate')
+    def test_pool_add_to_aggregate_called_by_driver(
+            self, mock_add_to_aggregate):
         def pool_add_to_aggregate(context, aggregate, host, slave_info=None):
             self.assertEqual("CONTEXT", context)
             self.assertEqual("AGGREGATE", aggregate)
             self.assertEqual("HOST", host)
             self.assertEqual("SLAVEINFO", slave_info)
-            calls.append(pool_add_to_aggregate)
-        self.stubs.Set(self.conn._pool,
-                       "add_to_aggregate",
-                       pool_add_to_aggregate)
+        mock_add_to_aggregate.side_effect = pool_add_to_aggregate
 
         self.conn.add_to_aggregate("CONTEXT", "AGGREGATE", "HOST",
                                    slave_info="SLAVEINFO")
 
-        self.assertIn(pool_add_to_aggregate, calls)
+        self.assertTrue(mock_add_to_aggregate.called)
 
-    def test_pool_remove_from_aggregate_called_by_driver(self):
-
-        calls = []
-
+    @mock.patch('nova.virt.xenapi.pool.ResourcePool.remove_from_aggregate')
+    def test_pool_remove_from_aggregate_called_by_driver(
+            self, mock_remove_from_aggregate):
         def pool_remove_from_aggregate(context, aggregate, host,
                                        slave_info=None):
             self.assertEqual("CONTEXT", context)
             self.assertEqual("AGGREGATE", aggregate)
             self.assertEqual("HOST", host)
             self.assertEqual("SLAVEINFO", slave_info)
-            calls.append(pool_remove_from_aggregate)
-        self.stubs.Set(self.conn._pool,
-                       "remove_from_aggregate",
-                       pool_remove_from_aggregate)
-
+        mock_remove_from_aggregate.side_effect = pool_remove_from_aggregate
         self.conn.remove_from_aggregate("CONTEXT", "AGGREGATE", "HOST",
                                         slave_info="SLAVEINFO")
 
-        self.assertIn(pool_remove_from_aggregate, calls)
+        self.assertTrue(mock_remove_from_aggregate.called)
 
-    def test_add_to_aggregate_for_first_host_sets_metadata(self):
-        def fake_init_pool(id, name):
-            fake_init_pool.called = True
-        self.stubs.Set(self.conn._pool, "_init_pool", fake_init_pool)
-
+    @mock.patch('nova.virt.xenapi.pool.ResourcePool._init_pool')
+    def test_add_to_aggregate_for_first_host_sets_metadata(
+            self, mock_init_pool):
         aggregate = self._aggregate_setup()
         self.conn._pool.add_to_aggregate(self.context, aggregate, "host")
-        result = db.aggregate_get(self.context, aggregate['id'])
-        self.assertTrue(fake_init_pool.called)
+        result = objects.Aggregate.get_by_id(self.context, aggregate.id)
+        self.assertTrue(mock_init_pool.called)
         self.assertThat(self.fake_metadata,
-                        matchers.DictMatches(result['metadetails']))
+                        matchers.DictMatches(result.metadata))
 
-    def test_join_slave(self):
+    @mock.patch('nova.virt.xenapi.pool.ResourcePool._join_slave')
+    def test_join_slave(self, mock_join_slave):
         # Ensure join_slave gets called when the request gets to master.
-        def fake_join_slave(id, compute_uuid, host, url, user, password):
-            fake_join_slave.called = True
-        self.stubs.Set(self.conn._pool, "_join_slave", fake_join_slave)
-
         aggregate = self._aggregate_setup(hosts=['host', 'host2'],
                                           metadata=self.fake_metadata)
         self.conn._pool.add_to_aggregate(self.context, aggregate, "host2",
@@ -3068,13 +3225,10 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
                                          user='fake_user',
                                          passwd='fake_pass',
                                          xenhost_uuid='fake_uuid'))
-        self.assertTrue(fake_join_slave.called)
+        self.assertTrue(mock_join_slave.called)
 
-    def test_add_to_aggregate_first_host(self):
-        def fake_pool_set_name_label(self, session, pool_ref, name):
-            fake_pool_set_name_label.called = True
-        self.stubs.Set(xenapi_fake.SessionBase, "pool_set_name_label",
-                       fake_pool_set_name_label)
+    @mock.patch.object(xenapi_fake.SessionBase, 'pool_set_name_label')
+    def test_add_to_aggregate_first_host(self, mock_pool_set_name_label):
         self.conn._session.call_xenapi("pool.create", {"name": "asdf"})
 
         metadata = {'availability_zone': 'fake_zone',
@@ -3090,17 +3244,12 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
         self.assertEqual(metadata, aggregate.metadata)
 
         self.conn._pool.add_to_aggregate(self.context, aggregate, "host")
-        self.assertTrue(fake_pool_set_name_label.called)
+        self.assertTrue(mock_pool_set_name_label.called)
 
-    def test_remove_from_aggregate_called(self):
-        def fake_remove_from_aggregate(context, aggregate, host):
-            fake_remove_from_aggregate.called = True
-        self.stubs.Set(self.conn._pool,
-                       "remove_from_aggregate",
-                       fake_remove_from_aggregate)
-
+    @mock.patch('nova.virt.xenapi.pool.ResourcePool.remove_from_aggregate')
+    def test_remove_from_aggregate_called(self, mock_remove_from_aggregate):
         self.conn.remove_from_aggregate(None, None, None)
-        self.assertTrue(fake_remove_from_aggregate.called)
+        self.assertTrue(mock_remove_from_aggregate.called)
 
     def test_remove_from_empty_aggregate(self):
         result = self._aggregate_setup()
@@ -3108,32 +3257,26 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
                           self.conn._pool.remove_from_aggregate,
                           self.context, result, "test_host")
 
-    def test_remove_slave(self):
+    @mock.patch('nova.virt.xenapi.pool.ResourcePool._eject_slave')
+    def test_remove_slave(self, mock_eject_slave):
         # Ensure eject slave gets called.
-        def fake_eject_slave(id, compute_uuid, host_uuid):
-            fake_eject_slave.called = True
-        self.stubs.Set(self.conn._pool, "_eject_slave", fake_eject_slave)
-
         self.fake_metadata['host2'] = 'fake_host2_uuid'
         aggregate = self._aggregate_setup(hosts=['host', 'host2'],
                 metadata=self.fake_metadata, aggr_state=pool_states.ACTIVE)
         self.conn._pool.remove_from_aggregate(self.context, aggregate, "host2")
-        self.assertTrue(fake_eject_slave.called)
+        self.assertTrue(mock_eject_slave.called)
 
-    def test_remove_master_solo(self):
+    @mock.patch('nova.virt.xenapi.pool.ResourcePool._clear_pool')
+    def test_remove_master_solo(self, mock_clear_pool):
         # Ensure metadata are cleared after removal.
-        def fake_clear_pool(id):
-            fake_clear_pool.called = True
-        self.stubs.Set(self.conn._pool, "_clear_pool", fake_clear_pool)
-
         aggregate = self._aggregate_setup(metadata=self.fake_metadata)
         self.conn._pool.remove_from_aggregate(self.context, aggregate, "host")
-        result = db.aggregate_get(self.context, aggregate['id'])
-        self.assertTrue(fake_clear_pool.called)
+        result = objects.Aggregate.get_by_id(self.context, aggregate.id)
+        self.assertTrue(mock_clear_pool.called)
         self.assertThat({'availability_zone': 'fake_zone',
                 pool_states.POOL_FLAG: 'XenAPI',
                 pool_states.KEY: pool_states.ACTIVE},
-                matchers.DictMatches(result['metadetails']))
+                matchers.DictMatches(result.metadata))
 
     def test_remote_master_non_empty_pool(self):
         # Ensure AggregateError is raised if removing the master.
@@ -3191,25 +3334,32 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
                                aggregate, 'fake_host')
         self.assertIn('aggregate in error', str(ex))
 
-    def test_remove_host_from_aggregate_error(self):
+    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
+                'aggregate_remove_host')
+    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
+                'aggregate_add_host')
+    def test_remove_host_from_aggregate_error(
+            self, mock_add_host, mock_remove_host):
         # Ensure we can remove a host from an aggregate even if in error.
         values = _create_service_entries(self.context)
-        fake_zone = values.keys()[0]
+        fake_zone = list(values.keys())[0]
         aggr = self.api.create_aggregate(self.context,
                                          'fake_aggregate', fake_zone)
         # let's mock the fact that the aggregate is ready!
         metadata = {pool_states.POOL_FLAG: "XenAPI",
                     pool_states.KEY: pool_states.ACTIVE}
-        db.aggregate_metadata_add(self.context, aggr['id'], metadata)
+        self.api.update_aggregate_metadata(self.context,
+                                           aggr.id,
+                                           metadata)
         for aggregate_host in values[fake_zone]:
             aggr = self.api.add_host_to_aggregate(self.context,
-                                                  aggr['id'], aggregate_host)
+                                                  aggr.id, aggregate_host)
         # let's mock the fact that the aggregate is in error!
         expected = self.api.remove_host_from_aggregate(self.context,
-                                                       aggr['id'],
+                                                       aggr.id,
                                                        values[fake_zone][0])
-        self.assertEqual(len(aggr['hosts']) - 1, len(expected['hosts']))
-        self.assertEqual(expected['metadata'][pool_states.KEY],
+        self.assertEqual(len(aggr.hosts) - 1, len(expected.hosts))
+        self.assertEqual(expected.metadata[pool_states.KEY],
                          pool_states.ACTIVE)
 
     def test_remove_host_from_aggregate_invalid_dismissed_status(self):
@@ -3230,27 +3380,27 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
                           self.conn.remove_from_aggregate, self.context,
                           aggregate, 'fake_host')
 
+    @mock.patch('nova.virt.xenapi.driver.XenAPIDriver.add_to_aggregate',
+                new=mock.Mock(
+                    side_effect=exception.AggregateError(
+                        aggregate_id='', action='', reason='')))
+    @mock.patch('nova.compute.utils.notify_about_aggregate_action',
+                new=mock.Mock())
     def test_add_aggregate_host_raise_err(self):
         # Ensure the undo operation works correctly on add.
-        def fake_driver_add_to_aggregate(context, aggregate, host, **_ignore):
-            raise exception.AggregateError(
-                    aggregate_id='', action='', reason='')
-        self.stubs.Set(self.compute.driver, "add_to_aggregate",
-                       fake_driver_add_to_aggregate)
         metadata = {pool_states.POOL_FLAG: "XenAPI",
                     pool_states.KEY: pool_states.ACTIVE}
-        db.aggregate_metadata_add(self.context, self.aggr['id'], metadata)
-        db.aggregate_host_add(self.context, self.aggr['id'], 'fake_host')
+        self.aggr.metadata = metadata
+        self.aggr.hosts = ['fake_host']
 
         self.assertRaises(exception.AggregateError,
                           self.compute.add_aggregate_host,
                           self.context, host="fake_host",
-                          aggregate=jsonutils.to_primitive(self.aggr),
+                          aggregate=self.aggr,
                           slave_info=None)
-        excepted = db.aggregate_get(self.context, self.aggr['id'])
-        self.assertEqual(excepted['metadetails'][pool_states.KEY],
+        self.assertEqual(self.aggr.metadata[pool_states.KEY],
                 pool_states.ERROR)
-        self.assertEqual(excepted['hosts'], [])
+        self.assertEqual(self.aggr.hosts, ['fake_host'])
 
 
 class MockComputeAPI(object):
@@ -3263,11 +3413,11 @@ class MockComputeAPI(object):
             self.add_aggregate_host, ctxt, aggregate,
             host_param, host, slave_info))
 
-    def remove_aggregate_host(self, ctxt, aggregate_id, host_param,
-                              host, slave_info):
+    def remove_aggregate_host(self, ctxt, host, aggregate_id, host_param,
+                              slave_info):
         self._mock_calls.append((
-            self.remove_aggregate_host, ctxt, aggregate_id,
-            host_param, host, slave_info))
+            self.remove_aggregate_host, ctxt, host, aggregate_id,
+            host_param, slave_info))
 
 
 class StubDependencies(object):
@@ -3300,10 +3450,11 @@ class HypervisorPoolTestCase(test.NoDBTestCase):
         'hosts': [],
         'metadata': {
             'master_compute': 'master',
-            pool_states.POOL_FLAG: {},
-            pool_states.KEY: {}
+            pool_states.POOL_FLAG: '',
+            pool_states.KEY: ''
             }
         }
+    fake_aggregate = objects.Aggregate(**fake_aggregate)
 
     def test_slave_asks_master_to_add_slave_to_pool(self):
         slave = ResourcePoolWithStubs()
@@ -3312,8 +3463,8 @@ class HypervisorPoolTestCase(test.NoDBTestCase):
 
         self.assertIn(
             (slave.compute_rpcapi.add_aggregate_host,
-            "CONTEXT", jsonutils.to_primitive(self.fake_aggregate),
-            "slave", "master", "SLAVE_INFO"),
+            "CONTEXT", "slave", self.fake_aggregate,
+            "master", "SLAVE_INFO"),
             slave.compute_rpcapi._mock_calls)
 
     def test_slave_asks_master_to_remove_slave_from_pool(self):
@@ -3323,7 +3474,7 @@ class HypervisorPoolTestCase(test.NoDBTestCase):
 
         self.assertIn(
             (slave.compute_rpcapi.remove_aggregate_host,
-            "CONTEXT", 98, "slave", "master", "SLAVE_INFO"),
+             "CONTEXT", "slave", 98, "master", "SLAVE_INFO"),
             slave.compute_rpcapi._mock_calls)
 
 
@@ -3352,307 +3503,349 @@ class XenAPILiveMigrateTestCase(stubs.XenAPITestBaseNoDB):
     """Unit tests for live_migration."""
     def setUp(self):
         super(XenAPILiveMigrateTestCase, self).setUp()
-        self.flags(connection_url='test_url',
+        self.flags(connection_url='http://localhost',
                    connection_password='test_pass',
                    group='xenserver')
         self.flags(firewall_driver='nova.virt.xenapi.firewall.'
                                    'Dom0IptablesFirewallDriver',
                    host='host')
-        db_fakes.stub_out_db_instance_api(self.stubs)
+        db_fakes.stub_out_db_instance_api(self)
         self.context = context.get_admin_context()
 
-    def test_live_migration_calls_vmops(self):
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+    @mock.patch.object(vmops.VMOps, 'live_migrate')
+    def test_live_migration_calls_vmops(self, mock_live_migrate):
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
-
-        def fake_live_migrate(context, instance_ref, dest, post_method,
-                              recover_method, block_migration, migrate_data):
-            fake_live_migrate.called = True
-
-        self.stubs.Set(self.conn._vmops, "live_migrate", fake_live_migrate)
-
         self.conn.live_migration(None, None, None, None, None)
-        self.assertTrue(fake_live_migrate.called)
+        self.assertTrue(mock_live_migrate.called)
 
     def test_pre_live_migration(self):
-        # ensure method is present
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
-        self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
-        self.conn.pre_live_migration(None, None, None, None, None)
-
-    def test_post_live_migration_at_destination(self):
-        # ensure method is present
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
-        fake_instance = {"name": "name"}
+        with mock.patch.object(self.conn._vmops, "pre_live_migration") as pre:
+            pre.return_value = True
+
+            result = self.conn.pre_live_migration(
+                    "ctx", "inst", "bdi", "nw", "di", "data")
+
+            self.assertTrue(result)
+            pre.assert_called_with("ctx", "inst", "bdi", "nw", "di", "data")
+
+    @mock.patch('nova.virt.firewall.IptablesFirewallDriver.'
+                'apply_instance_filter')
+    @mock.patch('nova.virt.firewall.IptablesFirewallDriver.'
+                'prepare_instance_filter')
+    @mock.patch('nova.virt.firewall.IptablesFirewallDriver.'
+                'setup_basic_filtering')
+    @mock.patch.object(vm_utils, 'create_kernel_and_ramdisk',
+                       return_value=('fake-kernel-file', 'fake-ramdisk-file'))
+    @mock.patch.object(vm_utils, 'strip_base_mirror_from_vdis')
+    @mock.patch.object(vmops.VMOps, '_get_vm_opaque_ref')
+    @mock.patch.object(vmops.VMOps, '_post_start_actions')
+    def test_post_live_migration_at_destination(
+            self, mock_post_action, mock_get_vm_opaque_ref,
+            mock_strip_base_mirror_from_vdis, mock_create_kernel_and_ramdisk,
+            mock_setup_basic_filtering, mock_prepare_instance_filter,
+            mock_apply_instance_filter):
+        # ensure method is present
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
+        self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
+
+        fake_instance = {"name": "fake-name"}
         fake_network_info = "network_info"
 
-        def fake_fw(instance, network_info):
-            self.assertEqual(instance, fake_instance)
-            self.assertEqual(network_info, fake_network_info)
-            fake_fw.call_count += 1
+        self.conn.post_live_migration_at_destination(
+            self.context, fake_instance, fake_network_info, None)
+        self.assertTrue(mock_get_vm_opaque_ref.called)
+        self.assertTrue(mock_strip_base_mirror_from_vdis.called)
+        mock_post_action.assert_called_once_with(fake_instance)
+        mock_create_kernel_and_ramdisk.assert_called_once_with(
+            self.context, self.conn._session, fake_instance,
+            fake_instance['name'])
+        mock_setup_basic_filtering.assert_called_once_with(fake_instance,
+                                                           fake_network_info)
+        mock_prepare_instance_filter.assert_called_once_with(fake_instance,
+                                                             fake_network_info)
+        mock_apply_instance_filter.assert_called_once_with(fake_instance,
+                                                           fake_network_info)
 
-        def fake_create_kernel_and_ramdisk(context, session, instance,
-                                           name_label):
-            return "fake-kernel-file", "fake-ramdisk-file"
-
-        fake_fw.call_count = 0
-        _vmops = self.conn._vmops
-        self.stubs.Set(_vmops.firewall_driver,
-                       'setup_basic_filtering', fake_fw)
-        self.stubs.Set(_vmops.firewall_driver,
-                       'prepare_instance_filter', fake_fw)
-        self.stubs.Set(_vmops.firewall_driver,
-                       'apply_instance_filter', fake_fw)
-        self.stubs.Set(vm_utils, "create_kernel_and_ramdisk",
-                       fake_create_kernel_and_ramdisk)
-
-        def fake_get_vm_opaque_ref(instance):
-            fake_get_vm_opaque_ref.called = True
-        self.stubs.Set(_vmops, "_get_vm_opaque_ref", fake_get_vm_opaque_ref)
-        fake_get_vm_opaque_ref.called = False
-
-        def fake_strip_base_mirror_from_vdis(session, vm_ref):
-            fake_strip_base_mirror_from_vdis.called = True
-        self.stubs.Set(vm_utils, "strip_base_mirror_from_vdis",
-                       fake_strip_base_mirror_from_vdis)
-        fake_strip_base_mirror_from_vdis.called = False
-
-        self.conn.post_live_migration_at_destination(None, fake_instance,
-                                                     fake_network_info, None)
-        self.assertEqual(fake_fw.call_count, 3)
-        self.assertTrue(fake_get_vm_opaque_ref.called)
-        self.assertTrue(fake_strip_base_mirror_from_vdis.called)
-
-    def test_check_can_live_migrate_destination_with_block_migration(self):
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+    @mock.patch.object(vm_utils, 'host_in_this_pool')
+    def test_check_can_live_migrate_destination_with_block_migration(
+            self,
+            mock_same_pool):
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
-        self.stubs.Set(vm_utils, "safe_find_sr", lambda _x: "asdf")
+        fake_instance = objects.Instance(host="fake_host")
 
-        expected = {'block_migration': True,
-                    'migrate_data': {
-                        'migrate_send_data': "fake_migrate_data",
-                        'destination_sr_ref': 'asdf'
-                        }
-                    }
-        result = self.conn.check_can_live_migrate_destination(self.context,
-                              {'host': 'host'},
-                              {}, {},
-                              True, False)
-        self.assertEqual(expected, result)
+        self.stub_out('nova.virt.xenapi.vm_utils.safe_find_sr',
+                      lambda _x: 'asdf')
+        with mock.patch.object(self.conn._vmops._session, "host_ref") as \
+                fake_host_ref, mock.patch.object(
+                    self.conn._vmops, '_get_network_ref') as \
+                fake_get_network_ref, mock.patch.object(
+                    self.conn._vmops, '_get_host_opaque_ref'):
+            fake_host_ref.return_value = 'fake_host_ref'
+            fake_get_network_ref.return_value = 'fake_network_ref'
+            expected = {'block_migration': True,
+                        'is_volume_backed': False,
+                        'migrate_send_data': {'value': 'fake_migrate_data'},
+                        'destination_sr_ref': 'asdf',
+                        'vif_uuid_map': {'': 'fake_network_ref'}}
+            result = self.conn.check_can_live_migrate_destination(
+                self.context,
+                fake_instance,
+                {}, {},
+                True, False)
+            result.is_volume_backed = False
+            self.assertEqual(expected,
+                             result.obj_to_primitive()['nova_object.data'])
 
     def test_check_live_migrate_destination_verifies_ip(self):
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
+
+        fake_instance = objects.Instance(host="fake_host")
 
         for pif_ref in xenapi_fake.get_all('PIF'):
             pif_rec = xenapi_fake.get_record('PIF', pif_ref)
             pif_rec['IP'] = ''
             pif_rec['IPv6'] = ''
 
-        self.stubs.Set(vm_utils, "safe_find_sr", lambda _x: "asdf")
+        self.stub_out('nova.virt.xenapi.vm_utils.safe_find_sr',
+                      lambda _x: 'asdf')
 
         self.assertRaises(exception.MigrationError,
                           self.conn.check_can_live_migrate_destination,
-                          self.context, {'host': 'host'},
+                          self.context, fake_instance,
                           {}, {},
                           True, False)
 
     def test_check_can_live_migrate_destination_block_migration_fails(self):
-        stubs.stubout_session(self.stubs,
-                              stubs.FakeSessionForFailedMigrateTests)
+
+        fake_instance = objects.Instance(host="fake_host")
+
+        stubs.stubout_session(self, stubs.FakeSessionForFailedMigrateTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
         self.assertRaises(exception.MigrationError,
                           self.conn.check_can_live_migrate_destination,
-                          self.context, {'host': 'host'},
+                          self.context, fake_instance,
                           {}, {},
                           True, False)
 
     def _add_default_live_migrate_stubs(self, conn):
-        def fake_generate_vdi_map(destination_sr_ref, _vm_ref):
+        @classmethod
+        def fake_generate_vdi_map(cls, destination_sr_ref, _vm_ref):
             pass
 
-        def fake_get_iscsi_srs(destination_sr_ref, _vm_ref):
+        @classmethod
+        def fake_get_iscsi_srs(cls, destination_sr_ref, _vm_ref):
             return []
 
-        def fake_get_vm_opaque_ref(instance):
+        @classmethod
+        def fake_get_vm_opaque_ref(cls, instance):
             return "fake_vm"
 
         def fake_lookup_kernel_ramdisk(session, vm):
             return ("fake_PV_kernel", "fake_PV_ramdisk")
 
-        self.stubs.Set(conn._vmops, "_generate_vdi_map",
-                       fake_generate_vdi_map)
-        self.stubs.Set(conn._vmops, "_get_iscsi_srs",
-                       fake_get_iscsi_srs)
-        self.stubs.Set(conn._vmops, "_get_vm_opaque_ref",
-                       fake_get_vm_opaque_ref)
-        self.stubs.Set(vm_utils, "lookup_kernel_ramdisk",
-                       fake_lookup_kernel_ramdisk)
+        @classmethod
+        def fake_generate_vif_map(cls, vif_uuid_map):
+            return {'vif_ref1': 'dest_net_ref'}
+
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._generate_vdi_map',
+                      fake_generate_vdi_map)
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._get_iscsi_srs',
+                      fake_get_iscsi_srs)
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._get_vm_opaque_ref',
+                      fake_get_vm_opaque_ref)
+        self.stub_out('nova.virt.xenapi.vm_utils.lookup_kernel_ramdisk',
+                      fake_lookup_kernel_ramdisk)
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._generate_vif_network_map',
+                      fake_generate_vif_map)
 
     def test_check_can_live_migrate_source_with_block_migrate(self):
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
         self._add_default_live_migrate_stubs(self.conn)
 
-        dest_check_data = {'block_migration': True,
-                           'migrate_data': {
-                            'destination_sr_ref': None,
-                            'migrate_send_data': None
-                           }}
+        dest_check_data = objects.XenapiLiveMigrateData(
+            block_migration=True, is_volume_backed=False,
+            destination_sr_ref=None, migrate_send_data={'key': 'value'})
         result = self.conn.check_can_live_migrate_source(self.context,
                                                          {'host': 'host'},
                                                          dest_check_data)
         self.assertEqual(dest_check_data, result)
 
     def test_check_can_live_migrate_source_with_block_migrate_iscsi(self):
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
         self._add_default_live_migrate_stubs(self.conn)
-
-        def fake_get_iscsi_srs(destination_sr_ref, _vm_ref):
-            return ['sr_ref']
-        self.stubs.Set(self.conn._vmops, "_get_iscsi_srs",
-                       fake_get_iscsi_srs)
-
-        def fake_make_plugin_call(plugin, method, **args):
-            return "true"
-        self.stubs.Set(self.conn._vmops, "_make_plugin_call",
-                       fake_make_plugin_call)
-
-        dest_check_data = {'block_migration': True,
-                           'migrate_data': {
-                            'destination_sr_ref': None,
-                            'migrate_send_data': None
-                           }}
+        dest_check_data = objects.XenapiLiveMigrateData(
+            block_migration=True,
+            is_volume_backed=True,
+            destination_sr_ref=None,
+            migrate_send_data={'key': 'value'})
         result = self.conn.check_can_live_migrate_source(self.context,
                                                          {'host': 'host'},
                                                          dest_check_data)
         self.assertEqual(dest_check_data, result)
 
-    def test_check_can_live_migrate_source_with_block_iscsi_fails(self):
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+    @mock.patch.object(session.XenAPISession, 'is_xsm_sr_check_relaxed',
+                       return_value=False)
+    def test_check_can_live_migrate_source_with_block_iscsi_fails(
+            self, mock_is_xsm_sr_check_relaxed):
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
         self._add_default_live_migrate_stubs(self.conn)
 
-        def fake_get_iscsi_srs(destination_sr_ref, _vm_ref):
-            return ['sr_ref']
-        self.stubs.Set(self.conn._vmops, "_get_iscsi_srs",
-                       fake_get_iscsi_srs)
-
-        def fake_make_plugin_call(plugin, method, **args):
-            return {'returncode': 'error', 'message': 'Plugin not found'}
-        self.stubs.Set(self.conn._vmops, "_make_plugin_call",
-                       fake_make_plugin_call)
-
-        self.assertRaises(exception.MigrationError,
-                          self.conn.check_can_live_migrate_source,
-                          self.context, {'host': 'host'},
-                          {})
+        with mock.patch.object(vmops.VMOps, '_get_iscsi_srs',
+                               return_value=['sr_ref']):
+            self.assertRaises(exception.MigrationError,
+                              self.conn.check_can_live_migrate_source,
+                              self.context, {'host': 'host'},
+                              {})
+        mock_is_xsm_sr_check_relaxed.assert_called_once_with()
 
     def test_check_can_live_migrate_source_with_block_migrate_fails(self):
-        stubs.stubout_session(self.stubs,
-                              stubs.FakeSessionForFailedMigrateTests)
+        stubs.stubout_session(self, stubs.FakeSessionForFailedMigrateTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
         self._add_default_live_migrate_stubs(self.conn)
 
-        dest_check_data = {'block_migration': True,
-                           'migrate_data': {
-                            'destination_sr_ref': None,
-                            'migrate_send_data': None
-                           }}
+        dest_check_data = objects.XenapiLiveMigrateData(
+            block_migration=True, is_volume_backed=True,
+            migrate_send_data={'key': 'value'}, destination_sr_ref=None)
         self.assertRaises(exception.MigrationError,
                           self.conn.check_can_live_migrate_source,
                           self.context,
                           {'host': 'host'},
                           dest_check_data)
 
-    def test_check_can_live_migrate_works(self):
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+    @mock.patch.object(vm_utils, 'host_in_this_pool')
+    def test_check_can_live_migrate_works(self,
+                                          mock_host_in_this_pool):
+        # The dest host is in the same pool with the src host, do no block
+        # live migrate
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
+        mock_host_in_this_pool.side_effect = [True, True]
+        with mock.patch.object(self.conn._vmops, "_get_host_opaque_ref") as \
+                fake_get_host_opaque_ref, \
+                mock.patch.object(self.conn._vmops, '_get_network_ref') as \
+                fake_get_network_ref, \
+                mock.patch.object(self.conn._vmops._session, 'get_rec') as \
+                fake_get_rec:
+            fake_host_ref = 'fake_host_ref'
+            fake_get_host_opaque_ref.return_value = fake_host_ref
+            fake_network_ref = 'fake_network_ref'
+            fake_get_network_ref.return_value = fake_network_ref
+            fake_get_rec.return_value = {'shared': True}
+            fake_host_name = 'fake_host'
+            instance = objects.Instance(host=fake_host_name)
 
-        def fake_aggregate_get_by_host(context, host, key=None):
-            self.assertEqual(CONF.host, host)
-            return [dict(test_aggregate.fake_aggregate,
-                         metadetails={"host": "test_host_uuid"})]
+            # Set block_migration to None to enable pool check, then do pooled
+            # live migrate
+            dest_check_data = self.conn.check_can_live_migrate_destination(
+                self.context, instance, 'fake_src_compute_info',
+                'fake_dst_compute_info', None, None)
+            self.assertFalse(dest_check_data.block_migration)
+            self.assertEqual(dest_check_data.vif_uuid_map,
+                             {'': fake_network_ref})
+            fake_get_host_opaque_ref.assert_called_once_with(fake_host_name)
+            mock_host_in_this_pool.assert_called_once_with(
+                self.conn._vmops._session, fake_host_ref)
+            fake_get_network_ref.assert_called_once()
 
-        self.stubs.Set(db, "aggregate_get_by_host",
-                fake_aggregate_get_by_host)
-        self.conn.check_can_live_migrate_destination(self.context,
-                {'host': 'host'}, False, False)
-
-    def test_check_can_live_migrate_fails(self):
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+    @mock.patch.object(vm_utils, 'host_in_this_pool')
+    def test_check_can_live_migrate_fails(self, mock_host_in_this_pool):
+        # Caller asks for no block live migrate while the dest host is not in
+        # the same pool with the src host, raise exception
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
+        mock_host_in_this_pool.return_value = False
+        with mock.patch.object(self.conn._vmops, "_get_host_opaque_ref") as \
+                fake_get_host_opaque_ref, \
+                mock.patch.object(self.conn._vmops, '_get_network_ref') as \
+                fake_get_network_ref:
+            fake_host_ref = 'fake_host_ref'
+            fake_get_host_opaque_ref.return_value = fake_host_ref
+            fake_network_ref = 'fake_network_ref'
+            fake_get_network_ref.return_value = fake_network_ref
+            fake_host_name = 'fake_host'
+            instance = objects.Instance(host=fake_host_name)
 
-        def fake_aggregate_get_by_host(context, host, key=None):
-            self.assertEqual(CONF.host, host)
-            return [dict(test_aggregate.fake_aggregate,
-                         metadetails={"dest_other": "test_host_uuid"})]
+            # Set block_migration to False to do pooled live migrate
+            self.assertRaises(exception.MigrationPreCheckError,
+                              self.conn.check_can_live_migrate_destination,
+                              self.context, instance, 'fake_src_compute_info',
+                              'fake_dst_compute_info', False, None)
 
-        self.stubs.Set(db, "aggregate_get_by_host",
-                      fake_aggregate_get_by_host)
-        self.assertRaises(exception.MigrationError,
-                          self.conn.check_can_live_migrate_destination,
-                          self.context, {'host': 'host'}, None, None)
+            fake_get_host_opaque_ref.assert_called_once_with(fake_host_name)
+            mock_host_in_this_pool.assert_called_once_with(
+                self.conn._vmops._session, fake_host_ref)
+            fake_get_network_ref.assert_not_called()
 
-    def test_live_migration(self):
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+    @mock.patch.object(vmops.VMOps, '_get_host_opaque_ref',
+                       return_value='fake_host')
+    @mock.patch.object(vmops.VMOps, '_get_vm_opaque_ref',
+                       return_value='fake_vm')
+    @mock.patch.object(vm_utils, 'lookup_kernel_ramdisk',
+                       return_value=('kernel', 'ramdisk'))
+    def test_live_migration(self, mock_lookup_kernel_ramdisk,
+                            mock_get_vm_opaque_ref, mock_get_host_opaque_ref):
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
-
-        def fake_get_vm_opaque_ref(instance):
-            return "fake_vm"
-        self.stubs.Set(self.conn._vmops, "_get_vm_opaque_ref",
-                       fake_get_vm_opaque_ref)
-
-        def fake_get_host_opaque_ref(context, destination_hostname):
-            return "fake_host"
-        self.stubs.Set(self.conn._vmops, "_get_host_opaque_ref",
-                       fake_get_host_opaque_ref)
 
         def post_method(context, instance, destination_hostname,
                         block_migration, migrate_data):
             post_method.called = True
+        migrate_data = objects.XenapiLiveMigrateData(
+            destination_sr_ref="foo",
+            migrate_send_data={"bar": "baz"},
+            block_migration=False)
 
-        self.conn.live_migration(self.conn, None, None, post_method, None)
+        fake_instance = mock.Mock()
+        self.conn.live_migration(self.context, fake_instance, 'fake-dest',
+                                 post_method, None, None, migrate_data)
 
-        self.assertTrue(post_method.called, "post_method.called")
+        self.assertTrue(post_method.called, "post_method was not called")
+        mock_lookup_kernel_ramdisk.assert_called_once_with(
+            self.conn._session, 'fake_vm')
+        mock_get_vm_opaque_ref.assert_called_once_with(fake_instance)
+        mock_get_host_opaque_ref.assert_called_once_with('fake-dest')
 
-    def test_live_migration_on_failure(self):
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+    @mock.patch.object(vmops.VMOps, '_get_vm_opaque_ref',
+                       return_value='fake_vm')
+    def test_live_migration_on_failure(self, mock_get_vm_opaque_ref):
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
-        def fake_get_vm_opaque_ref(instance):
-            return "fake_vm"
-        self.stubs.Set(self.conn._vmops, "_get_vm_opaque_ref",
-                       fake_get_vm_opaque_ref)
-
-        def fake_get_host_opaque_ref(context, destination_hostname):
-            return "fake_host"
-        self.stubs.Set(self.conn._vmops, "_get_host_opaque_ref",
-                       fake_get_host_opaque_ref)
-
-        def fake_call_xenapi(*args):
-            raise NotImplementedError()
-        self.stubs.Set(self.conn._vmops._session, "call_xenapi",
-                       fake_call_xenapi)
-
         def recover_method(context, instance, destination_hostname,
-                        block_migration):
+                           migrate_data=None):
+            self.assertIsNotNone(migrate_data, 'migrate_data should be passed')
             recover_method.called = True
+        migrate_data = objects.XenapiLiveMigrateData(
+            destination_sr_ref="foo",
+            migrate_send_data={"bar": "baz"},
+            block_migration=False)
+        fake_instance = mock.Mock()
 
-        self.assertRaises(NotImplementedError, self.conn.live_migration,
-                          self.conn, None, None, None, recover_method)
-        self.assertTrue(recover_method.called, "recover_method.called")
+        with mock.patch.object(session.XenAPISession, 'call_xenapi',
+                               side_effect=NotImplementedError()):
+            self.assertRaises(NotImplementedError, self.conn.live_migration,
+                              self.context, fake_instance, 'fake-dest', None,
+                              recover_method, None, migrate_data)
+            self.assertTrue(recover_method.called,
+                            "recover_method was not called")
+        mock_get_vm_opaque_ref.assert_called_once_with(fake_instance)
 
     def test_live_migration_calls_post_migration(self):
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
         self._add_default_live_migrate_stubs(self.conn)
@@ -3662,67 +3855,53 @@ class XenAPILiveMigrateTestCase(stubs.XenAPITestBaseNoDB):
             post_method.called = True
 
         # pass block_migration = True and migrate data
-        migrate_data = {"destination_sr_ref": "foo",
-                        "migrate_send_data": "bar"}
+        migrate_data = objects.XenapiLiveMigrateData(
+            destination_sr_ref="foo",
+            migrate_send_data={"bar": "baz"},
+            block_migration=True)
         self.conn.live_migration(self.conn, None, None, post_method, None,
                                  True, migrate_data)
         self.assertTrue(post_method.called, "post_method.called")
 
-    def test_live_migration_block_cleans_srs(self):
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+    @mock.patch.object(volume_utils, 'forget_sr')
+    def test_live_migration_block_cleans_srs(self, mock_forget_sr):
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
         self._add_default_live_migrate_stubs(self.conn)
-
-        def fake_get_iscsi_srs(context, instance):
-            return ['sr_ref']
-        self.stubs.Set(self.conn._vmops, "_get_iscsi_srs",
-                       fake_get_iscsi_srs)
-
-        def fake_forget_sr(context, instance):
-            fake_forget_sr.called = True
-        self.stubs.Set(volume_utils, "forget_sr",
-                       fake_forget_sr)
 
         def post_method(context, instance, destination_hostname,
                         block_migration, migrate_data):
             post_method.called = True
 
-        migrate_data = {"destination_sr_ref": "foo",
-                        "migrate_send_data": "bar"}
-        self.conn.live_migration(self.conn, None, None, post_method, None,
-                                 True, migrate_data)
+        migrate_data = objects.XenapiLiveMigrateData(
+            destination_sr_ref="foo",
+            migrate_send_data={"bar": "baz"},
+            block_migration=True)
 
-        self.assertTrue(post_method.called, "post_method.called")
-        self.assertTrue(fake_forget_sr.called, "forget_sr.called")
+        with mock.patch.object(vmops.VMOps, '_get_iscsi_srs',
+                               return_value=['sr_ref']):
+            self.conn.live_migration(self.conn, None, None, post_method, None,
+                                     True, migrate_data)
 
-    def test_live_migration_with_block_migration_raises_invalid_param(self):
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
-        self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
-
-        self._add_default_live_migrate_stubs(self.conn)
-
-        def recover_method(context, instance, destination_hostname,
-                           block_migration):
-            recover_method.called = True
-        # pass block_migration = True and no migrate data
-        self.assertRaises(exception.InvalidParameterValue,
-                          self.conn.live_migration, self.conn,
-                          None, None, None, recover_method, True, None)
-        self.assertTrue(recover_method.called, "recover_method.called")
+            self.assertTrue(post_method.called, "post_method was not called")
+            self.assertTrue(mock_forget_sr.called, "forget_sr was not called")
 
     def test_live_migration_with_block_migration_fails_migrate_send(self):
-        stubs.stubout_session(self.stubs,
-                              stubs.FakeSessionForFailedMigrateTests)
+        stubs.stubout_session(self, stubs.FakeSessionForFailedMigrateTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
         self._add_default_live_migrate_stubs(self.conn)
 
         def recover_method(context, instance, destination_hostname,
-                           block_migration):
+                           migrate_data=None):
+            self.assertIsNotNone(migrate_data, 'migrate_data should be passed')
             recover_method.called = True
         # pass block_migration = True and migrate data
-        migrate_data = dict(destination_sr_ref='foo', migrate_send_data='bar')
+        migrate_data = objects.XenapiLiveMigrateData(
+            destination_sr_ref='foo',
+            migrate_send_data={'bar': 'baz'},
+            block_migration=True)
         self.assertRaises(exception.MigrationError,
                           self.conn.live_migration, self.conn,
                           None, None, None, recover_method, True, migrate_data)
@@ -3735,32 +3914,38 @@ class XenAPILiveMigrateTestCase(stubs.XenAPITestBaseNoDB):
         class Session(xenapi_fake.SessionBase):
             def VM_migrate_send(self_, session, vmref, migrate_data, islive,
                                 vdi_map, vif_map, options):
-                self.assertEqual('SOMEDATA', migrate_data)
+                self.assertEqual({'SOMEDATA': 'SOMEVAL'}, migrate_data)
                 self.assertEqual(fake_vdi_map, vdi_map)
 
-        stubs.stubout_session(self.stubs, Session)
+        stubs.stubout_session(self, Session)
 
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
         self._add_default_live_migrate_stubs(conn)
 
-        def fake_generate_vdi_map(destination_sr_ref, _vm_ref):
+        def fake_generate_vdi_map(self, destination_sr_ref, _vm_ref):
             return fake_vdi_map
 
-        self.stubs.Set(conn._vmops, "_generate_vdi_map",
-                       fake_generate_vdi_map)
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._generate_vdi_map',
+                      fake_generate_vdi_map)
 
         def dummy_callback(*args, **kwargs):
             pass
 
+        migrate_data = objects.XenapiLiveMigrateData(
+            migrate_send_data={'SOMEDATA': 'SOMEVAL'},
+            destination_sr_ref='TARGET_SR_OPAQUE_REF',
+            block_migration=True)
         conn.live_migration(
             self.context, instance=dict(name='ignore'), dest=None,
             post_method=dummy_callback, recover_method=dummy_callback,
             block_migration="SOMEDATA",
-            migrate_data=dict(migrate_send_data='SOMEDATA',
-                              destination_sr_ref="TARGET_SR_OPAQUE_REF"))
+            migrate_data=migrate_data)
 
-    def test_live_migrate_pool_migration_xapi_call_parameters(self):
+    @mock.patch.object(vmops.VMOps, '_get_host_opaque_ref',
+                       return_value='fake_ref')
+    def test_live_migrate_pool_migration_xapi_call_parameters(
+            self, mock_get_host_opaque_ref):
 
         class Session(xenapi_fake.SessionBase):
             def VM_pool_migrate(self_, session, vm_ref, host_ref, options):
@@ -3768,68 +3953,64 @@ class XenAPILiveMigrateTestCase(stubs.XenAPITestBaseNoDB):
                 self.assertEqual({"live": "true"}, options)
                 raise IOError()
 
-        stubs.stubout_session(self.stubs, Session)
+        stubs.stubout_session(self, Session)
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
         self._add_default_live_migrate_stubs(conn)
-
-        def fake_get_host_opaque_ref(context, destination):
-            return "fake_ref"
-
-        self.stubs.Set(conn._vmops, "_get_host_opaque_ref",
-                       fake_get_host_opaque_ref)
 
         def dummy_callback(*args, **kwargs):
             pass
 
+        migrate_data = objects.XenapiLiveMigrateData(
+            migrate_send_data={'foo': 'bar'},
+            destination_sr_ref='foo',
+            block_migration=False)
         self.assertRaises(IOError, conn.live_migration,
-            self.context, instance=dict(name='ignore'), dest=None,
+            self.context, instance=dict(name='ignore'), dest='fake-dest',
             post_method=dummy_callback, recover_method=dummy_callback,
-            block_migration=False, migrate_data={})
+            block_migration=False, migrate_data=migrate_data)
+        mock_get_host_opaque_ref.assert_called_once_with('fake-dest')
 
-    def test_generate_vdi_map(self):
-        stubs.stubout_session(self.stubs, xenapi_fake.SessionBase)
+    @mock.patch.object(vm_utils, 'get_instance_vdis_for_sr')
+    @mock.patch.object(vm_utils, 'safe_find_sr')
+    def test_generate_vdi_map(self, mock_safe_find_sr,
+                              mock_get_instance_vdis_for_sr):
+        stubs.stubout_session(self, xenapi_fake.SessionBase)
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
         vm_ref = "fake_vm_ref"
+        mock_safe_find_sr.return_value = 'source_sr_ref'
 
-        def fake_find_sr(_session):
-            self.assertEqual(conn._session, _session)
-            return "source_sr_ref"
-        self.stubs.Set(vm_utils, "safe_find_sr", fake_find_sr)
-
-        def fake_get_instance_vdis_for_sr(_session, _vm_ref, _sr_ref):
-            self.assertEqual(conn._session, _session)
-            self.assertEqual(vm_ref, _vm_ref)
-            self.assertEqual("source_sr_ref", _sr_ref)
-            return ["vdi0", "vdi1"]
-
-        self.stubs.Set(vm_utils, "get_instance_vdis_for_sr",
-                       fake_get_instance_vdis_for_sr)
+        mock_get_instance_vdis_for_sr.return_value = ['vdi0', 'vdi1']
 
         result = conn._vmops._generate_vdi_map("dest_sr_ref", vm_ref)
 
         self.assertEqual({"vdi0": "dest_sr_ref",
                           "vdi1": "dest_sr_ref"}, result)
+        mock_safe_find_sr.assert_called_once_with(conn._session)
+        mock_get_instance_vdis_for_sr.assert_called_once_with(
+            conn._session, vm_ref, 'source_sr_ref')
 
-    def test_rollback_live_migration_at_destination(self):
-        stubs.stubout_session(self.stubs, xenapi_fake.SessionBase)
+    @mock.patch.object(vmops.VMOps, "_delete_networks_and_bridges")
+    def test_rollback_live_migration_at_destination(self, mock_delete_network):
+        stubs.stubout_session(self, xenapi_fake.SessionBase)
         conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
-
+        network_info = ["fake_vif1"]
         with mock.patch.object(conn, "destroy") as mock_destroy:
             conn.rollback_live_migration_at_destination("context",
-                    "instance", [], None)
+                    "instance", network_info, {'block_device_mapping': []})
             self.assertFalse(mock_destroy.called)
+            self.assertTrue(mock_delete_network.called)
 
 
 class XenAPIInjectMetadataTestCase(stubs.XenAPITestBaseNoDB):
     def setUp(self):
         super(XenAPIInjectMetadataTestCase, self).setUp()
-        self.flags(connection_url='test_url',
+        self.flags(connection_url='http://localhost',
                    connection_password='test_pass',
                    group='xenserver')
         self.flags(firewall_driver='nova.virt.xenapi.firewall.'
                                    'Dom0IptablesFirewallDriver')
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
         self.conn = xenapi_conn.XenAPIDriver(fake.FakeVirtAPI(), False)
 
         self.xenstore = dict(persist={}, ephem={})
@@ -3863,16 +4044,17 @@ class XenAPIInjectMetadataTestCase(stubs.XenAPITestBaseNoDB):
             if path in self.xenstore['ephem']:
                 del self.xenstore['ephem'][path]
 
-        self.stubs.Set(vmops.VMOps, '_get_vm_opaque_ref',
-                       fake_get_vm_opaque_ref)
-        self.stubs.Set(vmops.VMOps, '_add_to_param_xenstore',
-                       fake_add_to_param_xenstore)
-        self.stubs.Set(vmops.VMOps, '_remove_from_param_xenstore',
-                       fake_remove_from_param_xenstore)
-        self.stubs.Set(vmops.VMOps, '_write_to_xenstore',
-                       fake_write_to_xenstore)
-        self.stubs.Set(vmops.VMOps, '_delete_from_xenstore',
-                       fake_delete_from_xenstore)
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._get_vm_opaque_ref',
+                      fake_get_vm_opaque_ref)
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._add_to_param_xenstore',
+                      fake_add_to_param_xenstore)
+        self.stub_out('nova.virt.xenapi.vmops.VMOps.'
+                      '_remove_from_param_xenstore',
+                      fake_remove_from_param_xenstore)
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._write_to_xenstore',
+                      fake_write_to_xenstore)
+        self.stub_out('nova.virt.xenapi.vmops.VMOps._delete_from_xenstore',
+                      fake_delete_from_xenstore)
 
     def test_inject_instance_metadata(self):
 
@@ -4000,140 +4182,6 @@ class XenAPIInjectMetadataTestCase(stubs.XenAPITestBaseNoDB):
         instance = {'uuid': 'not_found'}
         self.conn._vmops.change_instance_metadata(instance, "fake_diff")
         self.assertTrue(self.called_fake_get_vm_opaque_ref)
-
-
-class XenAPISessionTestCase(test.NoDBTestCase):
-    def _get_mock_xapisession(self, software_version):
-        class MockXapiSession(xenapi_session.XenAPISession):
-            def __init__(_ignore):
-                "Skip the superclass's dirty init"
-
-            def _get_software_version(_ignore):
-                return software_version
-
-        return MockXapiSession()
-
-    def test_local_session(self):
-        session = self._get_mock_xapisession({})
-        session.is_local_connection = True
-        session.XenAPI = self.mox.CreateMockAnything()
-        session.XenAPI.xapi_local().AndReturn("local_connection")
-
-        self.mox.ReplayAll()
-        self.assertEqual("local_connection",
-                         session._create_session("unix://local"))
-
-    def test_remote_session(self):
-        session = self._get_mock_xapisession({})
-        session.is_local_connection = False
-        session.XenAPI = self.mox.CreateMockAnything()
-        session.XenAPI.Session("url").AndReturn("remote_connection")
-
-        self.mox.ReplayAll()
-        self.assertEqual("remote_connection", session._create_session("url"))
-
-    def test_get_product_version_product_brand_does_not_fail(self):
-        session = self._get_mock_xapisession({
-                    'build_number': '0',
-                    'date': '2012-08-03',
-                    'hostname': 'komainu',
-                    'linux': '3.2.0-27-generic',
-                    'network_backend': 'bridge',
-                    'platform_name': 'XCP_Kronos',
-                    'platform_version': '1.6.0',
-                    'xapi': '1.3',
-                    'xen': '4.1.2',
-                    'xencenter_max': '1.10',
-                    'xencenter_min': '1.10'
-                })
-
-        self.assertEqual(
-            ((1, 6, 0), None),
-            session._get_product_version_and_brand()
-        )
-
-    def test_get_product_version_product_brand_xs_6(self):
-        session = self._get_mock_xapisession({
-                    'product_brand': 'XenServer',
-                    'product_version': '6.0.50',
-                    'platform_version': '0.0.1'
-                })
-
-        self.assertEqual(
-            ((6, 0, 50), 'XenServer'),
-            session._get_product_version_and_brand()
-        )
-
-    def test_verify_plugin_version_same(self):
-        session = self._get_mock_xapisession({})
-
-        session.PLUGIN_REQUIRED_VERSION = '2.4'
-
-        self.mox.StubOutWithMock(session, 'call_plugin_serialized')
-        session.call_plugin_serialized('nova_plugin_version', 'get_version',
-                            ).AndReturn("2.4")
-
-        self.mox.ReplayAll()
-        session._verify_plugin_version()
-
-    def test_verify_plugin_version_compatible(self):
-        session = self._get_mock_xapisession({})
-        session.XenAPI = xenapi_fake.FakeXenAPI()
-
-        session.PLUGIN_REQUIRED_VERSION = '2.4'
-
-        self.mox.StubOutWithMock(session, 'call_plugin_serialized')
-        session.call_plugin_serialized('nova_plugin_version', 'get_version',
-                            ).AndReturn("2.5")
-
-        self.mox.ReplayAll()
-        session._verify_plugin_version()
-
-    def test_verify_plugin_version_bad_maj(self):
-        session = self._get_mock_xapisession({})
-        session.XenAPI = xenapi_fake.FakeXenAPI()
-
-        session.PLUGIN_REQUIRED_VERSION = '2.4'
-
-        self.mox.StubOutWithMock(session, 'call_plugin_serialized')
-        session.call_plugin_serialized('nova_plugin_version', 'get_version',
-                            ).AndReturn("3.0")
-
-        self.mox.ReplayAll()
-        self.assertRaises(xenapi_fake.Failure, session._verify_plugin_version)
-
-    def test_verify_plugin_version_bad_min(self):
-        session = self._get_mock_xapisession({})
-        session.XenAPI = xenapi_fake.FakeXenAPI()
-
-        session.PLUGIN_REQUIRED_VERSION = '2.4'
-
-        self.mox.StubOutWithMock(session, 'call_plugin_serialized')
-        session.call_plugin_serialized('nova_plugin_version', 'get_version',
-                            ).AndReturn("2.3")
-
-        self.mox.ReplayAll()
-        self.assertRaises(xenapi_fake.Failure, session._verify_plugin_version)
-
-    def test_verify_current_version_matches(self):
-        session = self._get_mock_xapisession({})
-
-        # Import the plugin to extract its version
-        path = os.path.dirname(__file__)
-        rel_path_elem = "../../../../../plugins/xenserver/xenapi/etc/xapi.d/" \
-            "plugins/nova_plugin_version"
-        for elem in rel_path_elem.split('/'):
-            path = os.path.join(path, elem)
-        path = os.path.realpath(path)
-
-        plugin_version = None
-        with open(path) as plugin_file:
-            for line in plugin_file:
-                if "PLUGIN_VERSION = " in line:
-                    plugin_version = line.strip()[17:].strip('"')
-
-        self.assertEqual(session.PLUGIN_REQUIRED_VERSION,
-                         plugin_version)
 
 
 class XenAPIFakeTestCase(test.NoDBTestCase):

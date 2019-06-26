@@ -20,6 +20,4 @@
    :platform: Unix
 """
 
-import eventlet
-
-eventlet.monkey_patch(os=False)
+import nova.monkey_patch  # noqa

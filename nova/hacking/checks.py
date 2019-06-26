@@ -14,9 +14,10 @@
 # under the License.
 
 import ast
+import os
 import re
 
-import pep8
+import six
 
 """
 Guidelines for writing new hacking checks
@@ -36,14 +37,15 @@ UNDERSCORE_IMPORT_FILES = []
 
 session_check = re.compile(r"\w*def [a-zA-Z0-9].*[(].*session.*[)]")
 cfg_re = re.compile(r".*\scfg\.")
-vi_header_re = re.compile(r"^#\s+vim?:.+")
+# Excludes oslo.config OptGroup objects
+cfg_opt_re = re.compile(r".*[\s\[]cfg\.[a-zA-Z]*Opt\(")
+rule_default_re = re.compile(r".*RuleDefault\(")
+policy_enforce_re = re.compile(r".*_ENFORCER\.enforce\(")
 virt_file_re = re.compile(r"\./nova/(?:tests/)?virt/(\w+)/")
 virt_import_re = re.compile(
     r"^\s*(?:import|from) nova\.(?:tests\.)?virt\.(\w+)")
 virt_config_re = re.compile(
     r"CONF\.import_opt\('.*?', 'nova\.virt\.(\w+)('|.)")
-author_tag_re = (re.compile("^\s*#\s*@?(a|A)uthor:"),
-                 re.compile("^\.\.\s+moduleauthor::"))
 asse_trueinst_re = re.compile(
                      r"(.)*assertTrue\(isinstance\((\w|\.|\'|\"|\[|\])+, "
                      "(\w|\.|\'|\"|\[|\])+\)\)")
@@ -54,10 +56,6 @@ asse_equal_in_end_with_true_or_false_re = re.compile(r"assertEqual\("
                     r"(\w|[][.'\"])+ in (\w|[][.'\", ])+, (True|False)\)")
 asse_equal_in_start_with_true_or_false_re = re.compile(r"assertEqual\("
                     r"(True|False), (\w|[][.'\"])+ in (\w|[][.'\", ])+\)")
-asse_equal_end_with_none_re = re.compile(
-                           r"assertEqual\(.*?,\s+None\)$")
-asse_equal_start_with_none_re = re.compile(
-                           r"assertEqual\(None,")
 # NOTE(snikitin): Next two regexes weren't united to one for more readability.
 #                 asse_true_false_with_in_or_not_in regex checks
 #                 assertTrue/False(A in B) cases where B argument has no spaces
@@ -76,14 +74,6 @@ asse_true_false_with_in_or_not_in_spaces = re.compile(r"assert(True|False)"
                     r"[\[|'|\"](, .*)?\)")
 asse_raises_regexp = re.compile(r"assertRaisesRegexp\(")
 conf_attribute_set_re = re.compile(r"CONF\.[a-z0-9_.]+\s*=\s*\w")
-log_translation = re.compile(
-    r"(.)*LOG\.(audit|error|critical)\(\s*('|\")")
-log_translation_info = re.compile(
-    r"(.)*LOG\.(info)\(\s*(_\(|'|\")")
-log_translation_exception = re.compile(
-    r"(.)*LOG\.(exception)\(\s*(_\(|'|\")")
-log_translation_LW = re.compile(
-    r"(.)*LOG\.(warning|warn)\(\s*(_\(|'|\")")
 translated_log = re.compile(
     r"(.)*LOG\.(audit|error|info|critical|exception)"
     "\(\s*_\(\s*('|\")")
@@ -94,24 +84,36 @@ import_translation_for_log_or_exception = re.compile(
     r"(.)*(from\snova.i18n\simport)\s_")
 # We need this for cases where they have created their own _ function.
 custom_underscore_check = re.compile(r"(.)*_\s*=\s*(.)*")
-api_version_re = re.compile(r"@.*api_version")
+api_version_re = re.compile(r"@.*\bapi_version\b")
 dict_constructor_with_list_copy_re = re.compile(r".*\bdict\((\[)?(\(|\[)")
 decorator_re = re.compile(r"@.*")
-
-# TODO(dims): When other oslo libraries switch over non-namespace'd
-# imports, we need to add them to the regexp below.
-oslo_namespace_imports = re.compile(r"from[\s]*oslo[.]"
-                                    r"(concurrency|config|context|db|i18n|"
-                                    r"log|messaging|middleware|rootwrap|"
-                                    r"serialization|utils|vmware)")
-oslo_namespace_imports_2 = re.compile(r"from[\s]*oslo[\s]*import[\s]*"
-                                    r"(concurrency|config|context|db|i18n|"
-                                    r"log|messaging|middleware|rootwrap|"
-                                    r"serialization|utils|vmware)")
-oslo_namespace_imports_3 = re.compile(r"import[\s]*oslo\."
-                                    r"(concurrency|config|context|db|i18n|"
-                                    r"log|messaging|middleware|rootwrap|"
-                                    r"serialization|utils|vmware)")
+http_not_implemented_re = re.compile(r"raise .*HTTPNotImplemented\(")
+spawn_re = re.compile(
+    r".*(eventlet|greenthread)\.(?P<spawn_part>spawn(_n)?)\(.*\)")
+contextlib_nested = re.compile(r"^with (contextlib\.)?nested\(")
+doubled_words_re = re.compile(
+    r"\b(then?|[iao]n|i[fst]|but|f?or|at|and|[dt]o)\s+\1\b")
+log_remove_context = re.compile(
+    r"(.)*LOG\.(.*)\(.*(context=[_a-zA-Z0-9].*)+.*\)")
+return_not_followed_by_space = re.compile(r"^\s*return(?:\(|{|\"|'|#).*$")
+uuid4_re = re.compile(r"uuid4\(\)($|[^\.]|\.hex)")
+redundant_import_alias_re = re.compile(r"import (?:.*\.)?(.+) as \1$")
+yield_not_followed_by_space = re.compile(r"^\s*yield(?:\(|{|\[|\"|').*$")
+asse_regexpmatches = re.compile(
+    r"(assertRegexpMatches|assertNotRegexpMatches)\(")
+privsep_file_re = re.compile('^nova/privsep[./]')
+privsep_import_re = re.compile(
+    r"^(?:import|from).*\bprivsep\b")
+# Redundant parenthetical masquerading as a tuple, used with ``in``:
+# Space, "in", space, open paren
+# Optional single or double quote (so we match strings or symbols)
+# A sequence of the characters that can make up a symbol. (This is weak: a
+#   string can contain other characters; and a numeric symbol can start with a
+#   minus, and a method call has a param list, and... Not sure this gets better
+#   without a lexer.)
+# The same closing quote
+# Close paren
+disguised_as_tuple_re = re.compile(r''' in \((['"]?)[a-zA-Z0-9_.]+\1\)''')
 
 
 class BaseASTChecker(ast.NodeVisitor):
@@ -129,7 +131,7 @@ class BaseASTChecker(ast.NodeVisitor):
     """
 
     def __init__(self, tree, filename):
-        """This object is created automatically by pep8.
+        """This object is created automatically by pycodestyle.
 
         :param tree: an AST tree
         :param filename: name of the file being analyzed
@@ -139,12 +141,12 @@ class BaseASTChecker(ast.NodeVisitor):
         self._errors = []
 
     def run(self):
-        """Called automatically by pep8."""
+        """Called automatically by pycodestyle."""
         self.visit(self._tree)
         return self._errors
 
     def add_error(self, node, message=None):
-        """Add an error caused by a node to the list of errors for pep8."""
+        """Add an error caused by a node to the list of errors."""
         message = message or self.CHECK_DESC
         error = (node.lineno, node.col_offset, message, self.__class__)
         self._errors.append(error)
@@ -166,8 +168,8 @@ def import_no_db_in_virt(logical_line, filename):
     N307
     """
     if "nova/virt" in filename and not filename.endswith("fake.py"):
-        if logical_line.startswith("from nova import db"):
-            yield (0, "N307: nova.db import not allowed in nova/virt/*")
+        if logical_line.startswith("from nova.db import api"):
+            yield (0, "N307: nova.db.api import not allowed in nova/virt/*")
 
 
 def no_db_session_in_public_api(logical_line, filename):
@@ -197,7 +199,8 @@ def _get_virt_name(regex, data):
     driver = m.group(1)
     # Ignore things we mis-detect as virt drivers in the regex
     if driver in ["test_virt_drivers", "driver", "firewall",
-                  "disk", "api", "imagecache", "cpu", "hardware"]:
+                  "disk", "api", "imagecache", "cpu", "hardware",
+                  "image"]:
         return None
     return driver
 
@@ -247,21 +250,7 @@ def capital_cfg_help(logical_line, tokens):
             if tokens[t][1] == "help":
                 txt = tokens[t + 2][1]
                 if len(txt) > 1 and txt[1].islower():
-                    yield(0, msg)
-
-
-def no_vi_headers(physical_line, line_number, lines):
-    """Check for vi editor configuration in source files.
-
-    By default vi modelines can only appear in the first or
-    last 5 lines of a source file.
-
-    N314
-    """
-    # NOTE(gilliard): line_number is 1-indexed
-    if line_number <= 5 or line_number > len(lines) - 5:
-        if vi_header_re.match(physical_line):
-            return 0, "N314: Don't put vi configuration in source files"
+                    yield (0, msg)
 
 
 def assert_true_instance(logical_line):
@@ -282,16 +271,10 @@ def assert_equal_type(logical_line):
         yield (0, "N317: assertEqual(type(A), B) sentences not allowed")
 
 
-def assert_equal_none(logical_line):
-    """Check for assertEqual(A, None) or assertEqual(None, A) sentences
-
-    N318
-    """
-    res = (asse_equal_start_with_none_re.search(logical_line) or
-           asse_equal_end_with_none_re.search(logical_line))
-    if res:
-        yield (0, "N318: assertEqual(A, None) or assertEqual(None, A) "
-               "sentences not allowed")
+def check_python3_xrange(logical_line):
+    if re.search(r"\bxrange\s*\(", logical_line):
+        yield (0, "N327: Do not use xrange(). 'xrange()' is not compatible "
+                  "with Python 3. Use range() or six.moves.range() instead.")
 
 
 def no_translate_debug_logs(logical_line, filename):
@@ -308,7 +291,7 @@ def no_translate_debug_logs(logical_line, filename):
     N319
     """
     if logical_line.startswith("LOG.debug(_("):
-        yield(0, "N319 Don't translate debug level logs")
+        yield (0, "N319 Don't translate debug level logs")
 
 
 def no_import_translation_in_tests(logical_line, filename):
@@ -318,7 +301,7 @@ def no_import_translation_in_tests(logical_line, filename):
     if 'nova/tests/' in filename:
         res = import_translation_for_log_or_exception.match(logical_line)
         if res:
-            yield(0, "N337 Don't import translation in tests")
+            yield (0, "N337 Don't import translation in tests")
 
 
 def no_setting_conf_directly_in_tests(logical_line, filename):
@@ -335,28 +318,6 @@ def no_setting_conf_directly_in_tests(logical_line, filename):
         if res:
             yield (0, "N320: Setting CONF.* attributes directly in tests is "
                       "forbidden. Use self.flags(option=value) instead")
-
-
-def validate_log_translations(logical_line, physical_line, filename):
-    # Translations are not required in the test directory
-    # and the Xen utilities
-    if ("nova/tests" in filename or
-                "plugins/xenserver/xenapi/etc/xapi.d" in filename):
-        return
-    if pep8.noqa(physical_line):
-        return
-    msg = "N328: LOG.info messages require translations `_LI()`!"
-    if log_translation_info.match(logical_line):
-        yield (0, msg)
-    msg = "N329: LOG.exception messages require translations `_LE()`!"
-    if log_translation_exception.match(logical_line):
-        yield (0, msg)
-    msg = "N330: LOG.warning, LOG.warn messages require translations `_LW()`!"
-    if log_translation_LW.match(logical_line):
-        yield (0, msg)
-    msg = "N321: Log messages require translations!"
-    if log_translation.match(logical_line):
-        yield (0, msg)
 
 
 def no_mutable_default_args(logical_line):
@@ -383,7 +344,7 @@ def check_explicit_underscore_import(logical_line, filename):
         UNDERSCORE_IMPORT_FILES.append(filename)
     elif (translated_log.match(logical_line) or
          string_translation.match(logical_line)):
-        yield(0, "N323: Found use of _() without explicit import of _ !")
+        yield (0, "N323: Found use of _() without explicit import of _ !")
 
 
 def use_jsonutils(logical_line, filename):
@@ -413,7 +374,7 @@ def check_api_version_decorator(logical_line, previous_logical, blank_before,
            " on a method.")
     if blank_before == 0 and re.match(api_version_re, logical_line) \
            and re.match(decorator_re, previous_logical):
-        yield(0, msg)
+        yield (0, msg)
 
 
 class CheckForStrUnicodeExc(BaseASTChecker):
@@ -434,14 +395,26 @@ class CheckForStrUnicodeExc(BaseASTChecker):
         self.name = []
         self.already_checked = []
 
-    def visit_TryExcept(self, node):
-        for handler in node.handlers:
-            if handler.name:
-                self.name.append(handler.name.id)
-                super(CheckForStrUnicodeExc, self).generic_visit(node)
-                self.name = self.name[:-1]
-            else:
-                super(CheckForStrUnicodeExc, self).generic_visit(node)
+    # Python 2 produces ast.TryExcept and ast.TryFinally nodes, but Python 3
+    # only produces ast.Try nodes.
+    if six.PY2:
+        def visit_TryExcept(self, node):
+            for handler in node.handlers:
+                if handler.name:
+                    self.name.append(handler.name.id)
+                    super(CheckForStrUnicodeExc, self).generic_visit(node)
+                    self.name = self.name[:-1]
+                else:
+                    super(CheckForStrUnicodeExc, self).generic_visit(node)
+    else:
+        def visit_Try(self, node):
+            for handler in node.handlers:
+                if handler.name:
+                    self.name.append(handler.name)
+                    super(CheckForStrUnicodeExc, self).generic_visit(node)
+                    self.name = self.name[:-1]
+                else:
+                    super(CheckForStrUnicodeExc, self).generic_visit(node)
 
     def visit_Call(self, node):
         if self._check_call_names(node, ['str', 'unicode']):
@@ -475,22 +448,75 @@ class CheckForTransAdd(BaseASTChecker):
         super(CheckForTransAdd, self).generic_visit(node)
 
 
-def check_oslo_namespace_imports(logical_line, blank_before, filename):
-    if re.match(oslo_namespace_imports, logical_line):
-        msg = ("N333: '%s' must be used instead of '%s'.") % (
-               logical_line.replace('oslo.', 'oslo_'),
-               logical_line)
-        yield(0, msg)
-    match = re.match(oslo_namespace_imports_2, logical_line)
-    if match:
-        msg = ("N333: 'module %s should not be imported "
-               "from oslo namespace.") % match.group(1)
-        yield(0, msg)
-    match = re.match(oslo_namespace_imports_3, logical_line)
-    if match:
-        msg = ("N333: 'module %s should not be imported "
-               "from oslo namespace.") % match.group(1)
-        yield(0, msg)
+class _FindVariableReferences(ast.NodeVisitor):
+    def __init__(self):
+        super(_FindVariableReferences, self).__init__()
+        self._references = []
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load):
+            # This means the value of a variable was loaded. For example a
+            # variable 'foo' was used like:
+            # mocked_thing.bar = foo
+            # foo()
+            # self.assertRaises(exception, foo)
+            self._references.append(node.id)
+        super(_FindVariableReferences, self).generic_visit(node)
+
+
+class CheckForUncalledTestClosure(BaseASTChecker):
+    """Look for closures that are never called in tests.
+
+    A recurring pattern when using multiple mocks is to create a closure
+    decorated with mocks like:
+
+    def test_thing(self):
+            @mock.patch.object(self.compute, 'foo')
+            @mock.patch.object(self.compute, 'bar')
+            def _do_test(mock_bar, mock_foo):
+                # Test things
+        _do_test()
+
+    However it is easy to leave off the _do_test() and have the test pass
+    because nothing runs. This check looks for methods defined within a test
+    method and ensures that there is a reference to them. Only methods defined
+    one level deep are checked. Something like:
+
+    def test_thing(self):
+        class FakeThing:
+            def foo(self):
+
+    would not ensure that foo is referenced.
+
+    N349
+    """
+
+    def __init__(self, tree, filename):
+        super(CheckForUncalledTestClosure, self).__init__(tree, filename)
+        self._filename = filename
+
+    def visit_FunctionDef(self, node):
+        # self._filename is 'stdin' in the unit test for this check.
+        if (not os.path.basename(self._filename).startswith('test_') and
+                os.path.basename(self._filename) != 'stdin'):
+            return
+
+        closures = []
+        references = []
+        # Walk just the direct nodes of the test method
+        for child_node in ast.iter_child_nodes(node):
+            if isinstance(child_node, ast.FunctionDef):
+                closures.append(child_node.name)
+
+        # Walk all nodes to find references
+        find_references = _FindVariableReferences()
+        find_references.generic_visit(node)
+        references = find_references._references
+
+        missed = set(closures) - set(references)
+        if missed:
+            self.add_error(node, 'N349: Test closures not called: %s'
+                    % ','.join(missed))
 
 
 def assert_true_or_false_with_in(logical_line):
@@ -541,6 +567,337 @@ def assert_equal_in(logical_line):
                   "contents.")
 
 
+def check_http_not_implemented(logical_line, physical_line, filename, noqa):
+    msg = ("N339: HTTPNotImplemented response must be implemented with"
+           " common raise_feature_not_supported().")
+    if noqa:
+        return
+    if ("nova/api/openstack/compute" not in filename):
+        return
+    if re.match(http_not_implemented_re, logical_line):
+        yield (0, msg)
+
+
+def check_greenthread_spawns(logical_line, physical_line, filename):
+    """Check for use of greenthread.spawn(), greenthread.spawn_n(),
+    eventlet.spawn(), and eventlet.spawn_n()
+
+    N340
+    """
+    msg = ("N340: Use nova.utils.%(spawn)s() rather than "
+           "greenthread.%(spawn)s() and eventlet.%(spawn)s()")
+    if "nova/utils.py" in filename or "nova/tests/" in filename:
+        return
+
+    match = re.match(spawn_re, logical_line)
+
+    if match:
+        yield (0, msg % {'spawn': match.group('spawn_part')})
+
+
+def check_no_contextlib_nested(logical_line, filename):
+    msg = ("N341: contextlib.nested is deprecated. With Python 2.7 and later "
+           "the with-statement supports multiple nested objects. See https://"
+           "docs.python.org/2/library/contextlib.html#contextlib.nested for "
+           "more information. nova.test.nested() is an alternative as well.")
+
+    if contextlib_nested.match(logical_line):
+        yield (0, msg)
+
+
+def check_config_option_in_central_place(logical_line, filename):
+    msg = ("N342: Config options should be in the central location "
+           "'/nova/conf/*'. Do not declare new config options outside "
+           "of that folder.")
+    # That's the correct location
+    if "nova/conf/" in filename:
+        return
+
+    # (macsz) All config options (with exceptions that are clarified
+    # in the list below) were moved to the central place. List below is for
+    # all options that were impossible to move without doing a major impact
+    # on code. Add full path to a module or folder.
+    conf_exceptions = [
+        # CLI opts are allowed to be outside of nova/conf directory
+        'nova/cmd/manage.py',
+        'nova/cmd/policy.py',
+        'nova/cmd/status.py',
+        # config options should not be declared in tests, but there is
+        # another checker for it (N320)
+        'nova/tests',
+    ]
+
+    if any(f in filename for f in conf_exceptions):
+        return
+
+    if cfg_opt_re.match(logical_line):
+        yield (0, msg)
+
+
+def check_policy_registration_in_central_place(logical_line, filename):
+    msg = ('N350: Policy registration should be in the central location(s) '
+           '"/nova/policies/*"')
+    # This is where registration should happen
+    if "nova/policies/" in filename:
+        return
+    # A couple of policy tests register rules
+    if "nova/tests/unit/test_policy.py" in filename:
+        return
+
+    if rule_default_re.match(logical_line):
+        yield (0, msg)
+
+
+def check_policy_enforce(logical_line, filename):
+    """Look for uses of nova.policy._ENFORCER.enforce()
+
+    Now that policy defaults are registered in code the _ENFORCER.authorize
+    method should be used. That ensures that only registered policies are used.
+    Uses of _ENFORCER.enforce could allow unregistered policies to be used, so
+    this check looks for uses of that method.
+
+    N351
+    """
+
+    msg = ('N351: nova.policy._ENFORCER.enforce() should not be used. '
+           'Use the authorize() method instead.')
+
+    if policy_enforce_re.match(logical_line):
+        yield (0, msg)
+
+
+def check_doubled_words(physical_line, filename):
+    """Check for the common doubled-word typos
+
+    N343
+    """
+    msg = ("N343: Doubled word '%(word)s' typo found")
+
+    match = re.search(doubled_words_re, physical_line)
+
+    if match:
+        return (0, msg % {'word': match.group(1)})
+
+
+def check_python3_no_iteritems(logical_line):
+    msg = ("N344: Use items() instead of dict.iteritems().")
+
+    if re.search(r".*\.iteritems\(\)", logical_line):
+        yield (0, msg)
+
+
+def check_python3_no_iterkeys(logical_line):
+    msg = ("N345: Use six.iterkeys() instead of dict.iterkeys().")
+
+    if re.search(r".*\.iterkeys\(\)", logical_line):
+        yield (0, msg)
+
+
+def check_python3_no_itervalues(logical_line):
+    msg = ("N346: Use six.itervalues() instead of dict.itervalues().")
+
+    if re.search(r".*\.itervalues\(\)", logical_line):
+        yield (0, msg)
+
+
+def no_os_popen(logical_line):
+    """Disallow 'os.popen('
+
+    Deprecated library function os.popen() Replace it using subprocess
+    https://bugs.launchpad.net/tempest/+bug/1529836
+
+    N348
+    """
+
+    if 'os.popen(' in logical_line:
+        yield (0, 'N348 Deprecated library function os.popen(). '
+                  'Replace it using subprocess module. ')
+
+
+def no_log_warn(logical_line):
+    """Disallow 'LOG.warn('
+
+    Deprecated LOG.warn(), instead use LOG.warning
+    https://bugs.launchpad.net/senlin/+bug/1508442
+
+    N352
+    """
+
+    msg = ("N352: LOG.warn is deprecated, please use LOG.warning!")
+    if "LOG.warn(" in logical_line:
+        yield (0, msg)
+
+
+def check_context_log(logical_line, physical_line, filename, noqa):
+    """check whether context is being passed to the logs
+
+    Not correct: LOG.info(_LI("Rebooting instance"), context=context)
+    Correct:  LOG.info(_LI("Rebooting instance"))
+    https://bugs.launchpad.net/nova/+bug/1500896
+
+    N353
+    """
+    if noqa:
+        return
+
+    if "nova/tests" in filename:
+        return
+
+    if log_remove_context.match(logical_line):
+        yield (0,
+               "N353: Nova is using oslo.context's RequestContext "
+               "which means the context object is in scope when "
+               "doing logging using oslo.log, so no need to pass it as "
+               "kwarg.")
+
+
+def no_assert_equal_true_false(logical_line):
+    """Enforce use of assertTrue/assertFalse.
+
+    Prevent use of assertEqual(A, True|False), assertEqual(True|False, A),
+    assertNotEqual(A, True|False), and assertNotEqual(True|False, A).
+
+    N355
+    """
+    _start_re = re.compile(r'assert(Not)?Equal\((True|False),')
+    _end_re = re.compile(r'assert(Not)?Equal\(.*,\s+(True|False)\)$')
+
+    if _start_re.search(logical_line) or _end_re.search(logical_line):
+        yield (0, "N355: assertEqual(A, True|False), "
+               "assertEqual(True|False, A), assertNotEqual(A, True|False), "
+               "or assertEqual(True|False, A) sentences must not be used. "
+               "Use assertTrue(A) or assertFalse(A) instead")
+
+
+def no_assert_true_false_is_not(logical_line):
+    """Enforce use of assertIs/assertIsNot.
+
+    Prevent use of assertTrue(A is|is not B) and assertFalse(A is|is not B).
+
+    N356
+    """
+    _re = re.compile(r'assert(True|False)\(.+\s+is\s+(not\s+)?.+\)$')
+
+    if _re.search(logical_line):
+        yield (0, "N356: assertTrue(A is|is not B) or "
+               "assertFalse(A is|is not B) sentences must not be used. "
+               "Use assertIs(A, B) or assertIsNot(A, B) instead")
+
+
+def check_uuid4(logical_line):
+    """Generating UUID
+
+    Use oslo_utils.uuidutils or uuidsentinel(in case of test cases) to generate
+    UUID instead of uuid4().
+
+    N357
+    """
+
+    msg = ("N357: Use oslo_utils.uuidutils or uuidsentinel(in case of test "
+           "cases) to generate UUID instead of uuid4().")
+
+    if uuid4_re.search(logical_line):
+        yield (0, msg)
+
+
+def return_followed_by_space(logical_line):
+    """Return should be followed by a space.
+
+    Return should be followed by a space to clarify that return is
+    not a function. Adding a space may force the developer to rethink
+    if there are unnecessary parentheses in the written code.
+
+    Not correct: return(42), return(a, b)
+    Correct: return, return 42, return (a, b), return a, b
+
+    N358
+    """
+    if return_not_followed_by_space.match(logical_line):
+        yield (0,
+               "N358: Return keyword should be followed by a space.")
+
+
+def no_redundant_import_alias(logical_line):
+    """Check for redundant import aliases.
+
+    Imports should not be in the forms below.
+
+    from x import y as y
+    import x as x
+    import x.y as y
+
+    N359
+    """
+    if re.search(redundant_import_alias_re, logical_line):
+        yield (0, "N359: Import alias should not be redundant.")
+
+
+def yield_followed_by_space(logical_line):
+    """Yield should be followed by a space.
+
+    Yield should be followed by a space to clarify that yield is
+    not a function. Adding a space may force the developer to rethink
+    if there are unnecessary parentheses in the written code.
+
+    Not correct: yield(x), yield(a, b)
+    Correct: yield x, yield (a, b), yield a, b
+
+    N360
+    """
+    if yield_not_followed_by_space.match(logical_line):
+        yield (0,
+               "N360: Yield keyword should be followed by a space.")
+
+
+def assert_regexpmatches(logical_line):
+    """Check for usage of deprecated assertRegexpMatches/assertNotRegexpMatches
+
+    N361
+    """
+    res = asse_regexpmatches.search(logical_line)
+    if res:
+        yield (0, "N361: assertRegex/assertNotRegex must be used instead "
+                  "of assertRegexpMatches/assertNotRegexpMatches.")
+
+
+def privsep_imports_not_aliased(logical_line, filename):
+    """Do not abbreviate or alias privsep module imports.
+
+    When accessing symbols under nova.privsep in code or tests, the full module
+    path (e.g. nova.privsep.linux_net.delete_bridge(...)) should be used
+    explicitly rather than importing and using an alias/abbreviation such as:
+
+      from nova.privsep import linux_net
+      ...
+      linux_net.delete_bridge(...)
+
+    See Ief177dbcb018da6fbad13bb0ff153fc47292d5b9.
+
+    N362
+    """
+    if (
+            # Give modules under nova.privsep a pass
+            not privsep_file_re.match(filename) and
+            # Any style of import of privsep...
+            privsep_import_re.match(logical_line) and
+            # ...that isn't 'import nova.privsep[.foo...]'
+            logical_line.count(' ') > 1):
+        yield (0, "N362: always import privsep modules so that the use of "
+                  "escalated permissions is obvious to callers. For example, "
+                  "use 'import nova.privsep.path' instead of "
+                  "'from nova.privsep import path'.")
+
+
+def did_you_mean_tuple(logical_line):
+    """Disallow ``(not_a_tuple)`` because you meant ``(a_tuple_of_one,)``.
+
+    N363
+    """
+    if disguised_as_tuple_re.search(logical_line):
+        yield (0, "N363: You said ``in (not_a_tuple)`` when you almost "
+                  "certainly meant ``in (a_tuple_of_one,)``.")
+
+
 def factory(register):
     register(import_no_db_in_virt)
     register(no_db_session_in_public_api)
@@ -548,22 +905,42 @@ def factory(register):
     register(import_no_virt_driver_import_deps)
     register(import_no_virt_driver_config_deps)
     register(capital_cfg_help)
-    register(no_vi_headers)
     register(no_import_translation_in_tests)
     register(assert_true_instance)
     register(assert_equal_type)
-    register(assert_equal_none)
     register(assert_raises_regexp)
     register(no_translate_debug_logs)
     register(no_setting_conf_directly_in_tests)
-    register(validate_log_translations)
     register(no_mutable_default_args)
     register(check_explicit_underscore_import)
     register(use_jsonutils)
     register(check_api_version_decorator)
     register(CheckForStrUnicodeExc)
     register(CheckForTransAdd)
-    register(check_oslo_namespace_imports)
     register(assert_true_or_false_with_in)
     register(dict_constructor_with_list_copy)
     register(assert_equal_in)
+    register(check_http_not_implemented)
+    register(check_no_contextlib_nested)
+    register(check_greenthread_spawns)
+    register(check_config_option_in_central_place)
+    register(check_policy_registration_in_central_place)
+    register(check_policy_enforce)
+    register(check_doubled_words)
+    register(check_python3_no_iteritems)
+    register(check_python3_no_iterkeys)
+    register(check_python3_no_itervalues)
+    register(check_python3_xrange)
+    register(no_os_popen)
+    register(no_log_warn)
+    register(CheckForUncalledTestClosure)
+    register(check_context_log)
+    register(no_assert_equal_true_false)
+    register(no_assert_true_false_is_not)
+    register(check_uuid4)
+    register(return_followed_by_space)
+    register(no_redundant_import_alias)
+    register(yield_followed_by_space)
+    register(assert_regexpmatches)
+    register(privsep_imports_not_aliased)
+    register(did_you_mean_tuple)

@@ -37,10 +37,8 @@ class SnapshotOpsTestCase(test_base.HyperVBaseTestCase):
 
     @mock.patch('nova.image.glance.get_remote_image_service')
     def test_save_glance_image(self, mock_get_remote_image_service):
-        image_metadata = {"is_public": False,
-                          "disk_format": "vhd",
-                          "container_format": "bare",
-                          "properties": {}}
+        image_metadata = {"disk_format": "vhd",
+                          "container_format": "bare"}
         glance_image_service = mock.MagicMock()
         mock_get_remote_image_service.return_value = (glance_image_service,
                                                       mock.sentinel.IMAGE_ID)
@@ -53,7 +51,8 @@ class SnapshotOpsTestCase(test_base.HyperVBaseTestCase):
             mock.sentinel.PATH, 'rb')
         glance_image_service.update.assert_called_once_with(
             self.context, mock.sentinel.IMAGE_ID, image_metadata,
-            self._snapshotops._pathutils.open().__enter__())
+            self._snapshotops._pathutils.open().__enter__(),
+            purge_props=False)
 
     @mock.patch('nova.virt.hyperv.snapshotops.SnapshotOps._save_glance_image')
     def _test_snapshot(self, mock_save_glance_image, base_disk_path):
@@ -96,7 +95,7 @@ class SnapshotOpsTestCase(test_base.HyperVBaseTestCase):
             mock_reconnect.assert_called_once_with(dest_vhd_path,
                                                    base_dest_disk_path)
             self._snapshotops._vhdutils.merge_vhd.assert_called_once_with(
-                dest_vhd_path, base_dest_disk_path)
+                dest_vhd_path)
             mock_save_glance_image.assert_called_once_with(
                 self.context, mock.sentinel.IMAGE_ID, base_dest_disk_path)
         else:

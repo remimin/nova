@@ -18,13 +18,10 @@
 Test the base rpc API.
 """
 
-from oslo_config import cfg
-
 from nova import baserpc
+from nova.compute import rpcapi as compute_rpcapi
 from nova import context
 from nova import test
-
-CONF = cfg.CONF
 
 
 class BaseAPITestCase(test.TestCase):
@@ -35,16 +32,14 @@ class BaseAPITestCase(test.TestCase):
         self.project_id = 'fake'
         self.context = context.RequestContext(self.user_id,
                                               self.project_id)
-        self.conductor = self.start_service(
-            'conductor', manager=CONF.conductor.manager)
         self.compute = self.start_service('compute')
-        self.base_rpcapi = baserpc.BaseAPI(CONF.compute_topic)
+        self.base_rpcapi = baserpc.BaseAPI(compute_rpcapi.RPC_TOPIC)
 
     def test_ping(self):
         res = self.base_rpcapi.ping(self.context, 'foo')
-        self.assertEqual(res, {'service': 'compute', 'arg': 'foo'})
+        self.assertEqual({'service': 'compute', 'arg': 'foo'}, res)
 
     def test_get_backdoor_port(self):
         res = self.base_rpcapi.get_backdoor_port(self.context,
                 self.compute.host)
-        self.assertEqual(res, self.compute.backdoor_port)
+        self.assertEqual(self.compute.backdoor_port, res)

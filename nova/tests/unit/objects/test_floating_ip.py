@@ -14,10 +14,13 @@
 
 import mock
 import netaddr
+from oslo_versionedobjects import base as ovo_base
 
 from nova import exception
 from nova import objects
 from nova.objects import floating_ip
+from nova import test
+from nova.tests.unit.api.openstack import fakes
 from nova.tests.unit.objects import test_fixed_ip
 from nova.tests.unit.objects import test_network
 from nova.tests.unit.objects import test_objects
@@ -55,7 +58,7 @@ class _TestFloatingIPObject(object):
                 obj_val = str(obj_val)
             self.assertEqual(db_val, obj_val)
 
-    @mock.patch('nova.db.floating_ip_get')
+    @mock.patch('nova.db.api.floating_ip_get')
     def test_get_by_id(self, get):
         db_floatingip = dict(fake_floating_ip,
                              fixed_ip=test_fixed_ip.fake_fixed_ip)
@@ -64,7 +67,7 @@ class _TestFloatingIPObject(object):
         get.assert_called_once_with(self.context, 123)
         self._compare(floatingip, db_floatingip)
 
-    @mock.patch('nova.db.floating_ip_get_by_address')
+    @mock.patch('nova.db.api.floating_ip_get_by_address')
     def test_get_by_address(self, get):
         get.return_value = fake_floating_ip
         floatingip = floating_ip.FloatingIP.get_by_address(self.context,
@@ -72,13 +75,13 @@ class _TestFloatingIPObject(object):
         get.assert_called_once_with(self.context, '1.2.3.4')
         self._compare(floatingip, fake_floating_ip)
 
-    @mock.patch('nova.db.floating_ip_get_pools')
+    @mock.patch('nova.db.api.floating_ip_get_pools')
     def test_get_pool_names(self, get):
         get.return_value = [{'name': 'a'}, {'name': 'b'}]
         self.assertEqual(['a', 'b'],
                          floating_ip.FloatingIP.get_pool_names(self.context))
 
-    @mock.patch('nova.db.floating_ip_allocate_address')
+    @mock.patch('nova.db.api.floating_ip_allocate_address')
     def test_allocate_address(self, allocate):
         allocate.return_value = '1.2.3.4'
         self.assertEqual('1.2.3.4',
@@ -88,7 +91,7 @@ class _TestFloatingIPObject(object):
         allocate.assert_called_with(self.context, 'project', 'pool',
                                     auto_assigned=False)
 
-    @mock.patch('nova.db.floating_ip_fixed_ip_associate')
+    @mock.patch('nova.db.api.floating_ip_fixed_ip_associate')
     def test_associate(self, associate):
         db_fixed = dict(test_fixed_ip.fake_fixed_ip,
                         network=test_network.fake_network)
@@ -103,17 +106,17 @@ class _TestFloatingIPObject(object):
         self.assertEqual('172.17.0.1', str(floatingip.address))
         self.assertEqual('host', floatingip.host)
 
-    @mock.patch('nova.db.floating_ip_deallocate')
+    @mock.patch('nova.db.api.floating_ip_deallocate')
     def test_deallocate(self, deallocate):
         floating_ip.FloatingIP.deallocate(self.context, '1.2.3.4')
         deallocate.assert_called_with(self.context, '1.2.3.4')
 
-    @mock.patch('nova.db.floating_ip_destroy')
+    @mock.patch('nova.db.api.floating_ip_destroy')
     def test_destroy(self, destroy):
         floating_ip.FloatingIP.destroy(self.context, '1.2.3.4')
         destroy.assert_called_with(self.context, '1.2.3.4')
 
-    @mock.patch('nova.db.floating_ip_disassociate')
+    @mock.patch('nova.db.api.floating_ip_disassociate')
     def test_disassociate(self, disassociate):
         db_fixed = dict(test_fixed_ip.fake_fixed_ip,
                         network=test_network.fake_network)
@@ -124,7 +127,7 @@ class _TestFloatingIPObject(object):
         self.assertEqual(db_fixed['id'], floatingip.fixed_ip.id)
         self.assertEqual('1.2.3.4', str(floatingip.address))
 
-    @mock.patch('nova.db.floating_ip_update')
+    @mock.patch('nova.db.api.floating_ip_update')
     def test_save(self, update):
         update.return_value = fake_floating_ip
         floatingip = floating_ip.FloatingIP(context=self.context,
@@ -147,7 +150,7 @@ class _TestFloatingIPObject(object):
         floatingip.fixed_ip_id = 1
         self.assertRaises(exception.ObjectActionError, floatingip.save)
 
-    @mock.patch('nova.db.floating_ip_update')
+    @mock.patch('nova.db.api.floating_ip_update')
     def test_save_no_fixedip(self, update):
         update.return_value = fake_floating_ip
         floatingip = floating_ip.FloatingIP(context=self.context,
@@ -156,7 +159,7 @@ class _TestFloatingIPObject(object):
                                               id=456)
         self.assertNotIn('fixed_ip', update.calls[1])
 
-    @mock.patch('nova.db.floating_ip_get_all')
+    @mock.patch('nova.db.api.floating_ip_get_all')
     def test_get_all(self, get):
         get.return_value = [fake_floating_ip]
         floatingips = floating_ip.FloatingIPList.get_all(self.context)
@@ -164,7 +167,7 @@ class _TestFloatingIPObject(object):
         self._compare(floatingips[0], fake_floating_ip)
         get.assert_called_with(self.context)
 
-    @mock.patch('nova.db.floating_ip_get_all_by_host')
+    @mock.patch('nova.db.api.floating_ip_get_all_by_host')
     def test_get_by_host(self, get):
         get.return_value = [fake_floating_ip]
         floatingips = floating_ip.FloatingIPList.get_by_host(self.context,
@@ -173,7 +176,7 @@ class _TestFloatingIPObject(object):
         self._compare(floatingips[0], fake_floating_ip)
         get.assert_called_with(self.context, 'host')
 
-    @mock.patch('nova.db.floating_ip_get_all_by_project')
+    @mock.patch('nova.db.api.floating_ip_get_all_by_project')
     def test_get_by_project(self, get):
         get.return_value = [fake_floating_ip]
         floatingips = floating_ip.FloatingIPList.get_by_project(self.context,
@@ -182,7 +185,7 @@ class _TestFloatingIPObject(object):
         self._compare(floatingips[0], fake_floating_ip)
         get.assert_called_with(self.context, 'project')
 
-    @mock.patch('nova.db.floating_ip_get_by_fixed_address')
+    @mock.patch('nova.db.api.floating_ip_get_by_fixed_address')
     def test_get_by_fixed_address(self, get):
         get.return_value = [fake_floating_ip]
         floatingips = floating_ip.FloatingIPList.get_by_fixed_address(
@@ -191,7 +194,7 @@ class _TestFloatingIPObject(object):
         self._compare(floatingips[0], fake_floating_ip)
         get.assert_called_with(self.context, '1.2.3.4')
 
-    @mock.patch('nova.db.floating_ip_get_by_fixed_ip_id')
+    @mock.patch('nova.db.api.floating_ip_get_by_fixed_ip_id')
     def test_get_by_fixed_ip_id(self, get):
         get.return_value = [fake_floating_ip]
         floatingips = floating_ip.FloatingIPList.get_by_fixed_ip_id(
@@ -200,7 +203,7 @@ class _TestFloatingIPObject(object):
         self._compare(floatingips[0], fake_floating_ip)
         get.assert_called_with(self.context, 123)
 
-    @mock.patch('nova.db.instance_floating_address_get_all')
+    @mock.patch('nova.db.api.instance_floating_address_get_all')
     def test_get_addresses_by_instance(self, get_all):
         expected = ['1.2.3.4', '4.5.6.7']
         get_all.return_value = list(expected)
@@ -215,11 +218,11 @@ class _TestFloatingIPObject(object):
                           'interface': 'eth0'},
                          result)
 
-    @mock.patch('nova.db.floating_ip_bulk_create')
+    @mock.patch('nova.db.api.floating_ip_bulk_create')
     def test_bulk_create(self, create_mock):
         def fake_create(ctxt, ip_info, want_result=False):
             return [{'id': 1, 'address': ip['address'], 'fixed_ip_id': 1,
-                     'project_id': 'foo', 'host': 'host',
+                     'project_id': fakes.FAKE_PROJECT_ID, 'host': 'host',
                      'auto_assigned': False, 'pool': ip['pool'],
                      'interface': ip['interface'], 'fixed_ip': None,
                      'created_at': None, 'updated_at': None,
@@ -230,12 +233,12 @@ class _TestFloatingIPObject(object):
         ips = [objects.FloatingIPList.make_ip_info('1.1.1.1', 'pool', 'eth0'),
                objects.FloatingIPList.make_ip_info('1.1.1.2', 'loop', 'eth1')]
         result = objects.FloatingIPList.create(None, ips)
-        self.assertIs(result, None)
+        self.assertIsNone(result)
         result = objects.FloatingIPList.create(None, ips, want_result=True)
         self.assertEqual('1.1.1.1', str(result[0].address))
         self.assertEqual('1.1.1.2', str(result[1].address))
 
-    @mock.patch('nova.db.floating_ip_bulk_destroy')
+    @mock.patch('nova.db.api.floating_ip_bulk_destroy')
     def test_bulk_destroy(self, destroy_mock):
         ips = [{'address': '1.2.3.4'}, {'address': '4.5.6.7'}]
         objects.FloatingIPList.destroy(None, ips)
@@ -245,9 +248,21 @@ class _TestFloatingIPObject(object):
         floating = objects.FloatingIP()
         fixed = objects.FixedIP()
         floating.fixed_ip = fixed
-        primitive = floating.obj_to_primitive(target_version='1.1')
+        versions = ovo_base.obj_tree_get_versions('FloatingIP')
+        versions['FixedIP'] = '1.1'
+        primitive = floating.obj_to_primitive(target_version='1.1',
+                                              version_manifest=versions)
         self.assertEqual('1.1',
             primitive['nova_object.data']['fixed_ip']['nova_object.version'])
+
+    def test_get_count_by_project(self):
+        ips = [objects.FloatingIPList.make_ip_info('1.1.1.1', 'pool', 'eth0')]
+        objects.FloatingIPList.create(self.context, ips)
+        floating_ip.FloatingIP.allocate_address(self.context,
+                                                self.context.project_id,
+                                                'pool')
+        self.assertEqual(1, floating_ip.FloatingIPList.get_count_by_project(
+            self.context, self.context.project_id))
 
 
 class TestFloatingIPObject(test_objects._LocalTest,
@@ -258,3 +273,17 @@ class TestFloatingIPObject(test_objects._LocalTest,
 class TestRemoteFloatingIPObject(test_objects._RemoteTest,
                                  _TestFloatingIPObject):
     pass
+
+
+class TestNeutronFloatingIPObject(test.NoDBTestCase):
+    def test_create_with_uuid_id(self):
+        uuid = 'fc9b4956-fd97-11e5-86aa-5e5517507c66'
+        fip = objects.floating_ip.NeutronFloatingIP(id=uuid)
+
+        self.assertEqual(uuid, fip.id)
+
+    def test_create_with_uuid_fixed_id(self):
+        uuid = 'fc9b4c3a-fd97-11e5-86aa-5e5517507c66'
+        fip = objects.floating_ip.NeutronFloatingIP(fixed_ip_id=uuid)
+
+        self.assertEqual(uuid, fip.fixed_ip_id)

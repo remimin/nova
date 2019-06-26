@@ -33,8 +33,16 @@ class _TestPciDevicePoolObject(object):
         pool_obj = objects.PciDevicePool.from_dict(fake_pci.fake_pool_dict)
         self.assertEqual(pool_obj.product_id, 'fake-product')
         self.assertEqual(pool_obj.vendor_id, 'fake-vendor')
+        self.assertEqual(pool_obj.numa_node, 1)
         self.assertEqual(pool_obj.tags, {'t1': 'v1', 't2': 'v2'})
         self.assertEqual(pool_obj.count, 2)
+
+    def test_pci_pool_from_dict_bad_tags(self):
+        bad_dict = copy.deepcopy(fake_pci.fake_pool_dict)
+        bad_dict['bad'] = {'foo': 'bar'}
+        self.assertRaises(ValueError,
+                          objects.PciDevicePool.from_dict,
+                          value=bad_dict)
 
     def test_pci_pool_from_dict_no_tags(self):
         dict_notag = copy.copy(fake_pci.fake_pool_dict)
@@ -60,6 +68,13 @@ class _TestPciDevicePoolObject(object):
         pool_obj = objects.PciDevicePool(product_id='pid')
         pool_dict = pool_obj.to_dict()
         self.assertEqual({'product_id': 'pid'}, pool_dict)
+
+    def test_obj_make_compatible(self):
+        pool_obj = objects.PciDevicePool(product_id='pid', numa_node=1)
+        primitive = pool_obj.obj_to_primitive()
+        self.assertIn('numa_node', primitive['nova_object.data'])
+        pool_obj.obj_make_compatible(primitive['nova_object.data'], '1.0')
+        self.assertNotIn('numa_node', primitive['nova_object.data'])
 
 
 class TestPciDevicePoolObject(test_objects._LocalTest,
@@ -94,4 +109,4 @@ class TestConvertPciStats(test.NoDBTestCase):
     def test_from_pci_stats_bad(self):
         prim = "not a valid json string for an object"
         pools = pci_device_pool.from_pci_stats(prim)
-        self.assertIsNone(pools)
+        self.assertEqual(len(pools), 0)

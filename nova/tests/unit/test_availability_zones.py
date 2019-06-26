@@ -17,19 +17,19 @@
 Tests for availability zones
 """
 
-from oslo_config import cfg
+import mock
+from oslo_utils.fixture import uuidsentinel
+import six
 
 from nova import availability_zones as az
+from nova.compute import api as compute_api
+import nova.conf
 from nova import context
-from nova import db
+from nova.db import api as db
+from nova import objects
 from nova import test
-from nova.tests.unit.api.openstack import fakes
 
-CONF = cfg.CONF
-CONF.import_opt('internal_service_availability_zone',
-                'nova.availability_zones')
-CONF.import_opt('default_availability_zone',
-                'nova.availability_zones')
+CONF = nova.conf.CONF
 
 
 class AvailabilityZoneTestCases(test.TestCase):
@@ -45,25 +45,23 @@ class AvailabilityZoneTestCases(test.TestCase):
         self.agg = self._create_az('az_agg', self.availability_zone)
 
     def tearDown(self):
-        db.aggregate_delete(self.context, self.agg['id'])
+        self.agg.destroy()
         super(AvailabilityZoneTestCases, self).tearDown()
 
     def _create_az(self, agg_name, az_name):
-        agg_meta = {'name': agg_name}
-        agg = db.aggregate_create(self.context, agg_meta)
-
-        metadata = {'availability_zone': az_name}
-        db.aggregate_metadata_add(self.context, agg['id'], metadata)
-
+        agg_meta = {'name': agg_name, 'uuid': uuidsentinel.agg_uuid,
+                    'metadata': {'availability_zone': az_name}}
+        agg = objects.Aggregate(self.context, **agg_meta)
+        agg.create()
+        agg = objects.Aggregate.get_by_id(self.context, agg.id)
         return agg
 
     def _update_az(self, aggregate, az_name):
-        metadata = {'availability_zone': az_name}
-        db.aggregate_update(self.context, aggregate['id'], metadata)
+        aggregate.update_metadata({'availability_zone': az_name})
 
     def _create_service_with_topic(self, topic, host, disabled=False):
         values = {
-            'binary': 'bin',
+            'binary': 'nova-bin',
             'host': host,
             'topic': topic,
             'disabled': disabled,
@@ -74,12 +72,10 @@ class AvailabilityZoneTestCases(test.TestCase):
         return db.service_destroy(self.context, service['id'])
 
     def _add_to_aggregate(self, service, aggregate):
-        return db.aggregate_host_add(self.context,
-                                     aggregate['id'], service['host'])
+        aggregate.add_host(service['host'])
 
     def _delete_from_aggregate(self, service, aggregate):
-        return db.aggregate_host_delete(self.context,
-                                        aggregate['id'], service['host'])
+        aggregate.delete_host(service['host'])
 
     def test_rest_availability_zone_reset_cache(self):
         az._get_cache().add('cache', 'fake_value')
@@ -96,9 +92,9 @@ class AvailabilityZoneTestCases(test.TestCase):
         agg_az1 = self._create_az('agg-az1', az_name)
         self._add_to_aggregate(service, agg_az1)
         az.update_host_availability_zone_cache(self.context, self.host)
-        self.assertEqual(az._get_cache().get(cache_key), 'az1')
+        self.assertEqual('az1', az._get_cache().get(cache_key))
         az.update_host_availability_zone_cache(self.context, self.host, 'az2')
-        self.assertEqual(az._get_cache().get(cache_key), 'az2')
+        self.assertEqual('az2', az._get_cache().get(cache_key))
 
     def test_set_availability_zone_compute_service(self):
         """Test for compute service get right availability zone."""
@@ -108,15 +104,14 @@ class AvailabilityZoneTestCases(test.TestCase):
         # The service is not add into aggregate, so confirm it is default
         # availability zone.
         new_service = az.set_availability_zones(self.context, services)[0]
-        self.assertEqual(new_service['availability_zone'],
-                         self.default_az)
+        self.assertEqual(self.default_az, new_service['availability_zone'])
 
         # The service is added into aggregate, confirm return the aggregate
         # availability zone.
         self._add_to_aggregate(service, self.agg)
         new_service = az.set_availability_zones(self.context, services)[0]
-        self.assertEqual(new_service['availability_zone'],
-                         self.availability_zone)
+        self.assertEqual(self.availability_zone,
+                         new_service['availability_zone'])
 
         self._destroy_service(service)
 
@@ -125,7 +120,7 @@ class AvailabilityZoneTestCases(test.TestCase):
         service = self._create_service_with_topic('network', self.host)
         services = db.service_get_all(self.context)
         az.set_availability_zones(self.context, services)
-        self.assertIsInstance(services[0]['host'], unicode)
+        self.assertIsInstance(services[0]['host'], six.text_type)
         cached_key = az._make_cache_key(services[0]['host'])
         self.assertIsInstance(cached_key, str)
         self._destroy_service(service)
@@ -135,8 +130,7 @@ class AvailabilityZoneTestCases(test.TestCase):
         service = self._create_service_with_topic('network', self.host)
         services = db.service_get_all(self.context)
         new_service = az.set_availability_zones(self.context, services)[0]
-        self.assertEqual(new_service['availability_zone'],
-                         self.default_in_az)
+        self.assertEqual(self.default_in_az, new_service['availability_zone'])
         self._destroy_service(service)
 
     def test_get_host_availability_zone(self):
@@ -217,16 +211,18 @@ class AvailabilityZoneTestCases(test.TestCase):
         self._add_to_aggregate(service3, agg2)
         self._add_to_aggregate(service4, agg3)
 
-        zones, not_zones = az.get_availability_zones(self.context)
+        host_api = compute_api.HostAPI()
+        zones, not_zones = az.get_availability_zones(self.context, host_api)
 
-        self.assertEqual(zones, ['nova-test', 'nova-test2'])
-        self.assertEqual(not_zones, ['nova-test3', 'nova'])
+        self.assertEqual(['nova-test', 'nova-test2'], zones)
+        self.assertEqual(['nova-test3', 'nova'], not_zones)
 
-        zones = az.get_availability_zones(self.context, True)
+        zones = az.get_availability_zones(self.context, host_api,
+                                          get_only_available=True)
 
-        self.assertEqual(zones, ['nova-test', 'nova-test2'])
+        self.assertEqual(['nova-test', 'nova-test2'], zones)
 
-        zones, not_zones = az.get_availability_zones(self.context,
+        zones, not_zones = az.get_availability_zones(self.context, host_api,
                                                      with_hosts=True)
 
         self.assertJsonEqual(zones,
@@ -238,8 +234,8 @@ class AvailabilityZoneTestCases(test.TestCase):
 
     def test_get_instance_availability_zone_default_value(self):
         """Test get right availability zone by given an instance."""
-        fake_inst_id = 162
-        fake_inst = fakes.stub_instance(fake_inst_id, host=self.host)
+        fake_inst = objects.Instance(host=self.host,
+                                     availability_zone=None)
 
         self.assertEqual(self.default_az,
                 az.get_instance_availability_zone(self.context, fake_inst))
@@ -250,8 +246,51 @@ class AvailabilityZoneTestCases(test.TestCase):
         service = self._create_service_with_topic('compute', host)
         self._add_to_aggregate(service, self.agg)
 
-        fake_inst_id = 174
-        fake_inst = fakes.stub_instance(fake_inst_id, host=host)
+        fake_inst = objects.Instance(host=host,
+                                     availability_zone=self.availability_zone)
 
         self.assertEqual(self.availability_zone,
                 az.get_instance_availability_zone(self.context, fake_inst))
+
+    @mock.patch.object(az._get_cache(), 'get')
+    def test_get_instance_availability_zone_cache_differs(self, cache_get):
+        host = 'host170'
+        service = self._create_service_with_topic('compute', host)
+        self._add_to_aggregate(service, self.agg)
+        cache_get.return_value = self.default_az
+
+        fake_inst = objects.Instance(host=host,
+                                     availability_zone=self.availability_zone)
+        self.assertEqual(
+            self.availability_zone,
+            az.get_instance_availability_zone(self.context, fake_inst))
+
+    def test_get_instance_availability_zone_no_host(self):
+        """Test get availability zone from instance if host is None."""
+        fake_inst = objects.Instance(host=None, availability_zone='inst-az')
+
+        result = az.get_instance_availability_zone(self.context, fake_inst)
+        self.assertEqual('inst-az', result)
+
+    def test_get_instance_availability_zone_no_host_set(self):
+        """Test get availability zone from instance if host not set.
+
+        This is testing the case in the compute API where the Instance object
+        does not have the host attribute set because it's just the object that
+        goes into the BuildRequest, it wasn't actually pulled from the DB. The
+        instance in this case doesn't actually get inserted into the DB until
+        it reaches conductor. So the host attribute may not be set but we
+        expect availability_zone always will in the API because of
+        _validate_and_build_base_options setting a default value which goes
+        into the object.
+        """
+        fake_inst = objects.Instance(availability_zone='inst-az')
+        result = az.get_instance_availability_zone(self.context, fake_inst)
+        self.assertEqual('inst-az', result)
+
+    def test_get_instance_availability_zone_no_host_no_az(self):
+        """Test get availability zone if neither host nor az is set."""
+        fake_inst = objects.Instance(host=None, availability_zone=None)
+
+        result = az.get_instance_availability_zone(self.context, fake_inst)
+        self.assertIsNone(result)

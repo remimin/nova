@@ -18,13 +18,16 @@ Unit Tests for nova.network.rpcapi
 
 import collections
 
-from mox3 import mox
+import mock
 from oslo_config import cfg
 
 from nova import context
+from nova import exception
 from nova.network import rpcapi as network_rpcapi
+from nova.objects import base as objects_base
 from nova import test
 from nova.tests.unit import fake_instance
+from nova.tests.unit import fake_network
 
 CONF = cfg.CONF
 
@@ -42,7 +45,8 @@ class NetworkRpcAPITestCase(test.NoDBTestCase):
 
         rpcapi = network_rpcapi.NetworkAPI()
         self.assertIsNotNone(rpcapi.client)
-        self.assertEqual(rpcapi.client.target.topic, CONF.network_topic)
+        self.assertEqual(network_rpcapi.RPC_TOPIC,
+                         rpcapi.client.target.topic)
 
         expected_retval = 'foo' if rpc_method == 'call' else None
         expected_version = kwargs.pop('version', None)
@@ -86,25 +90,38 @@ class NetworkRpcAPITestCase(test.NoDBTestCase):
             if CONF.multi_host:
                 prepare_kwargs['server'] = host
 
-        self.mox.StubOutWithMock(rpcapi, 'client')
+        with test.nested(
+            mock.patch.object(rpcapi.client, rpc_method),
+            mock.patch.object(rpcapi.client, 'prepare'),
+            mock.patch.object(rpcapi.client, 'can_send_version'),
+        ) as (
+            rpc_mock, prepare_mock, csv_mock
+        ):
 
-        version_check = [
-            'deallocate_for_instance', 'deallocate_fixed_ip',
-            'allocate_for_instance',
-        ]
-        if method in version_check:
-            rpcapi.client.can_send_version(mox.IgnoreArg()).AndReturn(True)
+            version_check = [
+                'deallocate_for_instance', 'deallocate_fixed_ip',
+                'allocate_for_instance', 'release_fixed_ip',
+                'set_network_host', 'setup_networks_on_host'
+            ]
+            if method in version_check:
+                csv_mock.return_value = True
 
-        if prepare_kwargs:
-            rpcapi.client.prepare(**prepare_kwargs).AndReturn(rpcapi.client)
+            if prepare_kwargs:
+                prepare_mock.return_value = rpcapi.client
 
-        rpc_method = getattr(rpcapi.client, rpc_method)
-        rpc_method(ctxt, method, **expected_kwargs).AndReturn('foo')
+            if rpc_method == 'call':
+                rpc_mock.return_value = 'foo'
+            else:
+                rpc_mock.return_value = None
 
-        self.mox.ReplayAll()
+            retval = getattr(rpcapi, method)(ctxt, **kwargs)
+            self.assertEqual(expected_retval, retval)
 
-        retval = getattr(rpcapi, method)(ctxt, **kwargs)
-        self.assertEqual(retval, expected_retval)
+            if method in version_check:
+                csv_mock.assert_called_once_with(mock.ANY)
+            if prepare_kwargs:
+                prepare_mock.assert_called_once_with(**prepare_kwargs)
+            rpc_mock.assert_called_once_with(ctxt, method, **expected_kwargs)
 
     def test_create_networks(self):
         self._test_network_api('create_networks', rpc_method='call',
@@ -130,6 +147,50 @@ class NetworkRpcAPITestCase(test.NoDBTestCase):
         instance = fake_instance.fake_instance_obj(context.get_admin_context())
         self._test_network_api('deallocate_for_instance', rpc_method='call',
                 instance=instance, requested_networks={}, version='1.11')
+
+    def test_release_dhcp(self):
+        ctxt = context.RequestContext('fake_user', 'fake_project')
+
+        dev = 'eth0'
+        address = '192.168.65.158'
+        vif_address = '00:0c:29:2c:b2:64'
+        host = 'fake-host'
+
+        rpcapi = network_rpcapi.NetworkAPI()
+        call_mock = mock.Mock()
+        cctxt_mock = mock.Mock(call=call_mock)
+
+        with test.nested(
+            mock.patch.object(rpcapi.client, 'can_send_version',
+                              return_value=True),
+            mock.patch.object(rpcapi.client, 'prepare',
+                              return_value=cctxt_mock)
+        ) as (
+            can_send_mock, prepare_mock
+        ):
+            rpcapi.release_dhcp(ctxt, host, dev, address, vif_address)
+
+        can_send_mock.assert_called_once_with('1.17')
+        prepare_mock.assert_called_once_with(server=host, version='1.17')
+        call_mock.assert_called_once_with(ctxt, 'release_dhcp', dev=dev,
+                                          address=address,
+                                          vif_address=vif_address)
+
+    def test_release_dhcp_v116(self):
+        ctxt = context.RequestContext('fake_user', 'fake_project')
+
+        dev = 'eth0'
+        address = '192.168.65.158'
+        vif_address = '00:0c:29:2c:b2:64'
+        host = 'fake-host'
+        rpcapi = network_rpcapi.NetworkAPI()
+
+        with mock.patch.object(rpcapi.client, 'can_send_version',
+                               return_value=False) as can_send_mock:
+            self.assertRaises(exception.RPCPinnedToOldVersion,
+                              rpcapi.release_dhcp, ctxt, host, dev, address,
+                              vif_address)
+            can_send_mock.assert_called_once_with('1.17')
 
     def test_add_fixed_ip_to_instance(self):
         self._test_network_api('add_fixed_ip_to_instance', rpc_method='call',
@@ -191,8 +252,36 @@ class NetworkRpcAPITestCase(test.NoDBTestCase):
                 domain='fake_domain', project='fake_project')
 
     def test_setup_networks_on_host(self):
+        ctxt = context.RequestContext('fake_user', 'fake_project')
+        instance = fake_instance.fake_instance_obj(ctxt)
         self._test_network_api('setup_networks_on_host', rpc_method='call',
-                instance_id='fake_id', host='fake_host', teardown=False)
+                instance_id=instance.id, host='fake_host', teardown=False,
+                instance=instance, version='1.16')
+
+    def test_setup_networks_on_host_v1_0(self):
+        ctxt = context.RequestContext('fake_user', 'fake_project')
+        instance = fake_instance.fake_instance_obj(ctxt)
+        host = 'fake_host'
+        teardown = True
+        rpcapi = network_rpcapi.NetworkAPI()
+        call_mock = mock.Mock()
+        cctxt_mock = mock.Mock(call=call_mock)
+        with test.nested(
+            mock.patch.object(rpcapi.client, 'can_send_version',
+                              return_value=False),
+            mock.patch.object(rpcapi.client, 'prepare',
+                              return_value=cctxt_mock)
+        ) as (
+            can_send_mock, prepare_mock
+        ):
+            rpcapi.setup_networks_on_host(ctxt, instance.id, host, teardown,
+                                          instance)
+        # assert our mocks were called as expected
+        can_send_mock.assert_called_once_with('1.16')
+        prepare_mock.assert_called_once_with(version='1.0')
+        call_mock.assert_called_once_with(ctxt, 'setup_networks_on_host',
+                                          host=host, teardown=teardown,
+                                          instance_id=instance.id)
 
     def test_lease_fixed_ip(self):
         self._test_network_api('lease_fixed_ip', rpc_method='cast',
@@ -200,11 +289,62 @@ class NetworkRpcAPITestCase(test.NoDBTestCase):
 
     def test_release_fixed_ip(self):
         self._test_network_api('release_fixed_ip', rpc_method='cast',
-                host='fake_host', address='fake_addr')
+                host='fake_host', address='fake_addr', mac='fake_mac',
+                version='1.14')
+
+    def test_release_fixed_ip_no_mac_support(self):
+        # Tests that the mac kwarg is not passed when we can't send version
+        # 1.14 to the network manager.
+        ctxt = context.RequestContext('fake_user', 'fake_project')
+        address = '192.168.65.158'
+        host = 'fake-host'
+        mac = '00:0c:29:2c:b2:64'
+        rpcapi = network_rpcapi.NetworkAPI()
+        cast_mock = mock.Mock()
+        cctxt_mock = mock.Mock(cast=cast_mock)
+        with test.nested(
+            mock.patch.object(rpcapi.client, 'can_send_version',
+                              return_value=False),
+            mock.patch.object(rpcapi.client, 'prepare',
+                              return_value=cctxt_mock)
+        ) as (
+            can_send_mock, prepare_mock
+        ):
+            rpcapi.release_fixed_ip(ctxt, address, host, mac)
+        # assert our mocks were called as expected     232
+        can_send_mock.assert_called_once_with('1.14')
+        prepare_mock.assert_called_once_with(server=host, version='1.0')
+        cast_mock.assert_called_once_with(ctxt, 'release_fixed_ip',
+                                          address=address)
 
     def test_set_network_host(self):
+        network = fake_network.fake_network_obj(context.get_admin_context())
         self._test_network_api('set_network_host', rpc_method='call',
-                network_ref={})
+                               network_ref=network, version='1.15')
+
+    def test_set_network_host_network_object_to_primitive(self):
+        # Tests that the network object is converted to a primitive if it
+        # can't send version 1.15.
+        ctxt = context.RequestContext('fake_user', 'fake_project')
+        network = fake_network.fake_network_obj(ctxt)
+        network_dict = objects_base.obj_to_primitive(network)
+        rpcapi = network_rpcapi.NetworkAPI()
+        call_mock = mock.Mock()
+        cctxt_mock = mock.Mock(call=call_mock)
+        with test.nested(
+            mock.patch.object(rpcapi.client, 'can_send_version',
+                              return_value=False),
+            mock.patch.object(rpcapi.client, 'prepare',
+                              return_value=cctxt_mock)
+        ) as (
+            can_send_mock, prepare_mock
+        ):
+            rpcapi.set_network_host(ctxt, network)
+        # assert our mocks were called as expected
+        can_send_mock.assert_called_once_with('1.15')
+        prepare_mock.assert_called_once_with(version='1.0')
+        call_mock.assert_called_once_with(ctxt, 'set_network_host',
+                                          network_ref=network_dict)
 
     def test_rpc_setup_network_on_host(self):
         self._test_network_api('rpc_setup_network_on_host', rpc_method='call',

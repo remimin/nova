@@ -19,9 +19,7 @@ import mock
 from oslo_serialization import jsonutils
 import webob
 
-from nova.api.openstack.compute import image_metadata
-from nova.api.openstack.compute.plugins.v3 import image_metadata \
-     as image_metadata_v21
+from nova.api.openstack.compute import image_metadata as image_metadata_v21
 from nova import exception
 from nova import test
 from nova.tests.unit.api.openstack import fakes
@@ -83,7 +81,7 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
         req = fakes.HTTPRequest.blank('/v2/fake/images/123/metadata')
         req.method = 'POST'
         body = {"metadata": {"key7": "value7"}}
-        req.body = jsonutils.dumps(body)
+        req.body = jsonutils.dump_as_bytes(body)
         req.headers["content-type"] = "application/json"
         res = self.controller.create(req, '123', body=body)
         get_mocked.assert_called_once_with(mock.ANY, '123')
@@ -108,7 +106,7 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
         req = fakes.HTTPRequest.blank('/v2/fake/images/100/metadata')
         req.method = 'POST'
         body = {"metadata": {"key7": "value7"}}
-        req.body = jsonutils.dumps(body)
+        req.body = jsonutils.dump_as_bytes(body)
         req.headers["content-type"] = "application/json"
 
         self.assertRaises(webob.exc.HTTPNotFound,
@@ -123,7 +121,7 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
         req = fakes.HTTPRequest.blank('/v2/fake/images/123/metadata')
         req.method = 'PUT'
         body = {"metadata": {"key9": "value9"}}
-        req.body = jsonutils.dumps(body)
+        req.body = jsonutils.dump_as_bytes(body)
         req.headers["content-type"] = "application/json"
         res = self.controller.update_all(req, '123', body=body)
         get_mocked.assert_called_once_with(mock.ANY, '123')
@@ -145,7 +143,7 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
         req = fakes.HTTPRequest.blank('/v2/fake/images/100/metadata')
         req.method = 'PUT'
         body = {"metadata": {"key9": "value9"}}
-        req.body = jsonutils.dumps(body)
+        req.body = jsonutils.dump_as_bytes(body)
         req.headers["content-type"] = "application/json"
 
         self.assertRaises(webob.exc.HTTPNotFound,
@@ -159,7 +157,7 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
         req = fakes.HTTPRequest.blank('/v2/fake/images/123/metadata/key1')
         req.method = 'PUT'
         body = {"meta": {"key1": "zz"}}
-        req.body = jsonutils.dumps(body)
+        req.body = jsonutils.dump_as_bytes(body)
         req.headers["content-type"] = "application/json"
         res = self.controller.update(req, '123', 'key1', body=body)
         expected = copy.deepcopy(get_image_123())
@@ -180,7 +178,7 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
         req = fakes.HTTPRequest.blank('/v2/fake/images/100/metadata/key1')
         req.method = 'PUT'
         body = {"meta": {"key1": "zz"}}
-        req.body = jsonutils.dumps(body)
+        req.body = jsonutils.dump_as_bytes(body)
         req.headers["content-type"] = "application/json"
 
         self.assertRaises(webob.exc.HTTPNotFound,
@@ -196,7 +194,7 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
         req = fakes.HTTPRequest.blank('/v2/fake/images/123/metadata/key1')
         req.method = 'PUT'
         body = {"key1": "zz"}
-        req.body = ''
+        req.body = b''
         req.headers["content-type"] = "application/json"
 
         self.assertRaises(self.invalid_request,
@@ -207,8 +205,7 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
         self.assertFalse(update_mocked.called)
 
     @mock.patch(CHK_QUOTA_STR,
-                side_effect=webob.exc.HTTPRequestEntityTooLarge(
-                        explanation='', headers={'Retry-After': 0}))
+                side_effect=webob.exc.HTTPBadRequest())
     @mock.patch('nova.image.api.API.update')
     @mock.patch('nova.image.api.API.get')
     def test_update_item_too_many_keys(self, get_mocked, update_mocked,
@@ -216,7 +213,7 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
         req = fakes.HTTPRequest.blank('/v2/fake/images/123/metadata/key1')
         req.method = 'PUT'
         body = {"meta": {"foo": "bar"}}
-        req.body = jsonutils.dumps(body)
+        req.body = jsonutils.dump_as_bytes(body)
         req.headers["content-type"] = "application/json"
 
         self.assertRaises(webob.exc.HTTPBadRequest,
@@ -233,7 +230,7 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
         req = fakes.HTTPRequest.blank('/v2/fake/images/123/metadata/bad')
         req.method = 'PUT'
         body = {"meta": {"key1": "value1"}}
-        req.body = jsonutils.dumps(body)
+        req.body = jsonutils.dump_as_bytes(body)
         req.headers["content-type"] = "application/json"
 
         self.assertRaises(webob.exc.HTTPBadRequest,
@@ -273,8 +270,7 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
                           self.controller.delete, req, '100', 'key1')
 
     @mock.patch(CHK_QUOTA_STR,
-                side_effect=webob.exc.HTTPForbidden(
-                        explanation='', headers={'Retry-After': 0}))
+                side_effect=webob.exc.HTTPForbidden(explanation=''))
     @mock.patch('nova.image.api.API.update')
     @mock.patch('nova.image.api.API.get', return_value=get_image_123())
     def test_too_many_metadata_items_on_create(self, _get_mocked,
@@ -282,7 +278,7 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
         body = {"metadata": {"foo": "bar"}}
         req = fakes.HTTPRequest.blank('/v2/fake/images/123/metadata')
         req.method = 'POST'
-        req.body = jsonutils.dumps(body)
+        req.body = jsonutils.dump_as_bytes(body)
         req.headers["content-type"] = "application/json"
 
         self.assertRaises(webob.exc.HTTPForbidden,
@@ -290,17 +286,15 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
         self.assertFalse(update_mocked.called)
 
     @mock.patch(CHK_QUOTA_STR,
-                side_effect=webob.exc.HTTPForbidden(
-                        explanation='', headers={'Retry-After': 0}))
+                side_effect=webob.exc.HTTPForbidden(explanation=''))
     @mock.patch('nova.image.api.API.update')
     @mock.patch('nova.image.api.API.get', return_value=get_image_123())
     def test_too_many_metadata_items_on_put(self, _get_mocked,
                                             update_mocked, _quota_mocked):
-        body = {"metadata": {"foo": "bar"}}
         req = fakes.HTTPRequest.blank('/v2/fake/images/123/metadata/blah')
         req.method = 'PUT'
         body = {"meta": {"blah": "blah", "blah1": "blah1"}}
-        req.body = jsonutils.dumps(body)
+        req.body = jsonutils.dump_as_bytes(body)
         req.headers["content-type"] = "application/json"
 
         self.assertRaises(self.invalid_request,
@@ -314,7 +308,7 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
         req = fakes.HTTPRequest.blank('/v2/fake/images/123/metadata/key1')
         req.method = 'PUT'
         body = {"meta": {"key1": "value1"}}
-        req.body = jsonutils.dumps(body)
+        req.body = jsonutils.dump_as_bytes(body)
         req.headers["content-type"] = "application/json"
 
         self.assertRaises(webob.exc.HTTPForbidden,
@@ -331,7 +325,7 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
                                       % image_id)
         req.method = 'PUT'
         body = {"metadata": {"key1": "value1"}}
-        req.body = jsonutils.dumps(body)
+        req.body = jsonutils.dump_as_bytes(body)
         req.headers["content-type"] = "application/json"
 
         self.assertRaises(webob.exc.HTTPForbidden,
@@ -348,7 +342,7 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
                                       % image_id)
         req.method = 'POST'
         body = {"metadata": {"key1": "value1"}}
-        req.body = jsonutils.dumps(body)
+        req.body = jsonutils.dump_as_bytes(body)
         req.headers["content-type"] = "application/json"
 
         self.assertRaises(webob.exc.HTTPForbidden,
@@ -356,21 +350,26 @@ class ImageMetaDataTestV21(test.NoDBTestCase):
                           body=body)
 
 
-class ImageMetaDataTestV2(ImageMetaDataTestV21):
-    controller_class = image_metadata.Controller
-    invalid_request = webob.exc.HTTPBadRequest
+class ImageMetadataControllerV239(test.NoDBTestCase):
 
-    # NOTE(cyeoh): This duplicate unittest is necessary for a race condition
-    # with the V21 unittests. It's mock issue.
-    @mock.patch('nova.image.api.API.update')
-    @mock.patch('nova.image.api.API.get', return_value=get_image_123())
-    def test_delete(self, _get_mocked, update_mocked):
-        req = fakes.HTTPRequest.blank('/v2/fake/images/123/metadata/key1')
-        req.method = 'DELETE'
-        res = self.controller.delete(req, '123', 'key1')
-        expected = copy.deepcopy(get_image_123())
-        expected['properties'] = {}
-        update_mocked.assert_called_once_with(mock.ANY, '123', expected,
-                                             data=None, purge_props=True)
+    def setUp(self):
+        super(ImageMetadataControllerV239, self).setUp()
+        self.controller = image_metadata_v21.ImageMetadataController()
+        self.req = fakes.HTTPRequest.blank('', version='2.39')
 
-        self.assertIsNone(res)
+    def test_not_found_for_all_image_metadata_api(self):
+        self.assertRaises(exception.VersionNotFoundForAPIMethod,
+                          self.controller.index, self.req)
+        self.assertRaises(exception.VersionNotFoundForAPIMethod,
+                          self.controller.show, self.req, fakes.FAKE_UUID)
+        self.assertRaises(exception.VersionNotFoundForAPIMethod,
+                          self.controller.create, self.req,
+                          fakes.FAKE_UUID, {'metadata': {}})
+        self.assertRaises(exception.VersionNotFoundForAPIMethod,
+                          self.controller.update, self.req,
+                          fakes.FAKE_UUID, 'id', {'metadata': {}})
+        self.assertRaises(exception.VersionNotFoundForAPIMethod,
+                          self.controller.update_all, self.req,
+                          fakes.FAKE_UUID, {'metadata': {}})
+        self.assertRaises(exception.VersionNotFoundForAPIMethod,
+                          self.controller.delete, self.req, fakes.FAKE_UUID)

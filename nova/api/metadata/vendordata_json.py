@@ -17,41 +17,36 @@
 
 import errno
 
-from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 
-from nova.api.metadata import base
-from nova.i18n import _LW
+from nova.api.metadata import vendordata
+import nova.conf
 
-file_opt = cfg.StrOpt('vendordata_jsonfile_path',
-                      help='File to load JSON formatted vendor data from')
-
-CONF = cfg.CONF
-CONF.register_opt(file_opt)
+CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
 
 
-class JsonFileVendorData(base.VendorDataDriver):
+class JsonFileVendorData(vendordata.VendorDataDriver):
     def __init__(self, *args, **kwargs):
         super(JsonFileVendorData, self).__init__(*args, **kwargs)
         data = {}
-        fpath = CONF.vendordata_jsonfile_path
-        logprefix = "%s[%s]: " % (file_opt.name, fpath)
+        fpath = CONF.api.vendordata_jsonfile_path
+        logprefix = "vendordata_jsonfile_path[%s]:" % fpath
         if fpath:
             try:
-                with open(fpath, "r") as fp:
+                with open(fpath, "rb") as fp:
                     data = jsonutils.load(fp)
             except IOError as e:
                 if e.errno == errno.ENOENT:
-                    LOG.warning(_LW("%(logprefix)sfile does not exist"),
+                    LOG.warning("%(logprefix)s file does not exist",
                                 {'logprefix': logprefix})
                 else:
-                    LOG.warning(_LW("%(logprefix)unexpected IOError when "
-                                    "reading"), {'logprefix': logprefix})
-                raise e
+                    LOG.warning("%(logprefix)s unexpected IOError when "
+                                "reading", {'logprefix': logprefix})
+                raise
             except ValueError:
-                LOG.warning(_LW("%(logprefix)sfailed to load json"),
+                LOG.warning("%(logprefix)s failed to load json",
                             {'logprefix': logprefix})
                 raise
 

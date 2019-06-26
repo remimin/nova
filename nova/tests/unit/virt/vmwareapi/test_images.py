@@ -15,11 +15,11 @@
 Test suite for images.
 """
 
-import contextlib
 import os
 import tarfile
 
 import mock
+from oslo_utils.fixture import uuidsentinel
 from oslo_utils import units
 from oslo_vmware import rw_handles
 
@@ -29,6 +29,7 @@ from nova import test
 import nova.tests.unit.image.fake
 from nova.virt.vmwareapi import constants
 from nova.virt.vmwareapi import images
+from nova.virt.vmwareapi import vm_util
 
 
 class VMwareImagesTestCase(test.NoDBTestCase):
@@ -53,7 +54,7 @@ class VMwareImagesTestCase(test.NoDBTestCase):
         write_file_handle = mock.MagicMock()
         read_iter = mock.MagicMock()
         instance = objects.Instance(id=1,
-                                    uuid='fake-uuid',
+                                    uuid=uuidsentinel.foo,
                                     image_ref=image_data['id'])
 
         def fake_read_handle(read_iter):
@@ -63,17 +64,17 @@ class VMwareImagesTestCase(test.NoDBTestCase):
                               file_path, file_size):
             return write_file_handle
 
-        with contextlib.nested(
+        with test.nested(
              mock.patch.object(rw_handles, 'ImageReadHandle',
                                side_effect=fake_read_handle),
              mock.patch.object(rw_handles, 'FileWriteHandle',
                                side_effect=fake_write_handle),
-             mock.patch.object(images, 'start_transfer'),
+             mock.patch.object(images, 'image_transfer'),
              mock.patch.object(images.IMAGE_API, 'get',
                 return_value=image_data),
              mock.patch.object(images.IMAGE_API, 'download',
                      return_value=read_iter),
-        ) as (glance_read, http_write, start_transfer, image_show,
+        ) as (glance_read, http_write, image_transfer, image_show,
                 image_download):
             images.fetch_image(context, instance,
                                host, port, dc_name,
@@ -82,10 +83,8 @@ class VMwareImagesTestCase(test.NoDBTestCase):
         glance_read.assert_called_once_with(read_iter)
         http_write.assert_called_once_with(host, port, dc_name, ds_name, None,
                                            file_path, image_data['size'])
-        start_transfer.assert_called_once_with(
-                context, read_file_handle,
-                image_data['size'],
-                write_file_handle=write_file_handle)
+        image_transfer.assert_called_once_with(read_file_handle,
+                                               write_file_handle)
         image_download.assert_called_once_with(context, instance['image_ref'])
         image_show.assert_called_once_with(context, instance['image_ref'])
 
@@ -106,26 +105,27 @@ class VMwareImagesTestCase(test.NoDBTestCase):
     @mock.patch('oslo_vmware.rw_handles.ImageReadHandle')
     @mock.patch('oslo_vmware.rw_handles.VmdkWriteHandle')
     @mock.patch.object(tarfile, 'open')
-    @mock.patch.object(os, 'unlink')
-    def test_fetch_image_ova(self, mock_unlink, mock_tar_open,
-                             mock_write_class, mock_read_class):
+    def test_fetch_image_ova(self, mock_tar_open, mock_write_class,
+                             mock_read_class):
         session = mock.MagicMock()
         ovf_descriptor = None
         ovf_path = os.path.join(os.path.dirname(__file__), 'ovf.xml')
         with open(ovf_path) as f:
             ovf_descriptor = f.read()
 
-        with contextlib.nested(
+        with test.nested(
              mock.patch.object(images.IMAGE_API, 'get'),
              mock.patch.object(images.IMAGE_API, 'download'),
-             mock.patch.object(images, 'start_transfer'),
+             mock.patch.object(images, 'image_transfer'),
              mock.patch.object(images, '_build_shadow_vm_config_spec'),
-             mock.patch.object(session, '_call_method')
+             mock.patch.object(session, '_call_method'),
+             mock.patch.object(vm_util, 'get_vmdk_info')
         ) as (mock_image_api_get,
               mock_image_api_download,
-              mock_start_transfer,
+              mock_image_transfer,
               mock_build_shadow_vm_config_spec,
-              mock_call_method):
+              mock_call_method,
+              mock_get_vmdk_info):
             image_data = {'id': 'fake-id',
                           'disk_format': 'vmdk',
                           'size': 512}
@@ -150,11 +150,11 @@ class VMwareImagesTestCase(test.NoDBTestCase):
             mock_vmdk.name = "Damn_Small_Linux-disk1.vmdk"
 
             def fake_extract(name):
-                if name == mock_ovf.name:
+                if name == mock_ovf:
                     m = mock.MagicMock()
                     m.read.return_value = ovf_descriptor
                     return m
-                elif name == mock_vmdk.name:
+                elif name == mock_vmdk:
                     return mock_read_handle
 
             mock_tar = mock.MagicMock()
@@ -167,13 +167,14 @@ class VMwareImagesTestCase(test.NoDBTestCase):
                     context, instance, session, 'fake-vm', 'fake-datastore',
                     vm_folder_ref, res_pool_ref)
 
-            mock_start_transfer.assert_called_once_with(context,
-                    mock_read_handle, 512, write_file_handle=mock_write_handle)
-
+            mock_tar_open.assert_called_once_with(mode='r|',
+                                                  fileobj=mock_read_handle)
+            mock_image_transfer.assert_called_once_with(mock_read_handle,
+                                                        mock_write_handle)
+            mock_get_vmdk_info.assert_called_once_with(
+                    session, mock.sentinel.vm_ref, 'fake-vm')
             mock_call_method.assert_called_once_with(
                     session.vim, "UnregisterVM", mock.sentinel.vm_ref)
-
-            mock_unlink.assert_called_once_with(mock.ANY)
 
     @mock.patch('oslo_vmware.rw_handles.ImageReadHandle')
     @mock.patch('oslo_vmware.rw_handles.VmdkWriteHandle')
@@ -183,17 +184,19 @@ class VMwareImagesTestCase(test.NoDBTestCase):
         """Test fetching streamOptimized disk image."""
         session = mock.MagicMock()
 
-        with contextlib.nested(
+        with test.nested(
              mock.patch.object(images.IMAGE_API, 'get'),
              mock.patch.object(images.IMAGE_API, 'download'),
-             mock.patch.object(images, 'start_transfer'),
+             mock.patch.object(images, 'image_transfer'),
              mock.patch.object(images, '_build_shadow_vm_config_spec'),
-             mock.patch.object(session, '_call_method')
+             mock.patch.object(session, '_call_method'),
+             mock.patch.object(vm_util, 'get_vmdk_info')
         ) as (mock_image_api_get,
               mock_image_api_download,
-              mock_start_transfer,
+              mock_image_transfer,
               mock_build_shadow_vm_config_spec,
-              mock_call_method):
+              mock_call_method,
+              mock_get_vmdk_info):
             image_data = {'id': 'fake-id',
                           'disk_format': 'vmdk',
                           'size': 512}
@@ -216,11 +219,12 @@ class VMwareImagesTestCase(test.NoDBTestCase):
                     context, instance, session, 'fake-vm', 'fake-datastore',
                     vm_folder_ref, res_pool_ref)
 
-            mock_start_transfer.assert_called_once_with(context,
-                    mock_read_handle, 512, write_file_handle=mock_write_handle)
-
+            mock_image_transfer.assert_called_once_with(mock_read_handle,
+                                                        mock_write_handle)
             mock_call_method.assert_called_once_with(
                     session.vim, "UnregisterVM", mock.sentinel.vm_ref)
+            mock_get_vmdk_info.assert_called_once_with(
+                    session, mock.sentinel.vm_ref, 'fake-vm')
 
     def test_from_image_with_image_ref(self):
         raw_disk_size_in_gb = 83
@@ -233,9 +237,11 @@ class VMwareImagesTestCase(test.NoDBTestCase):
                      "vmware_adaptertype": constants.DEFAULT_ADAPTER_TYPE,
                      "vmware_disktype": constants.DEFAULT_DISK_TYPE,
                      "hw_vif_model": constants.DEFAULT_VIF_MODEL,
-                     images.LINKED_CLONE_PROPERTY: True}}
-
-        img_props = images.VMwareImage.from_image(image_id, mdata)
+                     "vmware_linked_clone": True}}
+        mdata = objects.ImageMeta.from_dict(mdata)
+        with mock.patch.object(images, 'get_vsphere_location',
+                               return_value=None):
+            img_props = images.VMwareImage.from_image(None, image_id, mdata)
 
         image_size_in_kb = raw_disk_size_in_bytes / units.Ki
 
@@ -253,7 +259,8 @@ class VMwareImagesTestCase(test.NoDBTestCase):
                      os_type=constants.DEFAULT_OS_TYPE,
                      adapter_type=constants.DEFAULT_ADAPTER_TYPE,
                      disk_type=constants.DEFAULT_DISK_TYPE,
-                     vif_model=constants.DEFAULT_VIF_MODEL):
+                     vif_model=constants.DEFAULT_VIF_MODEL,
+                     vsphere_location=None):
         self.flags(use_linked_clone=global_lc_setting, group='vmware')
         raw_disk_size_in_gb = 93
         raw_disk_size_in_btyes = raw_disk_size_in_gb * units.Gi
@@ -268,10 +275,13 @@ class VMwareImagesTestCase(test.NoDBTestCase):
                      "hw_vif_model": vif_model}}
 
         if image_lc_setting is not None:
-            mdata['properties'][
-                images.LINKED_CLONE_PROPERTY] = image_lc_setting
+            mdata['properties']["vmware_linked_clone"] = image_lc_setting
 
-        return images.VMwareImage.from_image(image_id, mdata)
+        context = mock.Mock()
+        mdata = objects.ImageMeta.from_dict(mdata)
+        with mock.patch.object(
+                images, 'get_vsphere_location', return_value=vsphere_location):
+            return images.VMwareImage.from_image(context, image_id, mdata)
 
     def test_use_linked_clone_override_nf(self):
         image_props = self._image_build(None, False)
@@ -303,11 +313,6 @@ class VMwareImagesTestCase(test.NoDBTestCase):
         self.assertTrue(image_props.linked_clone,
                         "image level metadata failed to override global")
 
-    def test_use_disk_format_none(self):
-        image = self._image_build(None, True, disk_format=None)
-        self.assertIsNone(image.file_type)
-        self.assertFalse(image.is_iso)
-
     def test_use_disk_format_iso(self):
         image = self._image_build(None, True, disk_format='iso')
         self.assertEqual('iso', image.file_type)
@@ -323,15 +328,15 @@ class VMwareImagesTestCase(test.NoDBTestCase):
     def test_image_no_defaults(self):
         image = self._image_build(False, False,
                                   disk_format='iso',
-                                  os_type='fake-os-type',
-                                  adapter_type='fake-adapter-type',
-                                  disk_type='fake-disk-type',
-                                  vif_model='fake-vif-model')
+                                  os_type='otherGuest',
+                                  adapter_type='lsiLogic',
+                                  disk_type='preallocated',
+                                  vif_model='e1000e')
         self.assertEqual('iso', image.file_type)
-        self.assertEqual('fake-os-type', image.os_type)
-        self.assertEqual('fake-adapter-type', image.adapter_type)
-        self.assertEqual('fake-disk-type', image.disk_type)
-        self.assertEqual('fake-vif-model', image.vif_model)
+        self.assertEqual('otherGuest', image.os_type)
+        self.assertEqual('lsiLogic', image.adapter_type)
+        self.assertEqual('preallocated', image.disk_type)
+        self.assertEqual('e1000e', image.vif_model)
         self.assertFalse(image.linked_clone)
 
     def test_image_defaults(self):
@@ -344,3 +349,27 @@ class VMwareImagesTestCase(test.NoDBTestCase):
         self.assertEqual('lsiLogic', image.adapter_type)
         self.assertEqual('preallocated', image.disk_type)
         self.assertEqual('e1000', image.vif_model)
+
+    def test_use_vsphere_location(self):
+        image = self._image_build(None, True, vsphere_location='vsphere://ok')
+        self.assertEqual('vsphere://ok', image.vsphere_location)
+
+    def test_get_vsphere_location(self):
+        expected = 'vsphere://ok'
+        metadata = {'locations': [{}, {'url': 'http://ko'}, {'url': expected}]}
+        with mock.patch.object(images.IMAGE_API, 'get', return_value=metadata):
+            context = mock.Mock()
+            observed = images.get_vsphere_location(context, 'image_id')
+            self.assertEqual(expected, observed)
+
+    def test_get_no_vsphere_location(self):
+        metadata = {'locations': [{}, {'url': 'http://ko'}]}
+        with mock.patch.object(images.IMAGE_API, 'get', return_value=metadata):
+            context = mock.Mock()
+            observed = images.get_vsphere_location(context, 'image_id')
+            self.assertIsNone(observed)
+
+    def test_get_vsphere_location_no_image(self):
+        context = mock.Mock()
+        observed = images.get_vsphere_location(context, None)
+        self.assertIsNone(observed)

@@ -16,8 +16,10 @@ images used by the compute layer.
 """
 
 from nova.image import glance
+from nova import profiler
 
 
+@profiler.trace_cls("nova_image")
 class API(object):
 
     """Responsible for exposing a relatively stable internal API for other
@@ -52,6 +54,16 @@ class API(object):
         #                 it, returning a real session object that keeps
         #                 the context alive...
         return glance.get_default_image_service()
+
+    @staticmethod
+    def generate_image_url(image_ref, context):
+        """Generate an image URL from an image_ref.
+
+        :param image_ref: The image ref to generate URL
+        :param context: The `nova.context.Context` object for the request
+        """
+        return "%s/images/%s" % (next(glance.get_api_servers(context)),
+                                 image_ref)
 
     def get_all(self, context, **kwargs):
         """Retrieves all information records about all disk images available
@@ -140,7 +152,8 @@ class API(object):
         session, image_id = self._get_session_and_image_id(context, id_or_uri)
         return session.delete(context, image_id)
 
-    def download(self, context, id_or_uri, data=None, dest_path=None):
+    def download(self, context, id_or_uri, data=None, dest_path=None,
+                 trusted_certs=None):
         """Transfer image bits from Glance or a known source location to the
         supplied destination filepath.
 
@@ -150,6 +163,9 @@ class API(object):
                           information for.
         :param data: A file object to use in downloading image data.
         :param dest_path: Filepath to transfer image bits to.
+        :param trusted_certs: A 'nova.objects.trusted_certs.TrustedCerts'
+                              object with a list of trusted image certificate
+                              IDs.
 
         Note that because of the poor design of the
         `glance.ImageService.download` method, the function returns different
@@ -179,4 +195,5 @@ class API(object):
         #                 handle streaming/copying/zero-copy as they see fit.
         session, image_id = self._get_session_and_image_id(context, id_or_uri)
         return session.download(context, image_id, data=data,
-                                dst_path=dest_path)
+                                dst_path=dest_path,
+                                trusted_certs=trusted_certs)

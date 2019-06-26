@@ -20,15 +20,15 @@ import re
 from oslo_log import log as logging
 from oslo_utils import timeutils
 from oslo_utils import uuidutils
+import six
 
+from nova import cache_utils
 from nova import context
 from nova import exception
 from nova.i18n import _
-from nova.i18n import _LI
 from nova.network import model as network_model
 from nova import objects
 from nova.objects import base as obj_base
-from nova.openstack.common import memorycache
 
 LOG = logging.getLogger(__name__)
 # NOTE(vish): cache mapping for one week
@@ -41,13 +41,13 @@ def memoize(func):
     def memoizer(context, reqid):
         global _CACHE
         if not _CACHE:
-            _CACHE = memorycache.get_client()
+            _CACHE = cache_utils.get_client(expiration_time=_CACHE_TIME)
         key = "%s:%s" % (func.__name__, reqid)
         key = str(key)
         value = _CACHE.get(key)
         if value is None:
             value = func(context, reqid)
-            _CACHE.set(key, value, time=_CACHE_TIME)
+            _CACHE.set(key, value)
         return value
     return memoizer
 
@@ -257,7 +257,6 @@ def is_ec2_timestamp_expired(request, expires=None):
     """Checks the timestamp or expiry time included in an EC2 request
     and returns true if the request is expired
     """
-    query_time = None
     timestamp = request.get('Timestamp')
     expiry_time = request.get('Expires')
 
@@ -289,7 +288,7 @@ def is_ec2_timestamp_expired(request, expires=None):
                        timeutils.is_newer_than(query_time, expires)
         return False
     except ValueError:
-        LOG.info(_LI("Timestamp is invalid."))
+        LOG.info("Timestamp is invalid.")
         return True
 
 
@@ -414,7 +413,7 @@ def dict_from_dotted_str(items):
     for key, value in items:
         parts = key.split(".")
         key = str(camelcase_to_underscore(parts[0]))
-        if isinstance(value, str) or isinstance(value, unicode):
+        if isinstance(value, six.string_types):
             # NOTE(vish): Automatically convert strings back
             #             into their respective values
             value = _try_convert(value)
@@ -454,7 +453,7 @@ def regex_from_ec2_regex(ec2_re):
             py_re += '.'
         elif char == '\\':
             try:
-                next_char = iter_ec2_re.next()
+                next_char = next(iter_ec2_re)
             except StopIteration:
                 next_char = ''
             if next_char == '*' or next_char == '?':

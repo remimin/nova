@@ -15,18 +15,15 @@
 #    under the License.
 
 import datetime
-import uuid as stdlib_uuid
 
+from oslo_policy import policy as oslo_policy
+from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
 import webob
 
-from nova.api.openstack.compute import consoles as consoles_v2
-from nova.api.openstack.compute.plugins.v3 import consoles as consoles_v21
+from nova.api.openstack.compute import consoles as consoles_v21
 from nova.compute import vm_states
-from nova import console
-from nova import db
 from nova import exception
-from nova.openstack.common import policy as common_policy
 from nova import policy
 from nova import test
 from nova.tests.unit.api.openstack import fakes
@@ -57,7 +54,7 @@ class FakeInstanceDB(object):
         if id is None:
             id = self.max_id + 1
         if uuid is None:
-            uuid = str(stdlib_uuid.uuid4())
+            uuid = uuids.fake
         instance = stub_instance(id, uuid=uuid)
         self.instances_by_id[id] = instance
         self.ids_by_uuid[uuid] = id
@@ -108,7 +105,6 @@ def stub_instance(id, user_id='fake', project_id='fake', host=None,
         "user_data": "",
         "reservation_id": reservation_id,
         "mac_address": "",
-        "scheduled_at": timeutils.utcnow(),
         "launched_at": timeutils.utcnow(),
         "terminated_at": timeutils.utcnow(),
         "availability_zone": "",
@@ -127,13 +123,12 @@ def stub_instance(id, user_id='fake', project_id='fake', host=None,
 class ConsolesControllerTestV21(test.NoDBTestCase):
     def setUp(self):
         super(ConsolesControllerTestV21, self).setUp()
-        self.flags(verbose=True)
         self.instance_db = FakeInstanceDB()
-        self.stubs.Set(db, 'instance_get',
-                       self.instance_db.return_server_by_id)
-        self.stubs.Set(db, 'instance_get_by_uuid',
-                       self.instance_db.return_server_by_uuid)
-        self.uuid = str(stdlib_uuid.uuid4())
+        self.stub_out('nova.db.api.instance_get',
+                      self.instance_db.return_server_by_id)
+        self.stub_out('nova.db.api.instance_get_by_uuid',
+                      self.instance_db.return_server_by_uuid)
+        self.uuid = uuids.fake
         self.url = '/v2/fake/servers/%s/consoles' % self.uuid
         self._set_up_controller()
 
@@ -144,7 +139,9 @@ class ConsolesControllerTestV21(test.NoDBTestCase):
         def fake_create_console(cons_self, context, instance_id):
             self.assertEqual(instance_id, self.uuid)
             return {}
-        self.stubs.Set(console.api.API, 'create_console', fake_create_console)
+
+        self.stub_out('nova.console.api.API.create_console',
+                      fake_create_console)
 
         req = fakes.HTTPRequest.blank(self.url)
         self.controller.create(req, self.uuid, None)
@@ -152,7 +149,9 @@ class ConsolesControllerTestV21(test.NoDBTestCase):
     def test_create_console_unknown_instance(self):
         def fake_create_console(cons_self, context, instance_id):
             raise exception.InstanceNotFound(instance_id=instance_id)
-        self.stubs.Set(console.api.API, 'create_console', fake_create_console)
+
+        self.stub_out('nova.console.api.API.create_console',
+                      fake_create_console)
 
         req = fakes.HTTPRequest.blank(self.url)
         self.assertRaises(webob.exc.HTTPNotFound, self.controller.create,
@@ -174,7 +173,7 @@ class ConsolesControllerTestV21(test.NoDBTestCase):
                                 'instance_name': 'inst-0001',
                                 'console_type': 'fake_type'}}
 
-        self.stubs.Set(console.api.API, 'get_console', fake_get_console)
+        self.stub_out('nova.console.api.API.get_console', fake_get_console)
 
         req = fakes.HTTPRequest.blank(self.url + '/20')
         res_dict = self.controller.show(req, self.uuid, '20')
@@ -184,7 +183,7 @@ class ConsolesControllerTestV21(test.NoDBTestCase):
         def fake_get_console(cons_self, context, instance_id, console_id):
             raise exception.ConsoleNotFound(console_id=console_id)
 
-        self.stubs.Set(console.api.API, 'get_console', fake_get_console)
+        self.stub_out('nova.console.api.API.get_console', fake_get_console)
 
         req = fakes.HTTPRequest.blank(self.url + '/20')
         self.assertRaises(webob.exc.HTTPNotFound, self.controller.show,
@@ -195,7 +194,7 @@ class ConsolesControllerTestV21(test.NoDBTestCase):
             raise exception.ConsoleNotFoundForInstance(
                 instance_uuid=instance_id)
 
-        self.stubs.Set(console.api.API, 'get_console', fake_get_console)
+        self.stub_out('nova.console.api.API.get_console', fake_get_console)
 
         req = fakes.HTTPRequest.blank(self.url + '/20')
         self.assertRaises(webob.exc.HTTPNotFound, self.controller.show,
@@ -219,7 +218,7 @@ class ConsolesControllerTestV21(test.NoDBTestCase):
                 [{'console': {'id': 10, 'console_type': 'fake_type'}},
                  {'console': {'id': 11, 'console_type': 'fake_type2'}}]}
 
-        self.stubs.Set(console.api.API, 'get_consoles', fake_get_consoles)
+        self.stub_out('nova.console.api.API.get_consoles', fake_get_consoles)
 
         req = fakes.HTTPRequest.blank(self.url)
         res_dict = self.controller.index(req, self.uuid)
@@ -238,8 +237,9 @@ class ConsolesControllerTestV21(test.NoDBTestCase):
             self.assertEqual(instance_id, self.uuid)
             self.assertEqual(console_id, 20)
 
-        self.stubs.Set(console.api.API, 'get_console', fake_get_console)
-        self.stubs.Set(console.api.API, 'delete_console', fake_delete_console)
+        self.stub_out('nova.console.api.API.get_console', fake_get_console)
+        self.stub_out('nova.console.api.API.delete_console',
+                      fake_delete_console)
 
         req = fakes.HTTPRequest.blank(self.url + '/20')
         self.controller.delete(req, self.uuid, '20')
@@ -248,7 +248,8 @@ class ConsolesControllerTestV21(test.NoDBTestCase):
         def fake_delete_console(cons_self, context, instance_id, console_id):
             raise exception.ConsoleNotFound(console_id=console_id)
 
-        self.stubs.Set(console.api.API, 'delete_console', fake_delete_console)
+        self.stub_out('nova.console.api.API.delete_console',
+                      fake_delete_console)
 
         req = fakes.HTTPRequest.blank(self.url + '/20')
         self.assertRaises(webob.exc.HTTPNotFound, self.controller.delete,
@@ -259,7 +260,8 @@ class ConsolesControllerTestV21(test.NoDBTestCase):
             raise exception.ConsoleNotFoundForInstance(
                 instance_uuid=instance_id)
 
-        self.stubs.Set(console.api.API, 'delete_console', fake_delete_console)
+        self.stub_out('nova.console.api.API.delete_console',
+                      fake_delete_console)
 
         req = fakes.HTTPRequest.blank(self.url + '/20')
         self.assertRaises(webob.exc.HTTPNotFound, self.controller.delete,
@@ -267,10 +269,10 @@ class ConsolesControllerTestV21(test.NoDBTestCase):
 
     def _test_fail_policy(self, rule, action, data=None):
         rules = {
-            rule: common_policy.parse_rule("!"),
+            rule: "!",
         }
 
-        policy.set_rules(rules)
+        policy.set_rules(oslo_policy.Rules.from_dict(rules))
         req = fakes.HTTPRequest.blank(self.url + '/20')
 
         if data is not None:
@@ -295,12 +297,3 @@ class ConsolesControllerTestV21(test.NoDBTestCase):
     def test_show_console_fail_policy(self):
         self._test_fail_policy("os_compute_api:os-consoles:show",
                                self.controller.show, data='20')
-
-
-class ConsolesControllerTestV2(ConsolesControllerTestV21):
-    def _set_up_controller(self):
-        self.controller = consoles_v2.Controller()
-
-    def _test_fail_policy(self, rule, action, data=None):
-        # V2 API don't have policy
-        pass

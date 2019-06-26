@@ -16,9 +16,24 @@
 import shutil
 import tarfile
 
+from oslo_utils import importutils
+
+from nova import exception
 from nova import image
 
+_VDI_FORMAT_RAW = 1
+
 IMAGE_API = image.API()
+IMAGE_HANDLERS = {'direct_vhd': 'glance.GlanceStore',
+                  'vdi_local_dev': 'vdi_through_dev.VdiThroughDevStore',
+                  'vdi_remote_stream': 'vdi_stream.VdiStreamStore'}
+
+
+def get_image_handler(handler_name):
+    if handler_name not in IMAGE_HANDLERS:
+        raise exception.ImageHandlerUnsupported(image_handler=handler_name)
+    return importutils.import_object('nova.virt.xenapi.image.'
+                                     '%s' % IMAGE_HANDLERS[handler_name])
 
 
 class GlanceImage(object):
@@ -71,7 +86,7 @@ class IterableToFileAdapter(object):
         chunk = self.remaining_data
         try:
             while not chunk:
-                chunk = self.iterator.next()
+                chunk = next(self.iterator)
         except StopIteration:
             return ''
         return_value = chunk[0:size]

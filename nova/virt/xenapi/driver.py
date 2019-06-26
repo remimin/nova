@@ -25,16 +25,19 @@ A driver for XenServer or Xen Cloud Platform.
 
 import math
 
-from oslo_config import cfg
+import os_resource_classes as orc
+from os_xenapi.client import session
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import units
+from oslo_utils import versionutils
+
 import six.moves.urllib.parse as urlparse
 
-from nova.i18n import _, _LE, _LW
-from nova import utils
+import nova.conf
+from nova import exception
+from nova.i18n import _
 from nova.virt import driver
-from nova.virt.xenapi.client import session
 from nova.virt.xenapi import host
 from nova.virt.xenapi import pool
 from nova.virt.xenapi import vm_utils
@@ -43,66 +46,48 @@ from nova.virt.xenapi import volumeops
 
 LOG = logging.getLogger(__name__)
 
-xenapi_opts = [
-    cfg.StrOpt('connection_url',
-               help='URL for connection to XenServer/Xen Cloud Platform. '
-                    'A special value of unix://local can be used to connect '
-                    'to the local unix socket.  '
-                    'Required if compute_driver=xenapi.XenAPIDriver'),
-    cfg.StrOpt('connection_username',
-               default='root',
-               help='Username for connection to XenServer/Xen Cloud Platform. '
-                    'Used only if compute_driver=xenapi.XenAPIDriver'),
-    cfg.StrOpt('connection_password',
-               help='Password for connection to XenServer/Xen Cloud Platform. '
-                    'Used only if compute_driver=xenapi.XenAPIDriver',
-               secret=True),
-    cfg.FloatOpt('vhd_coalesce_poll_interval',
-                 default=5.0,
-                 help='The interval used for polling of coalescing vhds. '
-                      'Used only if compute_driver=xenapi.XenAPIDriver'),
-    cfg.BoolOpt('check_host',
-                default=True,
-                help='Ensure compute service is running on host XenAPI '
-                     'connects to.'),
-    cfg.IntOpt('vhd_coalesce_max_attempts',
-               default=20,
-               help='Max number of times to poll for VHD to coalesce. '
-                    'Used only if compute_driver=xenapi.XenAPIDriver'),
-    cfg.StrOpt('sr_base_path',
-               default='/var/run/sr-mount',
-               help='Base path to the storage repository'),
-    cfg.StrOpt('target_host',
-               help='The iSCSI Target Host'),
-    cfg.StrOpt('target_port',
-               default='3260',
-               help='The iSCSI Target Port, default is port 3260'),
-    cfg.StrOpt('iqn_prefix',
-               default='iqn.2010-10.org.openstack',
-               help='IQN Prefix'),
-    # NOTE(sirp): This is a work-around for a bug in Ubuntu Maverick,
-    # when we pull support for it, we should remove this
-    cfg.BoolOpt('remap_vbd_dev',
-                default=False,
-                help='Used to enable the remapping of VBD dev '
-                     '(Works around an issue in Ubuntu Maverick)'),
-    cfg.StrOpt('remap_vbd_dev_prefix',
-               default='sd',
-               help='Specify prefix to remap VBD dev to '
-                    '(ex. /dev/xvdb -> /dev/sdb)'),
-    ]
-
-CONF = cfg.CONF
-CONF.register_opts(xenapi_opts, 'xenserver')
-CONF.import_opt('host', 'nova.netconf')
+CONF = nova.conf.CONF
 
 OVERHEAD_BASE = 3
 OVERHEAD_PER_MB = 0.00781
 OVERHEAD_PER_VCPU = 1.5
 
 
+def invalid_option(option_name, recommended_value):
+    LOG.exception(_('Current value of '
+                    'CONF.xenserver.%(option)s option incompatible with '
+                    'CONF.xenserver.independent_compute=True.  '
+                    'Consider using "%(recommended)s"'),
+                  {'option': option_name,
+                   'recommended': recommended_value})
+    raise exception.NotSupportedWithOption(
+        operation=option_name,
+        option='CONF.xenserver.independent_compute')
+
+
 class XenAPIDriver(driver.ComputeDriver):
     """A connection to XenServer or Xen Cloud Platform."""
+    capabilities = {
+        "has_imagecache": False,
+        "supports_evacuate": False,
+        "supports_migrate_to_same_host": False,
+        "supports_attach_interface": True,
+        "supports_device_tagging": True,
+        "supports_multiattach": False,
+        "supports_trusted_certs": False,
+
+        # Image type support flags
+        "supports_image_type_aki": False,
+        "supports_image_type_ami": False,
+        "supports_image_type_ari": False,
+        "supports_image_type_iso": False,
+        "supports_image_type_qcow2": False,
+        "supports_image_type_raw": True,
+        "supports_image_type_vdi": True,
+        "supports_image_type_vhd": True,
+        "supports_image_type_vhdx": False,
+        "supports_image_type_vmdk": False,
+    }
 
     def __init__(self, virtapi, read_only=False):
         super(XenAPIDriver, self).__init__(virtapi)
@@ -116,7 +101,8 @@ class XenAPIDriver(driver.ComputeDriver):
                               'connection_password to use '
                               'compute_driver=xenapi.XenAPIDriver'))
 
-        self._session = session.XenAPISession(url, username, password)
+        self._session = session.XenAPISession(url, username, password,
+                                              originator="nova")
         self._volumeops = volumeops.VolumeOps(self._session)
         self._host_state = None
         self._host = host.Host(self._session, self.virtapi)
@@ -132,13 +118,30 @@ class XenAPIDriver(driver.ComputeDriver):
         return self._host_state
 
     def init_host(self, host):
+        # TODO(mriedem): Consider deprecating the driver if there is still no
+        # working 3rd party CI by the end of the Train release.
+        LOG.warning('The xenapi driver is not tested by the OpenStack '
+                    'project and thus its quality can not be ensured. The '
+                    'driver may be deprecated in the future.')
+
+        if CONF.xenserver.independent_compute:
+            # Check various options are in the correct state:
+            if CONF.xenserver.check_host:
+                invalid_option('CONF.xenserver.check_host', False)
+            if CONF.flat_injected:
+                invalid_option('CONF.flat_injected', False)
+            if CONF.default_ephemeral_format and \
+               CONF.default_ephemeral_format != 'ext3':
+                invalid_option('CONF.default_ephemeral_format', 'ext3')
+
         if CONF.xenserver.check_host:
             vm_utils.ensure_correct_host(self._session)
 
-        try:
-            vm_utils.cleanup_attached_vdis(self._session)
-        except Exception:
-            LOG.exception(_LE('Failure while cleaning up attached VDIs'))
+        if not CONF.xenserver.independent_compute:
+            try:
+                vm_utils.cleanup_attached_vdis(self._session)
+            except Exception:
+                LOG.exception(_('Failure while cleaning up attached VDIs'))
 
     def instance_exists(self, instance):
         """Checks existence of an instance on the host.
@@ -170,8 +173,9 @@ class XenAPIDriver(driver.ComputeDriver):
         # Some padding is done to each value to fit all available VM data
         memory_mb = instance_info['memory_mb']
         vcpus = instance_info.get('vcpus', 1)
-        overhead = ((memory_mb * OVERHEAD_PER_MB) + (vcpus * OVERHEAD_PER_VCPU)
-                        + OVERHEAD_BASE)
+        overhead = ((memory_mb * OVERHEAD_PER_MB) +
+                    (vcpus * OVERHEAD_PER_VCPU) +
+                    OVERHEAD_BASE)
         overhead = math.ceil(overhead)
         return {'memory_mb': overhead}
 
@@ -185,15 +189,68 @@ class XenAPIDriver(driver.ComputeDriver):
         """
         return self._vmops.list_instance_uuids()
 
-    def spawn(self, context, instance, image_meta, injected_files,
-              admin_password, network_info=None, block_device_info=None):
-        """Create VM instance."""
-        self._vmops.spawn(context, instance, image_meta, injected_files,
-                          admin_password, network_info, block_device_info)
+    def _is_vgpu_allocated(self, allocations):
+        # check if allocated vGPUs
+        if not allocations:
+            # If no allocations, there is no vGPU request.
+            return False
+        RC_VGPU = orc.VGPU
+        for rp in allocations:
+            res = allocations[rp]['resources']
+            if res and RC_VGPU in res and res[RC_VGPU] > 0:
+                return True
+        return False
 
-    def confirm_migration(self, migration, instance, network_info):
+    def _get_vgpu_info(self, allocations):
+        """Get vGPU info basing on the allocations.
+
+        :param allocations: Information about resources allocated to the
+                            instance via placement, of the form returned by
+                            SchedulerReportClient.get_allocations_for_consumer.
+        :returns: Dictionary describing vGPU info if any vGPU allocated;
+                  None otherwise.
+        :raises: exception.ComputeResourcesUnavailable if there is no
+                 available vGPUs.
+        """
+        if not self._is_vgpu_allocated(allocations):
+            return None
+
+        # NOTE(jianghuaw): At the moment, we associate all vGPUs resource to
+        # the compute node regardless which GPU group the vGPUs belong to, so
+        # we need search all GPU groups until we got one group which has
+        # remaining capacity to supply one vGPU. Once we switch to the
+        # nested resource providers, the allocations will contain the resource
+        # provider which represents a particular GPU group. It's able to get
+        # the GPU group and vGPU type directly by using the resource provider's
+        # uuid. Then we can consider moving this function to vmops, as there is
+        # no need to query host stats to get all GPU groups.
+        host_stats = self.host_state.get_host_stats(refresh=True)
+        vgpu_stats = host_stats['vgpu_stats']
+        for grp_uuid in vgpu_stats:
+            if vgpu_stats[grp_uuid]['remaining'] > 0:
+                # NOTE(jianghuaw): As XenServer only supports single vGPU per
+                # VM, we've restricted the inventory data having `max_unit` as
+                # 1. If it reached here, surely only one GPU is allocated.
+                # So just return the GPU group uuid and vGPU type uuid once
+                # we got one group which still has remaining vGPUs.
+                return dict(gpu_grp_uuid=grp_uuid,
+                            vgpu_type_uuid=vgpu_stats[grp_uuid]['uuid'])
+        # No remaining vGPU available: e.g. the vGPU resource has been used by
+        # other instance or the vGPU has been changed to be disabled.
+        raise exception.ComputeResourcesUnavailable(
+            reason='vGPU resource is not available')
+
+    def spawn(self, context, instance, image_meta, injected_files,
+              admin_password, allocations, network_info=None,
+              block_device_info=None):
+        """Create VM instance."""
+        vgpu_info = self._get_vgpu_info(allocations)
+        self._vmops.spawn(context, instance, image_meta, injected_files,
+                          admin_password, network_info, block_device_info,
+                          vgpu_info)
+
+    def confirm_migration(self, context, migration, instance, network_info):
         """Confirms a resize, destroying the source VM."""
-        # TODO(Vek): Need to pass context in for access to auth_token
         self._vmops.confirm_migration(migration, instance, network_info)
 
     def finish_revert_migration(self, context, instance, network_info,
@@ -241,7 +298,7 @@ class XenAPIDriver(driver.ComputeDriver):
         self._vmops.change_instance_metadata(instance, diff)
 
     def destroy(self, context, instance, network_info, block_device_info=None,
-                destroy_disks=True, migrate_data=None):
+                destroy_disks=True):
         """Destroy VM instance."""
         self._vmops.destroy(instance, network_info, block_device_info,
                             destroy_disks)
@@ -331,7 +388,7 @@ class XenAPIDriver(driver.ComputeDriver):
         """Unplug VIFs from networks."""
         self._vmops.unplug_vifs(instance, network_info)
 
-    def get_info(self, instance):
+    def get_info(self, instance, use_cache=True):
         """Return data about VM instance."""
         return self._vmops.get_info(instance)
 
@@ -357,7 +414,7 @@ class XenAPIDriver(driver.ComputeDriver):
         # of mac addresses with values that are the bw counters:
         # e.g. {'instance-001' : { 12:34:56:78:90:12 : {'bw_in': 0, ....}}
         all_counters = self._vmops.get_all_bw_counters()
-        for instance_name, counters in all_counters.iteritems():
+        for instance_name, counters in all_counters.items():
             if instance_name in imap:
                 # yes these are stats for a nova-managed vm
                 # correlate the stats with the nova instance uuid:
@@ -382,7 +439,7 @@ class XenAPIDriver(driver.ComputeDriver):
                 self._initiator = stats['host_other-config']['iscsi_iqn']
                 self._hypervisor_hostname = stats['host_hostname']
             except (TypeError, KeyError) as err:
-                LOG.warning(_LW('Could not determine key: %s'), err,
+                LOG.warning('Could not determine key: %s', err,
                             instance=instance)
                 self._initiator = None
         return {
@@ -397,8 +454,7 @@ class XenAPIDriver(driver.ComputeDriver):
             return CONF.my_block_storage_ip
         return self.get_host_ip_addr()
 
-    @staticmethod
-    def get_host_ip_addr():
+    def get_host_ip_addr(self):
         xs_url = urlparse.urlparse(CONF.xenserver.connection_url)
         return xs_url.netloc
 
@@ -409,7 +465,7 @@ class XenAPIDriver(driver.ComputeDriver):
                                       instance['name'],
                                       mountpoint)
 
-    def detach_volume(self, connection_info, instance, mountpoint,
+    def detach_volume(self, context, connection_info, instance, mountpoint,
                       encryption=None):
         """Detach volume storage from VM instance."""
         self._volumeops.detach_volume(connection_info,
@@ -421,6 +477,63 @@ class XenAPIDriver(driver.ComputeDriver):
         return {'address': xs_url.netloc,
                 'username': CONF.xenserver.connection_username,
                 'password': CONF.xenserver.connection_password}
+
+    def _get_vgpu_total(self, vgpu_stats):
+        # NOTE(jianghuaw): Now we only enable one vGPU type in one
+        # compute node. So normally vgpu_stats should contain only
+        # one GPU group. If there are multiple GPU groups, they
+        # must contain the same vGPU type. So just add them up.
+        total = 0
+        for grp_id in vgpu_stats:
+            total += vgpu_stats[grp_id]['total']
+        return total
+
+    def get_inventory(self, nodename):
+        """Return a dict, keyed by resource class, of inventory information for
+        the supplied node.
+        """
+        host_stats = self.host_state.get_host_stats(refresh=True)
+
+        vcpus = host_stats['host_cpu_info']['cpu_count']
+        memory_mb = int(host_stats['host_memory_total'] / units.Mi)
+        disk_gb = int(host_stats['disk_total'] / units.Gi)
+        vgpus = self._get_vgpu_total(host_stats['vgpu_stats'])
+
+        result = {
+            orc.VCPU: {
+                'total': vcpus,
+                'min_unit': 1,
+                'max_unit': vcpus,
+                'step_size': 1,
+            },
+            orc.MEMORY_MB: {
+                'total': memory_mb,
+                'min_unit': 1,
+                'max_unit': memory_mb,
+                'step_size': 1,
+            },
+            orc.DISK_GB: {
+                'total': disk_gb,
+                'min_unit': 1,
+                'max_unit': disk_gb,
+                'step_size': 1,
+            },
+        }
+        if vgpus > 0:
+            # Only create inventory for vGPU when driver can supply vGPUs.
+            # At the moment, XenAPI can support up to one vGPU per VM,
+            # so max_unit is 1.
+            result.update(
+                {
+                    orc.VGPU: {
+                        'total': vgpus,
+                        'min_unit': 1,
+                        'max_unit': 1,
+                        'step_size': 1,
+                    }
+                }
+            )
+        return result
 
     def get_available_resource(self, nodename):
         """Retrieve resource information.
@@ -442,20 +555,20 @@ class XenAPIDriver(driver.ComputeDriver):
         total_disk_gb = host_stats['disk_total'] / units.Gi
         used_disk_gb = host_stats['disk_used'] / units.Gi
         allocated_disk_gb = host_stats['disk_allocated'] / units.Gi
-        hyper_ver = utils.convert_version_to_int(self._session.product_version)
+        hyper_ver = versionutils.convert_version_to_int(
+                                                self._session.product_version)
         dic = {'vcpus': host_stats['host_cpu_info']['cpu_count'],
                'memory_mb': total_ram_mb,
                'local_gb': total_disk_gb,
                'vcpus_used': host_stats['vcpus_used'],
                'memory_mb_used': total_ram_mb - free_ram_mb,
                'local_gb_used': used_disk_gb,
-               'hypervisor_type': 'xen',
+               'hypervisor_type': 'XenServer',
                'hypervisor_version': hyper_ver,
                'hypervisor_hostname': host_stats['host_hostname'],
                'cpu_info': jsonutils.dumps(host_stats['cpu_model']),
                'disk_available_least': total_disk_gb - allocated_disk_gb,
-               'supported_instances': jsonutils.dumps(
-                   host_stats['supported_instances']),
+               'supported_instances': host_stats['supported_instances'],
                'pci_passthrough_devices': jsonutils.dumps(
                    host_stats['pci_passthrough_devices']),
                'numa_topology': None}
@@ -477,15 +590,15 @@ class XenAPIDriver(driver.ComputeDriver):
         :param instance: nova.db.sqlalchemy.models.Instance object
         :param block_migration: if true, prepare for block migration
         :param disk_over_commit: if true, allow disk over commit
-
+        :returns: a XenapiLiveMigrateData object
         """
         return self._vmops.check_can_live_migrate_destination(context,
                                                               instance,
                                                               block_migration,
                                                               disk_over_commit)
 
-    def check_can_live_migrate_destination_cleanup(self, context,
-                                                   dest_check_data):
+    def cleanup_live_migration_destination_check(self, context,
+                                                 dest_check_data):
         """Do required cleanup on dest host after check_can_live_migrate calls
 
         :param context: security context
@@ -505,6 +618,7 @@ class XenAPIDriver(driver.ComputeDriver):
         :param dest_check_data: result of check_can_live_migrate_destination
                                 includes the block_migration flag
         :param block_device_info: result of _get_instance_block_device_info
+        :returns: a XenapiLiveMigrateData object
         """
         return self._vmops.check_can_live_migrate_source(context, instance,
                                                          dest_check_data)
@@ -533,7 +647,7 @@ class XenAPIDriver(driver.ComputeDriver):
             recovery method when any exception occurs.
             expected nova.compute.manager._rollback_live_migration.
         :param block_migration: if true, migrate VM disk.
-        :param migrate_data: implementation specific params
+        :param migrate_data: a XenapiLiveMigrateData object
         """
         self._vmops.live_migrate(context, instance, dest, post_method,
                                  recover_method, block_migration, migrate_data)
@@ -543,25 +657,38 @@ class XenAPIDriver(driver.ComputeDriver):
                                                block_device_info,
                                                destroy_disks=True,
                                                migrate_data=None):
+        """Performs a live migration rollback.
+
+        :param context: security context
+        :param instance: instance object that was being migrated
+        :param network_info: instance network information
+        :param block_device_info: instance block device information
+        :param destroy_disks:
+            if true, destroy disks at destination during cleanup
+        :param migrate_data: A XenapiLiveMigrateData object
+        """
+
         # NOTE(johngarbutt) Destroying the VM is not appropriate here
         # and in the cases where it might make sense,
         # XenServer has already done it.
-        # TODO(johngarbutt) investigate if any cleanup is required here
-        pass
+        # NOTE(sulo): The only cleanup we do explicitly is to forget
+        # any volume that was attached to the destination during
+        # live migration. XAPI should take care of all other cleanup.
+        self._vmops.rollback_live_migration_at_destination(instance,
+                                                           network_info,
+                                                           block_device_info)
 
     def pre_live_migration(self, context, instance, block_device_info,
-                           network_info, disk_info, migrate_data=None):
+                           network_info, disk_info, migrate_data):
         """Preparation live migration.
 
         :param block_device_info:
             It must be the result of _get_instance_volume_bdms()
             at compute manager.
+        :returns: a XenapiLiveMigrateData object
         """
-        # TODO(JohnGarbutt) look again when boot-from-volume hits trunk
-        pre_live_migration_result = {}
-        pre_live_migration_result['sr_uuid_map'] = \
-                 self._vmops.connect_block_device_volumes(block_device_info)
-        return pre_live_migration_result
+        return self._vmops.pre_live_migration(context, instance,
+                block_device_info, network_info, disk_info, migrate_data)
 
     def post_live_migration(self, context, instance, block_device_info,
                             migrate_data=None):
@@ -570,9 +697,19 @@ class XenAPIDriver(driver.ComputeDriver):
         :param context: security context
         :instance: instance object that was migrated
         :block_device_info: instance block device information
-        :param migrate_data: if not None, it is a dict which has data
+        :param migrate_data: a XenapiLiveMigrateData object
         """
         self._vmops.post_live_migration(context, instance, migrate_data)
+
+    def post_live_migration_at_source(self, context, instance, network_info):
+        """Unplug VIFs from networks at source.
+
+        :param context: security context
+        :param instance: instance object reference
+        :param network_info: instance network information
+        """
+        self._vmops.post_live_migration_at_source(context, instance,
+                                                  network_info)
 
     def post_live_migration_at_destination(self, context, instance,
                                            network_info,
@@ -603,14 +740,6 @@ class XenAPIDriver(driver.ComputeDriver):
         """
         return self._vmops.refresh_security_group_rules(security_group_id)
 
-    def refresh_security_group_members(self, security_group_id):
-        """Updates security group rules for all instances associated with a
-        given security group.
-
-        Invoked when instances are added/removed to a security group.
-        """
-        return self._vmops.refresh_security_group_members(security_group_id)
-
     def refresh_instance_security_rules(self, instance):
         """Updates security group rules for specified instance.
 
@@ -618,9 +747,6 @@ class XenAPIDriver(driver.ComputeDriver):
         or when a rule is added/removed to a security group.
         """
         return self._vmops.refresh_instance_security_rules(instance)
-
-    def refresh_provider_fw_rules(self):
-        return self._vmops.refresh_provider_fw_rules()
 
     def get_available_nodes(self, refresh=False):
         stats = self.host_state.get_host_stats(refresh=refresh)
@@ -679,3 +805,39 @@ class XenAPIDriver(driver.ComputeDriver):
         :returns: dict of  nova uuid => dict of usage info
         """
         return self._vmops.get_per_instance_usage()
+
+    def attach_interface(self, context, instance, image_meta, vif):
+        """Use hotplug to add a network interface to a running instance.
+
+        The counter action to this is :func:`detach_interface`.
+
+        :param context: The request context.
+        :param nova.objects.instance.Instance instance:
+            The instance which will get an additional network interface.
+        :param nova.objects.ImageMeta image_meta:
+            The metadata of the image of the instance.
+        :param nova.network.model.VIF vif:
+            The object which has the information about the interface to attach.
+
+        :raise nova.exception.NovaException: If the attach fails.
+
+        :return: None
+        """
+        self._vmops.attach_interface(instance, vif)
+
+    def detach_interface(self, context, instance, vif):
+        """Use hotunplug to remove a network interface from a running instance.
+
+        The counter action to this is :func:`attach_interface`.
+
+        :param context: The request context.
+        :param nova.objects.instance.Instance instance:
+            The instance which gets a network interface removed.
+        :param nova.network.model.VIF vif:
+            The object which has the information about the interface to detach.
+
+        :raise nova.exception.NovaException: If the detach fails.
+
+        :return: None
+        """
+        self._vmops.detach_interface(instance, vif)

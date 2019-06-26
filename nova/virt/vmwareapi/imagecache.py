@@ -32,7 +32,7 @@ If an image is used then the timestamps will be deleted.
 When accessing a timestamp we make use of locking. This ensure that aging
 will not delete an image during the spawn operation. When spawning
 the timestamp folder will be locked  and the timestamps will be purged.
-This will ensure that a image is not deleted during the spawn.
+This will ensure that an image is not deleted during the spawn.
 """
 
 from oslo_concurrency import lockutils
@@ -40,17 +40,14 @@ from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import timeutils
 from oslo_vmware import exceptions as vexc
+from oslo_vmware import vim_util as vutil
 
-from nova.i18n import _LI, _LW
 from nova.virt import imagecache
 from nova.virt.vmwareapi import ds_util
-from nova.virt.vmwareapi import vim_util
 
 LOG = logging.getLogger(__name__)
 
 CONF = cfg.CONF
-CONF.import_opt('remove_unused_original_minimum_age_seconds',
-                'nova.virt.imagecache')
 
 TIMESTAMP_PREFIX = 'ts-'
 TIMESTAMP_FORMAT = '%Y-%m-%d-%H-%M-%S'
@@ -71,7 +68,7 @@ class ImageCacheManager(imagecache.ImageCacheManager):
                 vexc.FileLockedException) as e:
             # There may be more than one process or thread that tries
             # to delete the file.
-            LOG.warning(_LW("Unable to delete %(file)s. Exception: %(ex)s"),
+            LOG.warning("Unable to delete %(file)s. Exception: %(ex)s",
                         {'file': ds_path, 'ex': e})
         except vexc.FileNotFoundException:
             LOG.debug("File not found: %s", ds_path)
@@ -85,7 +82,7 @@ class ImageCacheManager(imagecache.ImageCacheManager):
         # is going to be used now.
         path = self.timestamp_folder_get(cache_root_folder, image_id)
 
-        # Lock to ensure that the spawn will not try and access a image
+        # Lock to ensure that the spawn will not try and access an image
         # that is currently being deleted on the datastore.
         with lockutils.lock(str(path), lock_file_prefix='nova-vmware-ts',
                             external=True):
@@ -112,7 +109,7 @@ class ImageCacheManager(imagecache.ImageCacheManager):
 
     def _get_timestamp_filename(self):
         return '%s%s' % (TIMESTAMP_PREFIX,
-                         timeutils.strtime(fmt=TIMESTAMP_FORMAT))
+                         timeutils.utcnow().strftime(TIMESTAMP_FORMAT))
 
     def _get_datetime_from_filename(self, timestamp_filename):
         ts = timestamp_filename.lstrip(TIMESTAMP_PREFIX)
@@ -121,9 +118,9 @@ class ImageCacheManager(imagecache.ImageCacheManager):
     def _get_ds_browser(self, ds_ref):
         ds_browser = self._ds_browser.get(ds_ref.value)
         if not ds_browser:
-            ds_browser = vim_util.get_dynamic_property(
-                    self._session.vim, ds_ref,
-                    "Datastore", "browser")
+            ds_browser = vutil.get_object_property(self._session.vim,
+                                                   ds_ref,
+                                                   "browser")
             self._ds_browser[ds_ref.value] = ds_browser
         return ds_browser
 
@@ -148,7 +145,7 @@ class ImageCacheManager(imagecache.ImageCacheManager):
         ds_browser = self._get_ds_browser(datastore.ref)
         for image in unused_images:
             path = self.timestamp_folder_get(ds_path, image)
-            # Lock to ensure that the spawn will not try and access a image
+            # Lock to ensure that the spawn will not try and access an image
             # that is currently being deleted on the datastore.
             with lockutils.lock(str(path), lock_file_prefix='nova-vmware-ts',
                                 external=True):
@@ -159,13 +156,12 @@ class ImageCacheManager(imagecache.ImageCacheManager):
                         ds_util.mkdir(self._session, ts_path, dc_info.ref)
                     except vexc.FileAlreadyExistsException:
                         LOG.debug("Timestamp already exists.")
-                    LOG.info(_LI("Image %s is no longer used by this node. "
-                                 "Pending deletion!"), image)
+                    LOG.info("Image %s is no longer used by this node. "
+                             "Pending deletion!", image)
                 else:
                     dt = self._get_datetime_from_filename(str(ts))
                     if timeutils.is_older_than(dt, age_seconds):
-                        LOG.info(_LI("Image %s is no longer used. "
-                                     "Deleting!"), path)
+                        LOG.info("Image %s is no longer used. Deleting!", path)
                         # Image has aged - delete the image ID folder
                         self._folder_delete(path, dc_info.ref)
 

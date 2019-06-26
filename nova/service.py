@@ -22,101 +22,88 @@ import random
 import sys
 
 from oslo_concurrency import processutils
-from oslo_config import cfg
 from oslo_log import log as logging
 import oslo_messaging as messaging
+from oslo_service import service
 from oslo_utils import importutils
 
+from nova.api import wsgi as api_wsgi
 from nova import baserpc
 from nova import conductor
+import nova.conf
 from nova import context
 from nova import debugger
 from nova import exception
 from nova.i18n import _, _LE, _LI, _LW
+from nova import objects
 from nova.objects import base as objects_base
-from nova.openstack.common import service
+from nova.objects import service as service_obj
 from nova import rpc
 from nova import servicegroup
 from nova import utils
 from nova import version
 from nova import wsgi
 
+osprofiler = importutils.try_import("osprofiler")
+osprofiler_initializer = importutils.try_import("osprofiler.initializer")
+
+
 LOG = logging.getLogger(__name__)
 
-service_opts = [
-    cfg.IntOpt('report_interval',
-               default=10,
-               help='Seconds between nodes reporting state to datastore'),
-    cfg.BoolOpt('periodic_enable',
-               default=True,
-               help='Enable periodic tasks'),
-    cfg.IntOpt('periodic_fuzzy_delay',
-               default=60,
-               help='Range of seconds to randomly delay when starting the'
-                    ' periodic task scheduler to reduce stampeding.'
-                    ' (Disable by setting to 0)'),
-    cfg.ListOpt('enabled_apis',
-                default=['ec2', 'osapi_compute', 'metadata'],
-                help='A list of APIs to enable by default'),
-    cfg.ListOpt('enabled_ssl_apis',
-                default=[],
-                help='A list of APIs with enabled SSL'),
-    cfg.StrOpt('ec2_listen',
-               default="0.0.0.0",
-               help='The IP address on which the EC2 API will listen.'),
-    cfg.IntOpt('ec2_listen_port',
-               default=8773,
-               help='The port on which the EC2 API will listen.'),
-    cfg.IntOpt('ec2_workers',
-               help='Number of workers for EC2 API service. The default will '
-                    'be equal to the number of CPUs available.'),
-    cfg.StrOpt('osapi_compute_listen',
-               default="0.0.0.0",
-               help='The IP address on which the OpenStack API will listen.'),
-    cfg.IntOpt('osapi_compute_listen_port',
-               default=8774,
-               help='The port on which the OpenStack API will listen.'),
-    cfg.IntOpt('osapi_compute_workers',
-               help='Number of workers for OpenStack API service. The default '
-                    'will be the number of CPUs available.'),
-    cfg.StrOpt('metadata_manager',
-               default='nova.api.manager.MetadataManager',
-               help='OpenStack metadata service manager'),
-    cfg.StrOpt('metadata_listen',
-               default="0.0.0.0",
-               help='The IP address on which the metadata API will listen.'),
-    cfg.IntOpt('metadata_listen_port',
-               default=8775,
-               help='The port on which the metadata API will listen.'),
-    cfg.IntOpt('metadata_workers',
-               help='Number of workers for metadata service. The default will '
-                    'be the number of CPUs available.'),
-    cfg.StrOpt('compute_manager',
-               default='nova.compute.manager.ComputeManager',
-               help='Full class name for the Manager for compute'),
-    cfg.StrOpt('console_manager',
-               default='nova.console.manager.ConsoleProxyManager',
-               help='Full class name for the Manager for console proxy'),
-    cfg.StrOpt('consoleauth_manager',
-               default='nova.consoleauth.manager.ConsoleAuthManager',
-               help='Manager for console auth'),
-    cfg.StrOpt('cert_manager',
-               default='nova.cert.manager.CertManager',
-               help='Full class name for the Manager for cert'),
-    cfg.StrOpt('network_manager',
-               default='nova.network.manager.VlanManager',
-               help='Full class name for the Manager for network'),
-    cfg.StrOpt('scheduler_manager',
-               default='nova.scheduler.manager.SchedulerManager',
-               help='Full class name for the Manager for scheduler'),
-    cfg.IntOpt('service_down_time',
-               default=60,
-               help='Maximum time since last check-in for up service'),
-    ]
+CONF = nova.conf.CONF
 
-CONF = cfg.CONF
-CONF.register_opts(service_opts)
-CONF.import_opt('host', 'nova.netconf')
+SERVICE_MANAGERS = {
+    'nova-compute': 'nova.compute.manager.ComputeManager',
+    'nova-console': 'nova.console.manager.ConsoleProxyManager',
+    'nova-consoleauth': 'nova.consoleauth.manager.ConsoleAuthManager',
+    'nova-conductor': 'nova.conductor.manager.ConductorManager',
+    'nova-metadata': 'nova.api.manager.MetadataManager',
+    'nova-scheduler': 'nova.scheduler.manager.SchedulerManager',
+}
+
+
+def _create_service_ref(this_service, context):
+    service = objects.Service(context)
+    service.host = this_service.host
+    service.binary = this_service.binary
+    service.topic = this_service.topic
+    service.report_count = 0
+    service.create()
+    return service
+
+
+def _update_service_ref(service):
+    if service.version != service_obj.SERVICE_VERSION:
+        LOG.info(_LI('Updating service version for %(binary)s on '
+                     '%(host)s from %(old)i to %(new)i'),
+                 {'binary': service.binary,
+                  'host': service.host,
+                  'old': service.version,
+                  'new': service_obj.SERVICE_VERSION})
+        service.version = service_obj.SERVICE_VERSION
+        service.save()
+
+
+def setup_profiler(binary, host):
+    if osprofiler and CONF.profiler.enabled:
+        osprofiler.initializer.init_from_conf(
+            conf=CONF,
+            context=context.get_admin_context().to_dict(),
+            project="nova",
+            service=binary,
+            host=host)
+        LOG.info(_LI("OSProfiler is enabled."))
+
+
+def assert_eventlet_uses_monotonic_clock():
+    from eventlet import hubs
+    import monotonic
+
+    hub = hubs.get_hub()
+    if hub.clock is not monotonic.monotonic:
+        raise RuntimeError(
+            'eventlet hub is not using a monotonic clock - '
+            'periodic tasks will be affected by drifts of system time.')
 
 
 class Service(service.Service):
@@ -124,27 +111,22 @@ class Service(service.Service):
 
     A service takes a manager and enables rpc by listening to queues based
     on topic. It also periodically runs tasks on the manager and reports
-    it state to the database services table.
+    its state to the database services table.
     """
 
     def __init__(self, host, binary, topic, manager, report_interval=None,
                  periodic_enable=None, periodic_fuzzy_delay=None,
-                 periodic_interval_max=None, db_allowed=True,
-                 *args, **kwargs):
+                 periodic_interval_max=None, *args, **kwargs):
         super(Service, self).__init__()
         self.host = host
         self.binary = binary
         self.topic = topic
         self.manager_class_name = manager
-        # NOTE(russellb) We want to make sure to create the servicegroup API
-        # instance early, before creating other things such as the manager,
-        # that will also create a servicegroup API instance.  Internally, the
-        # servicegroup only allocates a single instance of the driver API and
-        # we want to make sure that our value of db_allowed is there when it
-        # gets created.  For that to happen, this has to be the first instance
-        # of the servicegroup API.
-        self.servicegroup_api = servicegroup.API(db_allowed=db_allowed)
+        self.servicegroup_api = servicegroup.API()
         manager_class = importutils.import_class(self.manager_class_name)
+        if objects_base.NovaObject.indirection_api:
+            conductor_api = conductor.API()
+            conductor_api.wait_until_ready(context.get_admin_context())
         self.manager = manager_class(host=self.host, *args, **kwargs)
         self.rpcserver = None
         self.report_interval = report_interval
@@ -153,10 +135,25 @@ class Service(service.Service):
         self.periodic_interval_max = periodic_interval_max
         self.saved_args, self.saved_kwargs = args, kwargs
         self.backdoor_port = None
-        self.conductor_api = conductor.API(use_local=db_allowed)
-        self.conductor_api.wait_until_ready(context.get_admin_context())
+        setup_profiler(binary, self.host)
+
+    def __repr__(self):
+        return "<%(cls_name)s: host=%(host)s, binary=%(binary)s, " \
+               "manager_class_name=%(manager)s>" % {
+                 'cls_name': self.__class__.__name__,
+                 'host': self.host,
+                 'binary': self.binary,
+                 'manager': self.manager_class_name
+                }
 
     def start(self):
+        """Start the service.
+
+        This includes starting an RPC service, initializing
+        periodic tasks, etc.
+        """
+        assert_eventlet_uses_monotonic_clock()
+
         verstr = version.version_string_with_package()
         LOG.info(_LI('Starting %(topic)s node (version %(version)s)'),
                   {'topic': self.topic, 'version': verstr})
@@ -164,21 +161,20 @@ class Service(service.Service):
         self.manager.init_host()
         self.model_disconnected = False
         ctxt = context.get_admin_context()
-        try:
-            self.service_ref = (
-                self.conductor_api.service_get_by_host_and_binary(
-                    ctxt, self.host, self.binary))
-            self.service_id = self.service_ref['id']
-        except exception.NotFound:
+        self.service_ref = objects.Service.get_by_host_and_binary(
+            ctxt, self.host, self.binary)
+        if self.service_ref:
+            _update_service_ref(self.service_ref)
+
+        else:
             try:
-                self.service_ref = self._create_service_ref(ctxt)
+                self.service_ref = _create_service_ref(self, ctxt)
             except (exception.ServiceTopicExists,
                     exception.ServiceBinaryExists):
                 # NOTE(danms): If we race to create a record with a sibling
                 # worker, don't fail here.
-                self.service_ref = (
-                    self.conductor_api.service_get_by_host_and_binary(
-                        ctxt, self.host, self.binary))
+                self.service_ref = objects.Service.get_by_host_and_binary(
+                    ctxt, self.host, self.binary)
 
         self.manager.pre_start_hook()
 
@@ -218,17 +214,6 @@ class Service(service.Service):
                                      periodic_interval_max=
                                         self.periodic_interval_max)
 
-    def _create_service_ref(self, context):
-        svc_values = {
-            'host': self.host,
-            'binary': self.binary,
-            'topic': self.topic,
-            'report_count': 0,
-        }
-        service = self.conductor_api.service_create(context, svc_values)
-        self.service_id = service['id']
-        return service
-
     def __getattr__(self, key):
         manager = self.__dict__.get('manager', None)
         return getattr(manager, key)
@@ -236,8 +221,7 @@ class Service(service.Service):
     @classmethod
     def create(cls, host=None, binary=None, topic=None, manager=None,
                report_interval=None, periodic_enable=None,
-               periodic_fuzzy_delay=None, periodic_interval_max=None,
-               db_allowed=True):
+               periodic_fuzzy_delay=None, periodic_interval_max=None):
         """Instantiates class and passes back application object.
 
         :param host: defaults to CONF.host
@@ -257,9 +241,7 @@ class Service(service.Service):
         if not topic:
             topic = binary.rpartition('nova-')[2]
         if not manager:
-            manager_cls = ('%s_manager' %
-                           binary.rpartition('nova-')[2])
-            manager = CONF.get(manager_cls, None)
+            manager = SERVICE_MANAGERS.get(binary)
         if report_interval is None:
             report_interval = CONF.report_interval
         if periodic_enable is None:
@@ -273,21 +255,26 @@ class Service(service.Service):
                           report_interval=report_interval,
                           periodic_enable=periodic_enable,
                           periodic_fuzzy_delay=periodic_fuzzy_delay,
-                          periodic_interval_max=periodic_interval_max,
-                          db_allowed=db_allowed)
+                          periodic_interval_max=periodic_interval_max)
 
         return service_obj
 
     def kill(self):
-        """Destroy the service object in the datastore."""
+        """Destroy the service object in the datastore.
+
+        NOTE: Although this method is not used anywhere else than tests, it is
+        convenient to have it here, so the tests might easily and in clean way
+        stop and remove the service_ref.
+
+        """
         self.stop()
         try:
-            self.conductor_api.service_destroy(context.get_admin_context(),
-                                               self.service_id)
+            self.service_ref.destroy()
         except exception.NotFound:
             LOG.warning(_LW('Service killed that has no database entry'))
 
     def stop(self):
+        """stop the service and clean up."""
         try:
             self.rpcserver.stop()
             self.rpcserver.wait()
@@ -317,8 +304,12 @@ class Service(service.Service):
             LOG.error(_LE('Temporary directory is invalid: %s'), e)
             sys.exit(1)
 
+    def reset(self):
+        """reset the service."""
+        self.manager.reset()
 
-class WSGIService(object):
+
+class WSGIService(service.Service):
     """Provides ability to launch API from a 'paste' configuration."""
 
     def __init__(self, name, loader=None, use_ssl=False, max_url_len=None):
@@ -330,8 +321,16 @@ class WSGIService(object):
 
         """
         self.name = name
+        # NOTE(danms): Name can be metadata, osapi_compute, per
+        # nova.service's enabled_apis
+        self.binary = 'nova-%s' % name
+
+        LOG.warning('Running %s using eventlet is deprecated. Deploy with '
+                    'a WSGI server such as uwsgi or mod_wsgi.', self.binary)
+
+        self.topic = None
         self.manager = self._get_manager()
-        self.loader = loader or wsgi.Loader()
+        self.loader = loader or api_wsgi.Loader()
         self.app = self.loader.load_app(name)
         # inherit all compute_api worker counts from osapi_compute
         if name.startswith('openstack_compute_api'):
@@ -359,14 +358,16 @@ class WSGIService(object):
         # Pull back actual port used
         self.port = self.server.port
         self.backdoor_port = None
+        setup_profiler(name, self.host)
 
     def reset(self):
-        """Reset server greenpool size to default.
+        """Reset server greenpool size to default and service version cache.
 
         :returns: None
 
         """
         self.server.reset()
+        service_obj.Service.clear_min_version_cache()
 
     def _get_manager(self):
         """Initialize a Manager object appropriate for this service.
@@ -378,15 +379,11 @@ class WSGIService(object):
         :returns: a Manager instance, or None.
 
         """
-        fl = '%s_manager' % self.name
-        if fl not in CONF:
+        manager = SERVICE_MANAGERS.get(self.binary)
+        if manager is None:
             return None
 
-        manager_class_name = CONF.get(fl, None)
-        if not manager_class_name:
-            return None
-
-        manager_class = importutils.import_class(manager_class_name)
+        manager_class = importutils.import_class(manager)
         return manager_class()
 
     def start(self):
@@ -398,6 +395,21 @@ class WSGIService(object):
         :returns: None
 
         """
+        ctxt = context.get_admin_context()
+        service_ref = objects.Service.get_by_host_and_binary(ctxt, self.host,
+                                                             self.binary)
+        if service_ref:
+            _update_service_ref(service_ref)
+        else:
+            try:
+                service_ref = _create_service_ref(self, ctxt)
+            except (exception.ServiceTopicExists,
+                    exception.ServiceBinaryExists):
+                # NOTE(danms): If we race to create a record wth a sibling,
+                # don't fail here.
+                service_ref = objects.Service.get_by_host_and_binary(
+                    ctxt, self.host, self.binary)
+
         if self.manager:
             self.manager.init_host()
             self.manager.pre_start_hook()
@@ -425,7 +437,7 @@ class WSGIService(object):
 
 
 def process_launcher():
-    return service.ProcessLauncher()
+    return service.ProcessLauncher(CONF, restart_method='mutate')
 
 
 # NOTE(vish): the global launcher is to maintain the existing
@@ -439,7 +451,8 @@ def serve(server, workers=None):
     if _launcher:
         raise RuntimeError(_('serve() can only be called once'))
 
-    _launcher = service.launch(server, workers=workers)
+    _launcher = service.launch(CONF, server, workers=workers,
+                               restart_method='mutate')
 
 
 def wait():

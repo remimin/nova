@@ -46,18 +46,6 @@ class SerialTestCase(test.NoDBTestCase):
         self.assertEqual(10000, start)
         self.assertEqual(20000, stop)
 
-    def test_get_port_range_not_numeric(self):
-        self.flags(port_range='xxx:yyy', group='serial_console')
-        start, stop = serial._get_port_range()
-        self.assertEqual(10000, start)
-        self.assertEqual(20000, stop)
-
-    def test_get_port_range_invalid_syntax(self):
-        self.flags(port_range='10:20:30', group='serial_console')
-        start, stop = serial._get_port_range()
-        self.assertEqual(10000, start)
-        self.assertEqual(20000, stop)
-
     @mock.patch('socket.socket')
     def test_verify_port(self, fake_socket):
         s = mock.MagicMock()
@@ -92,7 +80,7 @@ class SerialTestCase(test.NoDBTestCase):
         for port in six.moves.range(start, stop):
             self.assertEqual(port, serial.acquire_port('127.0.0.2'))
 
-        self.assertTrue(10, len(serial.ALLOCATED_PORTS))
+        self.assertEqual(10, len(serial.ALLOCATED_PORTS))
 
     @mock.patch('nova.console.serial._verify_port')
     def test_acquire_port_in_use(self, fake_verify_port):

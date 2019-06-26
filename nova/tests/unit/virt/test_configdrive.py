@@ -12,19 +12,70 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo_utils import strutils
-
+from nova import objects
 from nova import test
 from nova.virt import configdrive
 
 
 class ConfigDriveTestCase(test.NoDBTestCase):
-    def test_valid_string_values(self):
-        for value in (strutils.TRUE_STRINGS + ('always',)):
-            self.flags(force_config_drive=value)
-            self.assertTrue(configdrive.required_by({}))
+    def test_instance_force(self):
+        self.flags(force_config_drive=False)
 
-    def test_invalid_string_values(self):
-        for value in (strutils.FALSE_STRINGS + ('foo',)):
-            self.flags(force_config_drive=value)
-            self.assertFalse(configdrive.required_by({}))
+        instance = objects.Instance(
+            config_drive="yes",
+            system_metadata={
+                "image_img_config_drive": "mandatory",
+            }
+        )
+
+        self.assertTrue(configdrive.required_by(instance))
+
+    def test_image_meta_force(self):
+        self.flags(force_config_drive=False)
+
+        instance = objects.Instance(
+            config_drive=None,
+            system_metadata={
+                "image_img_config_drive": "mandatory",
+            }
+        )
+
+        self.assertTrue(configdrive.required_by(instance))
+
+    def test_config_flag_force_for_new_vms(self):
+        self.flags(force_config_drive=True)
+
+        instance = objects.Instance(
+            config_drive=None,
+            launched_at=None,
+            system_metadata={
+                "image_img_config_drive": "optional",
+            }
+        )
+
+        self.assertTrue(configdrive.required_by(instance))
+
+    def test_config_flag_force_for_existing_vms(self):
+        self.flags(force_config_drive=True)
+
+        instance = objects.Instance(
+            config_drive=None,
+            launched_at='2019-05-17T00:00:00.000000',
+            system_metadata={
+                "image_img_config_drive": "optional",
+            }
+        )
+
+        self.assertFalse(configdrive.required_by(instance))
+
+    def test_no_config_drive(self):
+        self.flags(force_config_drive=False)
+
+        instance = objects.Instance(
+            config_drive=None,
+            system_metadata={
+                "image_img_config_drive": "optional",
+            }
+        )
+
+        self.assertFalse(configdrive.required_by(instance))

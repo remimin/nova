@@ -11,6 +11,8 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
+from collections import OrderedDict
+import pprint
 
 import testtools
 from testtools.tests.matchers import helpers
@@ -20,9 +22,10 @@ from nova.tests.unit import matchers
 
 class TestDictMatches(testtools.TestCase, helpers.TestMatchersInterface):
 
+    matches_dict = OrderedDict(sorted({'foo': 'bar', 'baz': 'DONTCARE',
+         'cat': {'tabby': True, 'fluffy': False}}.items()))
     matches_matcher = matchers.DictMatches(
-        {'foo': 'bar', 'baz': 'DONTCARE',
-         'cat': {'tabby': True, 'fluffy': False}}
+            matches_dict
         )
 
     matches_matches = [
@@ -41,14 +44,13 @@ class TestDictMatches(testtools.TestCase, helpers.TestMatchersInterface):
         ]
 
     str_examples = [
-        ("DictMatches({'baz': 'DONTCARE', 'cat':"
-         " {'fluffy': False, 'tabby': True}, 'foo': 'bar'})",
+        ('DictMatches(%s)' % (pprint.pformat(matches_dict)),
          matches_matcher),
         ]
 
     describe_examples = [
-        ("Keys in d1 and not d2: set(['foo', 'baz', 'cat'])."
-         " Keys in d2 and not d1: set([])", {}, matches_matcher),
+        ("Keys in d1 and not d2: {0}. Keys in d2 and not d1: []"
+         .format(str(sorted(matches_dict.keys()))), {}, matches_matcher),
         ("Dictionaries do not match at fluffy. d1: False d2: True",
          {'foo': 'bar', 'baz': 'quux',
           'cat': {'tabby': True, 'fluffy': True}}, matches_matcher),
@@ -109,8 +111,8 @@ class TestDictListMatches(testtools.TestCase, helpers.TestMatchersInterface):
 class TestIsSubDictOf(testtools.TestCase, helpers.TestMatchersInterface):
 
     matches_matcher = matchers.IsSubDictOf(
-        {'foo': 'bar', 'baz': 'DONTCARE',
-         'cat': {'tabby': True, 'fluffy': False}}
+        OrderedDict(sorted({'foo': 'bar', 'baz': 'DONTCARE',
+         'cat': {'tabby': True, 'fluffy': False}}.items()))
         )
 
     matches_matches = [
@@ -127,10 +129,12 @@ class TestIsSubDictOf(testtools.TestCase, helpers.TestMatchersInterface):
         ]
 
     str_examples = [
-        ("IsSubDictOf({'foo': 'bar', 'baz': 'DONTCARE',"
-         " 'cat': {'fluffy': False, 'tabby': True}})",
+        ("IsSubDictOf({0})".format(
+            str(OrderedDict(sorted({'foo': 'bar', 'baz': 'DONTCARE',
+                                    'cat': {'tabby': True,
+                                            'fluffy': False}}.items())))),
          matches_matcher),
-        ]
+    ]
 
     describe_examples = [
         ("Dictionaries do not match at fluffy. d1: False d2: True",
@@ -448,7 +452,7 @@ class TestXMLMatchesUnorderedNodes(testtools.TestCase,
     ]
 
     describe_examples = [
-        ("/root: XML expected child element <text> not present at index 4",
+        ("/root: XML expected child element <text> not present",
          """<?xml version="1.0"?>
 <root>
   <text>some text here</text>
@@ -458,6 +462,134 @@ class TestXMLMatchesUnorderedNodes(testtools.TestCase,
     <child1>child 1</child1>
     <child2>child 2</child2>
     <child3>child 3</child3>
+  </children>
+</root>""", matches_matcher),
+    ]
+
+    str_examples = []
+
+
+class TestXMLMatchesOrderedMissingChildren(testtools.TestCase,
+                                           helpers.TestMatchersInterface):
+
+    matches_matcher = matchers.XMLMatches("""<?xml version="1.0"?>
+<root>
+  <children>
+    <child1 />
+    <child2>
+      <foo>subchild</foo>
+    </child2>
+  </children>
+</root>""", allow_mixed_nodes=False)
+
+    matches_matches = []
+
+    matches_mismatches = []
+
+    describe_examples = [
+        ("/root/children[0]/child2[1]: XML expected child element <foo> not "
+         "present at index 0",
+         """<?xml version="1.0"?>
+<root>
+  <children>
+    <child1 />
+    <child2 />
+  </children>
+</root>""", matches_matcher),
+    ]
+
+    str_examples = []
+
+
+class TestXMLMatchesUnorderedMissingChildren(testtools.TestCase,
+                                         helpers.TestMatchersInterface):
+
+    matches_matcher = matchers.XMLMatches("""<?xml version="1.0"?>
+<root>
+  <children>
+    <child1 />
+    <child2>
+      <foo>subchild</foo>
+    </child2>
+  </children>
+</root>""", allow_mixed_nodes=True)
+
+    matches_matches = []
+
+    matches_mismatches = []
+
+    describe_examples = [
+        ("/root/children[0]/child2[1]: XML expected child element <foo> not "
+         "present",
+         """<?xml version="1.0"?>
+<root>
+  <children>
+    <child1 />
+    <child2 />
+  </children>
+</root>""", matches_matcher),
+    ]
+
+    str_examples = []
+
+
+class TestXMLMatchesOrderedExtraChildren(testtools.TestCase,
+                                         helpers.TestMatchersInterface):
+
+    matches_matcher = matchers.XMLMatches("""<?xml version="1.0"?>
+<root>
+  <children>
+    <child1 />
+    <child2 />
+  </children>
+</root>""", allow_mixed_nodes=False)
+
+    matches_matches = []
+
+    matches_mismatches = []
+
+    describe_examples = [
+        ("/root/children[0]/child2[1]: XML unexpected child element <foo> "
+         "present at index 0",
+         """<?xml version="1.0"?>
+<root>
+  <children>
+    <child1 />
+    <child2>
+      <foo>subchild</foo>
+    </child2>
+  </children>
+</root>""", matches_matcher),
+    ]
+
+    str_examples = []
+
+
+class TestXMLMatchesUnorderedExtraChildren(testtools.TestCase,
+                                         helpers.TestMatchersInterface):
+
+    matches_matcher = matchers.XMLMatches("""<?xml version="1.0"?>
+<root>
+  <children>
+    <child1 />
+    <child2 />
+  </children>
+</root>""", allow_mixed_nodes=True)
+
+    matches_matches = []
+
+    matches_mismatches = []
+
+    describe_examples = [
+        ("/root/children[0]/child2[1]: XML unexpected child element <foo> "
+         "present at index 0",
+         """<?xml version="1.0"?>
+<root>
+  <children>
+    <child1 />
+    <child2>
+      <foo>subchild</foo>
+    </child2>
   </children>
 </root>""", matches_matcher),
     ]

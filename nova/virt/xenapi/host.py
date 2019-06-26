@@ -19,19 +19,20 @@ Management class for host-related functions (start, reboot, etc).
 
 import re
 
+from os_xenapi.client import host_management
+from os_xenapi.client import XenAPI
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 
-from nova.compute import arch
-from nova.compute import hv_type
+
 from nova.compute import task_states
-from nova.compute import vm_mode
 from nova.compute import vm_states
 from nova import context
 from nova import exception
-from nova.i18n import _, _LE, _LI, _LW
+from nova.i18n import _
 from nova import objects
+from nova.objects import fields as obj_fields
 from nova.virt.xenapi import pool_states
 from nova.virt.xenapi import vm_utils
 
@@ -72,11 +73,11 @@ class Host(object):
                         name = vm_rec['name_label']
                         uuid = _uuid_find(ctxt, host, name)
                         if not uuid:
-                            LOG.info(_LI('Instance %(name)s running on '
-                                         '%(host)s could not be found in '
-                                         'the database: assuming it is a '
-                                         'worker VM and skip ping migration '
-                                         'to a new host'),
+                            LOG.info('Instance %(name)s running on '
+                                     '%(host)s could not be found in '
+                                     'the database: assuming it is a '
+                                     'worker VM and skip ping migration '
+                                     'to a new host',
                                      {'name': name, 'host': host})
                             continue
                     instance = objects.Instance.get_by_uuid(ctxt, uuid)
@@ -103,9 +104,9 @@ class Host(object):
                     instance.save()
 
                     break
-                except self._session.XenAPI.Failure:
-                    LOG.exception(_LE('Unable to migrate VM %(vm_ref)s '
-                                      'from %(host)s'),
+                except XenAPI.Failure:
+                    LOG.exception(_('Unable to migrate VM %(vm_ref)s '
+                                    'from %(host)s'),
                                   {'vm_ref': vm_ref, 'host': host})
                     instance.host = host
                     instance.vm_state = vm_states.ACTIVE
@@ -114,8 +115,8 @@ class Host(object):
         if vm_counter == migrations_counter:
             return 'on_maintenance'
         else:
-            raise exception.NoValidHost(reason='Unable to find suitable '
-                                                   'host for VMs evacuation')
+            raise exception.NoValidHost(reason=_('Unable to find suitable '
+                                                 'host for VMs evacuation'))
 
     def set_host_enabled(self, enabled):
         """Sets the compute host's ability to accept new instances."""
@@ -128,13 +129,15 @@ class Host(object):
         service.disabled_reason = 'set by xenapi host_state'
         service.save()
 
-        args = {"enabled": jsonutils.dumps(enabled)}
-        response = call_xenhost(self._session, "set_host_enabled", args)
+        response = _call_host_management(self._session,
+                                         host_management.set_host_enabled,
+                                         jsonutils.dumps(enabled))
         return response.get("status", response)
 
     def get_host_uptime(self):
         """Returns the result of calling "uptime" on the target host."""
-        response = call_xenhost(self._session, "host_uptime", {})
+        response = _call_host_management(self._session,
+                                         host_management.get_host_uptime)
         return response.get("uptime", response)
 
 
@@ -167,7 +170,7 @@ class HostState(object):
             """Exctract information from the device string about the slot, the
             vendor and the product ID. The string is as follow:
                 "Slot:\tBDF\nClass:\txxxx\nVendor:\txxxx\nDevice:\txxxx\n..."
-            Return a dictionary with informations about the device.
+            Return a dictionary with information about the device.
             """
             slot_regex = _compile_hex(r"Slot:\t"
                                       r"((?:hex{4}:)?"  # Domain: (optional)
@@ -186,8 +189,7 @@ class HostState(object):
                     _("Failed to parse information about"
                       " a pci device for passthrough"))
 
-            type_pci = self._session.call_plugin_serialized(
-                'xenhost', 'get_pci_type', slot_id[0])
+            type_pci = host_management.get_pci_type(self._session, slot_id[0])
 
             return {'label': '_'.join(['label',
                                        vendor_id[0],
@@ -201,12 +203,12 @@ class HostState(object):
 
         # Devices are separated by a blank line. That is why we
         # use "\n\n" as separator.
-        lspci_out = self._session.call_plugin_serialized(
-            'xenhost', 'get_pci_device_details')
+        lspci_out = host_management.get_pci_device_details(self._session)
+
         pci_list = lspci_out.split("\n\n")
 
         # For each device of the list, check if it uses the pciback
-        # kernel driver and if it does, get informations and add it
+        # kernel driver and if it does, get information and add it
         # to the list of passthrough_devices. Ignore it if the driver
         # is not pciback.
         passthrough_devices = []
@@ -218,6 +220,115 @@ class HostState(object):
 
         return passthrough_devices
 
+    def _get_vgpu_stats(self):
+        """Invoke XenAPI to get the stats for VGPUs.
+
+        The return value is a dict which has GPU groups' uuid as
+        the keys:
+            dict(grp_uuid_1=dict_vgpu_stats_in_grp_1,
+                 grp_uuid_2=dict_vgpu_stats_in_grp_2,
+                 ...,
+                 grp_uuid_n=dict_vgpu_stats_in_grp_n)
+        The `dict_vgpu_stats_in_grp_x` is a dict represents the
+        vGPU stats in GPU group x. For details, please refer to
+        the return value of the function of _get_vgpu_stats_in_group().
+        """
+        if not CONF.devices.enabled_vgpu_types:
+            return {}
+
+        vgpu_stats = {}
+
+        # NOTE(jianghuaw): If there are multiple vGPU types enabled in
+        # the configure option, we only choose the first one so that
+        # we support only one vGPU type per compute node at the moment.
+        # Once we switch to use the nested resource providers, we will
+        # remove these lines to allow multiple vGPU types within multiple
+        # GPU groups (each group has a different vGPU type enabled).
+        if len(CONF.devices.enabled_vgpu_types) > 1:
+            LOG.warning('XenAPI only supports one GPU type per compute node,'
+                        ' only first type will be used.')
+        cfg_enabled_types = CONF.devices.enabled_vgpu_types[:1]
+
+        vgpu_grp_refs = self._session.call_xenapi('GPU_group.get_all')
+        for ref in vgpu_grp_refs:
+            grp_uuid = self._session.call_xenapi('GPU_group.get_uuid', ref)
+            stat = self._get_vgpu_stats_in_group(ref, cfg_enabled_types)
+            if stat:
+                vgpu_stats[grp_uuid] = stat
+
+        LOG.debug("Returning vGPU stats: %s", vgpu_stats)
+
+        return vgpu_stats
+
+    def _get_vgpu_stats_in_group(self, grp_ref, vgpu_types):
+        """Get stats for the specified vGPU types in a GPU group.
+
+        NOTE(Jianghuaw): In XenAPI, a GPU group is the minimal unit
+        from where to create a vGPU for an instance. So here, we
+        report vGPU resources for a particular GPU group. When we use
+        nested resource providers to represent the vGPU resources,
+        each GPU group will be a child resource provider under the
+        compute node.
+
+        The return value is a dict. For example:
+        {'uuid': '6444c6ee-3a49-42f5-bebb-606b52175e67',
+         'type_name': 'Intel GVT-g',
+         'max_heads': 1,
+         'total': 7,
+         'remaining': 7,
+         }
+        """
+        type_refs_in_grp = self._session.call_xenapi(
+            'GPU_group.get_enabled_VGPU_types', grp_ref)
+
+        type_names_in_grp = {self._session.call_xenapi(
+                                 'VGPU_type.get_model_name',
+                                 type_ref): type_ref
+                             for type_ref in type_refs_in_grp}
+        # Get the vGPU types enabled both in this GPU group and in the
+        # nova conf.
+        enabled_types = set(vgpu_types) & set(type_names_in_grp)
+        if not enabled_types:
+            return
+
+        stat = {}
+        # Get the sorted enabled types, so that we can always choose the same
+        # type when there are multiple enabled vGPU types.
+        sorted_types = sorted(enabled_types)
+        chosen_type = sorted_types[0]
+        if len(sorted_types) > 1:
+            LOG.warning('XenAPI only supports one vGPU type per GPU group,'
+                        ' but enabled multiple vGPU types: %(available)s.'
+                        ' Choosing the first one: %(chosen)s.',
+                       dict(available=sorted_types,
+                            chosen=chosen_type))
+        type_ref = type_names_in_grp[chosen_type]
+        type_uuid = self._session.call_xenapi('VGPU_type.get_uuid', type_ref)
+        stat['uuid'] = type_uuid
+        stat['type_name'] = chosen_type
+        stat['max_heads'] = int(self._session.call_xenapi(
+            'VGPU_type.get_max_heads', type_ref))
+
+        stat['total'] = self._get_total_vgpu_in_grp(grp_ref, type_ref)
+        stat['remaining'] = int(self._session.call_xenapi(
+                                    'GPU_group.get_remaining_capacity',
+                                    grp_ref,
+                                    type_ref))
+        return stat
+
+    def _get_total_vgpu_in_grp(self, grp_ref, type_ref):
+        """Get the total capacity of vGPUs in the group."""
+        pgpu_recs = self._session.call_xenapi(
+            'PGPU.get_all_records_where', 'field "GPU_group" = "%s"' % grp_ref)
+
+        total = 0
+        for pgpu_ref in pgpu_recs:
+            pgpu_rec = pgpu_recs[pgpu_ref]
+            if type_ref in pgpu_rec['enabled_VGPU_types']:
+                cap = pgpu_rec['supported_VGPU_max_capacities'][type_ref]
+                total += int(cap)
+        return total
+
     def get_host_stats(self, refresh=False):
         """Return the current state of the host. If 'refresh' is
         True, run the update first.
@@ -226,20 +337,59 @@ class HostState(object):
             self.update_status()
         return self._stats
 
+    def get_disk_used(self, sr_ref):
+        """Since glance images are downloaded and snapshotted before they are
+        used, only a small proportion of its VDI will be in use and it will
+        never grow.  We only need to count the virtual size for disks that
+        are attached to a VM - every other disk can count physical.
+        """
+
+        def _vdi_attached(vdi_ref):
+            try:
+                vbds = self._session.VDI.get_VBDs(vdi_ref)
+                for vbd in vbds:
+                    if self._session.VBD.get_currently_attached(vbd):
+                        return True
+            except self._session.XenAPI.Failure:
+                # VDI or VBD may no longer exist - in which case, it's
+                # not attached
+                pass
+            return False
+
+        allocated = 0
+        physical_used = 0
+
+        all_vdis = self._session.SR.get_VDIs(sr_ref)
+        for vdi_ref in all_vdis:
+            try:
+                vdi_physical = \
+                    int(self._session.VDI.get_physical_utilisation(vdi_ref))
+                if _vdi_attached(vdi_ref):
+                    allocated += \
+                        int(self._session.VDI.get_virtual_size(vdi_ref))
+                else:
+                    allocated += vdi_physical
+                physical_used += vdi_physical
+            except (ValueError, self._session.XenAPI.Failure):
+                LOG.exception(_('Unable to get size for vdi %s'), vdi_ref)
+
+        return (allocated, physical_used)
+
     def update_status(self):
         """Since under Xenserver, a compute node runs on a given host,
         we can get host status information using xenapi.
         """
         LOG.debug("Updating host stats")
-        data = call_xenhost(self._session, "host_data", {})
+        data = _call_host_management(self._session,
+                                     host_management.get_host_data)
         if data:
             sr_ref = vm_utils.scan_default_sr(self._session)
             sr_rec = self._session.SR.get_record(sr_ref)
             total = int(sr_rec["physical_size"])
-            used = int(sr_rec["physical_utilisation"])
+            (allocated, used) = self.get_disk_used(sr_ref)
             data["disk_total"] = total
             data["disk_used"] = used
-            data["disk_allocated"] = int(sr_rec["virtual_allocation"])
+            data["disk_allocated"] = allocated
             data["disk_available"] = total - used
             data["supported_instances"] = to_supported_instances(
                 data.get("host_capabilities")
@@ -257,8 +407,8 @@ class HostState(object):
                 del data['host_memory']
             if (data['host_hostname'] !=
                     self._stats.get('host_hostname', data['host_hostname'])):
-                LOG.error(_LE('Hostname has changed from %(old)s to %(new)s. '
-                              'A restart is required to take effect.') %
+                LOG.error('Hostname has changed from %(old)s to %(new)s. '
+                          'A restart is required to take effect.',
                           {'old': self._stats['host_hostname'],
                            'new': data['host_hostname']})
                 data['host_hostname'] = self._stats['host_hostname']
@@ -268,6 +418,7 @@ class HostState(object):
                 vcpus_used = vcpus_used + int(vm_rec['VCPUs_max'])
             data['vcpus_used'] = vcpus_used
             data['pci_passthrough_devices'] = self._get_passthrough_devices()
+            data['vgpu_stats'] = self._get_vgpu_stats()
             self._stats = data
 
 
@@ -284,12 +435,12 @@ def to_supported_instances(host_capabilities):
 
             ostype, _version, guestarch = capability.split("-")
 
-            guestarch = arch.canonicalize(guestarch)
-            ostype = vm_mode.canonicalize(ostype)
+            guestarch = obj_fields.Architecture.canonicalize(guestarch)
+            ostype = obj_fields.VMMode.canonicalize(ostype)
 
-            result.append((guestarch, hv_type.XEN, ostype))
+            result.append((guestarch, obj_fields.HVType.XEN, ostype))
         except ValueError:
-            LOG.warning(_LW("Failed to extract instance support from %s"),
+            LOG.warning("Failed to extract instance support from %s",
                         capability)
 
     return result
@@ -355,16 +506,36 @@ def call_xenhost(session, method, arg_dict):
     """
     # Create a task ID as something that won't match any instance ID
     try:
-        result = session.call_plugin('xenhost', method, args=arg_dict)
+        result = session.call_plugin('xenhost.py', method, args=arg_dict)
         if not result:
             return ''
         return jsonutils.loads(result)
     except ValueError:
-        LOG.exception(_LE("Unable to get updated status"))
+        LOG.exception(_("Unable to get updated status"))
         return None
     except session.XenAPI.Failure as e:
-        LOG.error(_LE("The call to %(method)s returned "
-                      "an error: %(e)s."), {'method': method, 'e': e})
+        LOG.error("The call to %(method)s returned "
+                  "an error: %(e)s.", {'method': method, 'e': e})
+        return e.details[1]
+
+
+def _call_host_management(session, method, *args):
+    """There will be several methods that will need this general
+    handling for interacting with the dom0 plugin, so this abstracts
+    out that behavior. the call_xenhost will be removed once we deprecated
+    those functions which are not needed anymore
+    """
+    try:
+        result = method(session, *args)
+        if not result:
+            return ''
+        return jsonutils.loads(result)
+    except ValueError:
+        LOG.exception(_("Unable to get updated status"))
+        return None
+    except session.XenAPI.Failure as e:
+        LOG.error("The call to %(method)s returned an error: %(e)s.",
+                  {'method': method.__name__, 'e': e})
         return e.details[1]
 
 
@@ -389,7 +560,7 @@ def _host_find(context, session, src_aggregate, host_ref):
     # CONF.host in the XenServer host's other-config map.
     # TODO(armando-migliaccio): improve according the note above
     uuid = session.host.get_uuid(host_ref)
-    for compute_host, host_uuid in src_aggregate.metadetails.iteritems():
+    for compute_host, host_uuid in src_aggregate.metadetails.items():
         if host_uuid == uuid:
             return compute_host
     raise exception.NoValidHost(reason='Host %(host_uuid)s could not be found '

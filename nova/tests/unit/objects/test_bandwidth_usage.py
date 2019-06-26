@@ -14,10 +14,11 @@ import datetime
 
 import iso8601
 import mock
+from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
 
 from nova import context
-from nova import db
+from nova.db import api as db
 from nova.objects import bandwidth_usage
 from nova import test
 from nova.tests.unit.objects import test_objects
@@ -35,9 +36,17 @@ class _TestBandwidthUsage(test.TestCase):
             time=now, start_period=start_period)
 
     @staticmethod
-    def _compare(test, db, obj):
+    def _compare(test, db, obj, ignored_fields=None):
+        if ignored_fields is None:
+            ignored_fields = []
         for field, value in db.items():
-            test.assertEqual(db[field], obj[field])
+            if field in ignored_fields:
+                continue
+            obj_field = field
+            if obj_field == 'uuid':
+                obj_field = 'instance_uuid'
+            test.assertEqual(db[field], getattr(obj, obj_field),
+                    'Field %s is not equal' % field)
 
     @staticmethod
     def _fake_bw_usage(time=None, start_period=None, bw_in=100,
@@ -47,7 +56,7 @@ class _TestBandwidthUsage(test.TestCase):
             'updated_at': None,
             'deleted_at': None,
             'deleted': 0,
-            'instance_uuid': 'fake_uuid1',
+            'uuid': uuids.instance,
             'mac': 'fake_mac1',
             'start_period': start_period,
             'bw_in': bw_in,
@@ -60,7 +69,7 @@ class _TestBandwidthUsage(test.TestCase):
 
     @staticmethod
     def _time_now_and_start_period():
-        now = timeutils.utcnow().replace(tzinfo=iso8601.iso8601.Utc(),
+        now = timeutils.utcnow().replace(tzinfo=iso8601.UTC,
                                          microsecond=0)
         start_period = now - datetime.timedelta(seconds=10)
         return now, start_period
@@ -69,7 +78,7 @@ class _TestBandwidthUsage(test.TestCase):
     def test_get_by_instance_uuid_and_mac(self, mock_get):
         mock_get.return_value = self.expected_bw_usage
         bw_usage = bandwidth_usage.BandwidthUsage.get_by_instance_uuid_and_mac(
-            self.context, 'fake_uuid', 'fake_mac',
+            self.context, uuids.instance, 'fake_mac',
             start_period=self.expected_bw_usage['start_period'])
         self._compare(self, self.expected_bw_usage, bw_usage)
 
@@ -78,9 +87,9 @@ class _TestBandwidthUsage(test.TestCase):
         mock_get_by_uuids.return_value = [self.expected_bw_usage]
 
         bw_usages = bandwidth_usage.BandwidthUsageList.get_by_uuids(
-            self.context, ['fake_uuid'],
+            self.context, [uuids.instance],
             start_period=self.expected_bw_usage['start_period'])
-        self.assertEqual(len(bw_usages), 1)
+        self.assertEqual(1, len(bw_usages))
         self._compare(self, self.expected_bw_usage, bw_usages[0])
 
     @mock.patch.object(db, 'bw_usage_update')
@@ -88,11 +97,29 @@ class _TestBandwidthUsage(test.TestCase):
         mock_create.return_value = self.expected_bw_usage
 
         bw_usage = bandwidth_usage.BandwidthUsage(context=self.context)
-        bw_usage.create('fake_uuid', 'fake_mac',
+        bw_usage.create(uuids.instance, 'fake_mac',
                         100, 200, 12345, 67890,
                         start_period=self.expected_bw_usage['start_period'])
 
         self._compare(self, self.expected_bw_usage, bw_usage)
+
+    def test_update_with_db(self):
+        expected_bw_usage1 = self._fake_bw_usage(
+            time=self.expected_bw_usage['last_refreshed'],
+            start_period=self.expected_bw_usage['start_period'],
+            last_ctr_in=42, last_ctr_out=42)
+
+        bw_usage = bandwidth_usage.BandwidthUsage(context=self.context)
+        bw_usage.create(uuids.instance, 'fake_mac1',
+                        100, 200, 42, 42,
+                        start_period=self.expected_bw_usage['start_period'])
+        self._compare(self, expected_bw_usage1, bw_usage,
+                ignored_fields=['last_refreshed', 'created_at'])
+        bw_usage.create(uuids.instance, 'fake_mac1',
+                        100, 200, 12345, 67890,
+                        start_period=self.expected_bw_usage['start_period'])
+        self._compare(self, self.expected_bw_usage, bw_usage,
+                ignored_fields=['last_refreshed', 'created_at', 'updated_at'])
 
     @mock.patch.object(db, 'bw_usage_update')
     def test_update(self, mock_update):

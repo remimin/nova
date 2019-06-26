@@ -16,31 +16,26 @@
 RAM Weigher.  Weigh hosts by their RAM usage.
 
 The default is to spread instances across all hosts evenly.  If you prefer
-stacking, you can set the 'ram_weight_multiplier' option to a negative
-number and the weighing has the opposite effect of the default.
+stacking, you can set the 'ram_weight_multiplier' option (by configuration
+or aggregate metadata) to a negative number and the weighing has the opposite
+effect of the default.
 """
 
-from oslo_config import cfg
-
+import nova.conf
+from nova.scheduler import utils
 from nova.scheduler import weights
 
-ram_weight_opts = [
-        cfg.FloatOpt('ram_weight_multiplier',
-                     default=1.0,
-                     help='Multiplier used for weighing ram.  Negative '
-                          'numbers mean to stack vs spread.'),
-]
-
-CONF = cfg.CONF
-CONF.register_opts(ram_weight_opts)
+CONF = nova.conf.CONF
 
 
 class RAMWeigher(weights.BaseHostWeigher):
     minval = 0
 
-    def weight_multiplier(self):
+    def weight_multiplier(self, host_state):
         """Override the weight multiplier."""
-        return CONF.ram_weight_multiplier
+        return utils.get_weight_multiplier(
+            host_state, 'ram_weight_multiplier',
+            CONF.filter_scheduler.ram_weight_multiplier)
 
     def _weigh_object(self, host_state, weight_properties):
         """Higher weights win.  We want spreading to be the default."""

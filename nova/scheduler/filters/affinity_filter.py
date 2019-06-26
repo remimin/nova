@@ -25,15 +25,14 @@ LOG = logging.getLogger(__name__)
 
 
 class DifferentHostFilter(filters.BaseHostFilter):
-    '''Schedule the instance on a different host from a set of instances.'''
-
+    """Schedule the instance on a different host from a set of instances."""
     # The hosts the instances are running on doesn't change within a request
     run_filter_once_per_request = True
 
-    def host_passes(self, host_state, filter_properties):
-        scheduler_hints = filter_properties.get('scheduler_hints') or {}
+    RUN_ON_REBUILD = False
 
-        affinity_uuids = scheduler_hints.get('different_host', [])
+    def host_passes(self, host_state, spec_obj):
+        affinity_uuids = spec_obj.get_scheduler_hint('different_host')
         if affinity_uuids:
             overlap = utils.instance_uuids_overlap(host_state, affinity_uuids)
             return not overlap
@@ -42,36 +41,33 @@ class DifferentHostFilter(filters.BaseHostFilter):
 
 
 class SameHostFilter(filters.BaseHostFilter):
-    '''Schedule the instance on the same host as another instance in a set of
+    """Schedule the instance on the same host as another instance in a set of
     instances.
-    '''
-
+    """
     # The hosts the instances are running on doesn't change within a request
     run_filter_once_per_request = True
 
-    def host_passes(self, host_state, filter_properties):
-        scheduler_hints = filter_properties.get('scheduler_hints') or {}
+    RUN_ON_REBUILD = False
 
-        affinity_uuids = scheduler_hints.get('same_host', [])
-        if affinity_uuids and host_state.instances:
+    def host_passes(self, host_state, spec_obj):
+        affinity_uuids = spec_obj.get_scheduler_hint('same_host')
+        if affinity_uuids:
             overlap = utils.instance_uuids_overlap(host_state, affinity_uuids)
             return overlap
-        # With no same_host key or no instances
+        # With no same_host key
         return True
 
 
 class SimpleCIDRAffinityFilter(filters.BaseHostFilter):
-    '''Schedule the instance on a host with a particular cidr
-    '''
-
+    """Schedule the instance on a host with a particular cidr"""
     # The address of a host doesn't change within a request
     run_filter_once_per_request = True
 
-    def host_passes(self, host_state, filter_properties):
-        scheduler_hints = filter_properties.get('scheduler_hints') or {}
+    RUN_ON_REBUILD = False
 
-        affinity_cidr = scheduler_hints.get('cidr', '/24')
-        affinity_host_addr = scheduler_hints.get('build_near_host_ip')
+    def host_passes(self, host_state, spec_obj):
+        affinity_cidr = spec_obj.get_scheduler_hint('cidr', '/24')
+        affinity_host_addr = spec_obj.get_scheduler_hint('build_near_host_ip')
         host_ip = host_state.host_ip
         if affinity_host_addr:
             affinity_net = netaddr.IPNetwork(str.join('', (affinity_host_addr,
@@ -87,21 +83,49 @@ class _GroupAntiAffinityFilter(filters.BaseHostFilter):
     """Schedule the instance on a different host from a set of group
     hosts.
     """
-    def host_passes(self, host_state, filter_properties):
-        # Only invoke the filter is 'anti-affinity' is configured
-        policies = filter_properties.get('group_policies', [])
-        if self.policy_name not in policies:
+
+    RUN_ON_REBUILD = False
+
+    def host_passes(self, host_state, spec_obj):
+        # Only invoke the filter if 'anti-affinity' is configured
+        instance_group = spec_obj.instance_group
+        policy = instance_group.policy if instance_group else None
+        if self.policy_name != policy:
             return True
+        # NOTE(hanrong): Move operations like resize can check the same source
+        # compute node where the instance is. That case, AntiAffinityFilter
+        # must not return the source as a non-possible destination.
+        if spec_obj.instance_uuid in host_state.instances.keys():
+            return True
+        # The list of instances UUIDs on the given host
+        instances = set(host_state.instances.keys())
+        # The list of instances UUIDs which are members of this group
+        members = set(spec_obj.instance_group.members)
+        # The set of instances on the host that are also members of this group
+        servers_on_host = instances.intersection(members)
 
-        group_hosts = filter_properties.get('group_hosts') or []
-        LOG.debug("Group anti affinity: check if %(host)s not "
-                    "in %(configured)s", {'host': host_state.host,
-                                           'configured': group_hosts})
-        if group_hosts:
-            return host_state.host not in group_hosts
+        rules = instance_group.rules
+        if rules and 'max_server_per_host' in rules:
+            max_server_per_host = rules['max_server_per_host']
+        else:
+            max_server_per_host = 1
 
-        # No groups configured
-        return True
+        # Very old request specs don't have a full InstanceGroup with the UUID
+        group_uuid = (instance_group.uuid
+                      if instance_group and 'uuid' in instance_group
+                      else 'n/a')
+        LOG.debug("Group anti-affinity: check if the number of servers from "
+                  "group %(group_uuid)s on host %(host)s is less than "
+                  "%(max_server)s.",
+                  {'group_uuid': group_uuid,
+                   'host': host_state.host,
+                   'max_server': max_server_per_host})
+        # NOTE(yikun): If the number of servers from same group on this host
+        # is less than the max_server_per_host, this filter will accept the
+        # given host. In the default case(max_server_per_host=1), this filter
+        # will accept the given host if there are 0 servers from the group
+        # already on this host.
+        return len(servers_on_host) < max_server_per_host
 
 
 class ServerGroupAntiAffinityFilter(_GroupAntiAffinityFilter):
@@ -113,16 +137,21 @@ class ServerGroupAntiAffinityFilter(_GroupAntiAffinityFilter):
 class _GroupAffinityFilter(filters.BaseHostFilter):
     """Schedule the instance on to host from a set of group hosts.
     """
-    def host_passes(self, host_state, filter_properties):
-        # Only invoke the filter is 'affinity' is configured
-        policies = filter_properties.get('group_policies', [])
+
+    RUN_ON_REBUILD = False
+
+    def host_passes(self, host_state, spec_obj):
+        # Only invoke the filter if 'affinity' is configured
+        policies = (spec_obj.instance_group.policies
+                    if spec_obj.instance_group else [])
         if self.policy_name not in policies:
             return True
 
-        group_hosts = filter_properties.get('group_hosts', [])
+        group_hosts = (spec_obj.instance_group.hosts
+                       if spec_obj.instance_group else [])
         LOG.debug("Group affinity: check if %(host)s in "
-                    "%(configured)s", {'host': host_state.host,
-                                        'configured': group_hosts})
+                  "%(configured)s", {'host': host_state.host,
+                                     'configured': group_hosts})
         if group_hosts:
             return host_state.host in group_hosts
 

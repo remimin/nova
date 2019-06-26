@@ -24,8 +24,7 @@ import mock
 import six.moves.urllib.parse as urlparse
 import webob
 
-from nova.api.openstack.compute import images
-from nova.api.openstack.compute.plugins.v3 import images as images_v21
+from nova.api.openstack.compute import images as images_v21
 from nova.api.openstack.compute.views import images as images_view
 from nova import exception
 from nova.image import glance
@@ -44,18 +43,18 @@ class ImagesControllerTestV21(test.NoDBTestCase):
     """Test of the OpenStack API /images application controller w/Glance.
     """
     image_controller_class = images_v21.ImagesController
-    url_base = '/v3'
-    bookmark_base = ''
-    http_request = fakes.HTTPRequestV3
+    url_base = '/v2/fake'
+    bookmark_base = '/fake'
+    http_request = fakes.HTTPRequestV21
 
     def setUp(self):
         """Run before each test."""
         super(ImagesControllerTestV21, self).setUp()
-        fakes.stub_out_networking(self.stubs)
-        fakes.stub_out_rate_limiting(self.stubs)
-        fakes.stub_out_key_pair_funcs(self.stubs)
-        fakes.stub_out_compute_api_snapshot(self.stubs)
-        fakes.stub_out_compute_api_backup(self.stubs)
+        self.flags(api_servers=['http://localhost:9292'], group='glance')
+        fakes.stub_out_networking(self)
+        fakes.stub_out_key_pair_funcs(self)
+        fakes.stub_out_compute_api_snapshot(self)
+        fakes.stub_out_compute_api_backup(self)
 
         self.controller = self.image_controller_class()
         self.url_prefix = "http://localhost%s/images" % self.url_base
@@ -80,6 +79,7 @@ class ImagesControllerTestV21(test.NoDBTestCase):
                       'minDisk': 10,
                       'progress': 100,
                       'minRam': 128,
+                      'OS-EXT-IMG-SIZE:size': 25165824,
                       "links": [{
                                     "rel": "self",
                                     "href": "%s/123" % self.url_prefix
@@ -93,7 +93,7 @@ class ImagesControllerTestV21(test.NoDBTestCase):
                                     "rel": "alternate",
                                     "type": "application/vnd.openstack.image",
                                     "href": self.alternate %
-                                            (glance.generate_glance_url(),
+                                            (glance.generate_glance_url('ctx'),
                                              123),
                                 }],
             },
@@ -112,6 +112,7 @@ class ImagesControllerTestV21(test.NoDBTestCase):
                       'progress': 25,
                       'minDisk': 0,
                       'minRam': 0,
+                      'OS-EXT-IMG-SIZE:size': 25165824,
                       'server': {
                           'id': self.server_uuid,
                           "links": [{
@@ -137,7 +138,7 @@ class ImagesControllerTestV21(test.NoDBTestCase):
                                     "type":
                                         "application/vnd.openstack.image",
                                     "href": self.alternate %
-                                            (glance.generate_glance_url(),
+                                            (glance.generate_glance_url('ctx'),
                                              124),
                                 }],
             },
@@ -153,8 +154,9 @@ class ImagesControllerTestV21(test.NoDBTestCase):
 
     @mock.patch('nova.image.api.API.get', return_value=IMAGE_FIXTURES[1])
     def test_get_image_with_custom_prefix(self, _get_mocked):
-        self.flags(osapi_compute_link_prefix='https://zoo.com:42',
-                   osapi_glance_link_prefix='http://circus.com:34')
+        self.flags(compute_link_prefix='https://zoo.com:42',
+                   glance_link_prefix='http://circus.com:34',
+                   group='api')
         fake_req = self.http_request.blank(self.url_base + 'images/124')
         actual_image = self.controller.show(fake_req, '124')
 
@@ -196,7 +198,7 @@ class ImagesControllerTestV21(test.NoDBTestCase):
         image_125["links"][0]["href"] = "%s/125" % self.url_prefix
         image_125["links"][1]["href"] = "%s/125" % self.bookmark_prefix
         image_125["links"][2]["href"] = (
-            "%s/images/125" % glance.generate_glance_url())
+            "%s/images/125" % glance.generate_glance_url('ctx'))
 
         image_126 = copy.deepcopy(self.expected_image_124["image"])
         image_126['id'] = '126'
@@ -206,7 +208,7 @@ class ImagesControllerTestV21(test.NoDBTestCase):
         image_126["links"][0]["href"] = "%s/126" % self.url_prefix
         image_126["links"][1]["href"] = "%s/126" % self.bookmark_prefix
         image_126["links"][2]["href"] = (
-            "%s/images/126" % glance.generate_glance_url())
+            "%s/images/126" % glance.generate_glance_url('ctx'))
 
         image_127 = copy.deepcopy(self.expected_image_124["image"])
         image_127['id'] = '127'
@@ -216,7 +218,7 @@ class ImagesControllerTestV21(test.NoDBTestCase):
         image_127["links"][0]["href"] = "%s/127" % self.url_prefix
         image_127["links"][1]["href"] = "%s/127" % self.bookmark_prefix
         image_127["links"][2]["href"] = (
-            "%s/images/127" % glance.generate_glance_url())
+            "%s/images/127" % glance.generate_glance_url('ctx'))
 
         image_128 = copy.deepcopy(self.expected_image_124["image"])
         image_128['id'] = '128'
@@ -226,7 +228,7 @@ class ImagesControllerTestV21(test.NoDBTestCase):
         image_128["links"][0]["href"] = "%s/128" % self.url_prefix
         image_128["links"][1]["href"] = "%s/128" % self.bookmark_prefix
         image_128["links"][2]["href"] = (
-            "%s/images/128" % glance.generate_glance_url())
+            "%s/images/128" % glance.generate_glance_url('ctx'))
 
         image_129 = copy.deepcopy(self.expected_image_124["image"])
         image_129['id'] = '129'
@@ -236,7 +238,7 @@ class ImagesControllerTestV21(test.NoDBTestCase):
         image_129["links"][0]["href"] = "%s/129" % self.url_prefix
         image_129["links"][1]["href"] = "%s/129" % self.bookmark_prefix
         image_129["links"][2]["href"] = (
-            "%s/images/129" % glance.generate_glance_url())
+            "%s/images/129" % glance.generate_glance_url('ctx'))
 
         image_130 = copy.deepcopy(self.expected_image_123["image"])
         image_130['id'] = '130'
@@ -247,7 +249,7 @@ class ImagesControllerTestV21(test.NoDBTestCase):
         image_130["links"][0]["href"] = "%s/130" % self.url_prefix
         image_130["links"][1]["href"] = "%s/130" % self.bookmark_prefix
         image_130["links"][2]["href"] = (
-            "%s/images/130" % glance.generate_glance_url())
+            "%s/images/130" % glance.generate_glance_url('ctx'))
 
         image_131 = copy.deepcopy(self.expected_image_123["image"])
         image_131['id'] = '131'
@@ -258,7 +260,7 @@ class ImagesControllerTestV21(test.NoDBTestCase):
         image_131["links"][0]["href"] = "%s/131" % self.url_prefix
         image_131["links"][1]["href"] = "%s/131" % self.bookmark_prefix
         image_131["links"][2]["href"] = (
-            "%s/images/131" % glance.generate_glance_url())
+            "%s/images/131" % glance.generate_glance_url('ctx'))
 
         expected = [self.expected_image_123["image"],
                     self.expected_image_124["image"],
@@ -352,7 +354,7 @@ class ImagesControllerTestV21(test.NoDBTestCase):
         view = images_view.ViewBuilder()
         request = self.http_request.blank(self.url_base + 'images/1')
         generated_url = view._get_alternate_link(request, 1)
-        actual_url = "%s/images/1" % glance.generate_glance_url()
+        actual_url = "%s/images/1" % glance.generate_glance_url('ctx')
         self.assertEqual(generated_url, actual_url)
 
     def _check_response(self, controller_method, response, expected_code):
@@ -362,8 +364,9 @@ class ImagesControllerTestV21(test.NoDBTestCase):
     def test_delete_image(self, delete_mocked):
         request = self.http_request.blank(self.url_base + 'images/124')
         request.method = 'DELETE'
-        response = self.controller.delete(request, '124')
-        self._check_response(self.controller.delete, response, 204)
+        delete_method = self.controller.delete
+        response = delete_method(request, '124')
+        self._check_response(delete_method, response, 204)
         delete_mocked.assert_called_once_with(mock.ANY, '124')
 
     @mock.patch('nova.image.api.API.delete',
@@ -408,11 +411,19 @@ class ImagesControllerTestV21(test.NoDBTestCase):
                         matchers.DictMatches(params))
 
 
-class ImagesControllerTestV2(ImagesControllerTestV21):
-    image_controller_class = images.Controller
-    url_base = '/v2/fake'
-    bookmark_base = '/fake'
-    http_request = fakes.HTTPRequest
+class ImagesControllerDeprecationTest(test.NoDBTestCase):
 
-    def _check_response(self, controller_method, response, expected_code):
-        self.assertEqual(expected_code, response.status_int)
+    def setUp(self):
+        super(ImagesControllerDeprecationTest, self).setUp()
+        self.controller = images_v21.ImagesController()
+        self.req = fakes.HTTPRequest.blank('', version='2.36')
+
+    def test_not_found_for_all_images_api(self):
+        self.assertRaises(exception.VersionNotFoundForAPIMethod,
+                          self.controller.show, self.req, fakes.FAKE_UUID)
+        self.assertRaises(exception.VersionNotFoundForAPIMethod,
+                          self.controller.delete, self.req, fakes.FAKE_UUID)
+        self.assertRaises(exception.VersionNotFoundForAPIMethod,
+                          self.controller.index, self.req)
+        self.assertRaises(exception.VersionNotFoundForAPIMethod,
+                          self.controller.detail, self.req)

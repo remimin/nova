@@ -56,7 +56,7 @@ class TestFaultWrapper(test.NoDBTestCase):
         # translate().
         mock_translate.assert_any_call(u'Should be translated.', None)
         # The return value from translate() should appear in the response.
-        self.assertIn("I've been translated!", unicode(response.body))
+        self.assertIn("I've been translated!", response.body.decode("UTF-8"))
 
 
 class TestFaults(test.NoDBTestCase):

@@ -17,26 +17,34 @@
 
 import sys
 
-from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_reports import guru_meditation_report as gmr
+from oslo_reports import opts as gmr_opts
 
+import nova.conf
 from nova import config
+from nova.consoleauth import rpcapi
 from nova import objects
-from nova.openstack.common.report import guru_meditation_report as gmr
 from nova import service
 from nova import version
 
-CONF = cfg.CONF
+CONF = nova.conf.CONF
+LOG = logging.getLogger('nova.consoleauth')
 
 
 def main():
     config.parse_args(sys.argv)
     logging.setup(CONF, "nova")
     objects.register_all()
+    gmr_opts.set_defaults(CONF)
 
-    gmr.TextGuruMeditation.setup_autorun(version)
+    gmr.TextGuruMeditation.setup_autorun(version, conf=CONF)
+
+    LOG.warning('The nova-consoleauth service is deprecated as console token '
+                'authorization storage has moved from the nova-consoleauth '
+                'service backend to the database backend.')
 
     server = service.Service.create(binary='nova-consoleauth',
-                                    topic=CONF.consoleauth_topic)
+                                    topic=rpcapi.RPC_TOPIC)
     service.serve(server)
     service.wait()

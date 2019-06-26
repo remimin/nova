@@ -12,16 +12,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from nova import db
+from nova.db import api as db
 from nova import exception
 from nova import objects
 from nova.objects import base
 from nova.objects import fields
 
 
-# TODO(berrange): Remove NovaObjectDictCompat
-class Agent(base.NovaPersistentObject, base.NovaObject,
-            base.NovaObjectDictCompat):
+@base.NovaObjectRegistry.register
+class Agent(base.NovaPersistentObject, base.NovaObject):
     VERSION = '1.0'
 
     fields = {
@@ -37,7 +36,7 @@ class Agent(base.NovaPersistentObject, base.NovaObject,
     @staticmethod
     def _from_db_object(context, agent, db_agent):
         for name in agent.fields:
-            agent[name] = db_agent[name]
+            setattr(agent, name, db_agent[name])
         agent._context = context
         agent.obj_reset_changes()
         return agent
@@ -70,14 +69,12 @@ class Agent(base.NovaPersistentObject, base.NovaObject,
         self.obj_reset_changes()
 
 
+@base.NovaObjectRegistry.register
 class AgentList(base.ObjectListBase, base.NovaObject):
     VERSION = '1.0'
 
     fields = {
         'objects': fields.ListOfObjectsField('Agent'),
-        }
-    child_versions = {
-        '1.0': '1.0',
         }
 
     @base.remotable_classmethod

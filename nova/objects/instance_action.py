@@ -13,14 +13,16 @@
 #    under the License.
 
 from oslo_utils import timeutils
+from oslo_utils import versionutils
 
-from nova import db
+from nova.db import api as db
 from nova import objects
 from nova.objects import base
 from nova.objects import fields
 
 
 # TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
 class InstanceAction(base.NovaPersistentObject, base.NovaObject,
                      base.NovaObjectDictCompat):
     # Version 1.0: Initial version
@@ -54,14 +56,17 @@ class InstanceAction(base.NovaPersistentObject, base.NovaObject,
                   'user_id': context.user_id,
                   'project_id': context.project_id,
                   'action': action_name,
-                  'start_time': context.timestamp}
+                  'start_time': context.timestamp,
+                  'updated_at': context.timestamp}
         return values
 
     @staticmethod
     def pack_action_finish(context, instance_uuid):
+        utcnow = timeutils.utcnow()
         values = {'request_id': context.request_id,
                   'instance_uuid': instance_uuid,
-                  'finish_time': timeutils.utcnow()}
+                  'finish_time': utcnow,
+                  'updated_at': utcnow}
         return values
 
     @base.remotable_classmethod
@@ -93,30 +98,31 @@ class InstanceAction(base.NovaPersistentObject, base.NovaObject,
         self._from_db_object(self._context, self, db_action)
 
 
+@base.NovaObjectRegistry.register
 class InstanceActionList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
-    #              InstanceAction <= version 1.1
-    VERSION = '1.0'
+    # Version 1.1: get_by_instance_uuid added pagination and filters support
+    VERSION = '1.1'
     fields = {
         'objects': fields.ListOfObjectsField('InstanceAction'),
         }
-    child_versions = {
-        '1.0': '1.1',
-        # NOTE(danms): InstanceAction was at 1.1 before we added this
-        }
 
     @base.remotable_classmethod
-    def get_by_instance_uuid(cls, context, instance_uuid):
-        db_actions = db.actions_get(context, instance_uuid)
+    def get_by_instance_uuid(cls, context, instance_uuid, limit=None,
+                             marker=None, filters=None):
+        db_actions = db.actions_get(
+            context, instance_uuid, limit, marker, filters)
         return base.obj_make_list(context, cls(), InstanceAction, db_actions)
 
 
 # TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
 class InstanceActionEvent(base.NovaPersistentObject, base.NovaObject,
                           base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: event_finish_with_failure decorated with serialize_args
-    VERSION = '1.1'
+    # Version 1.2: Add 'host' field
+    VERSION = '1.2'
     fields = {
         'id': fields.IntegerField(),
         'event': fields.StringField(nullable=True),
@@ -125,7 +131,13 @@ class InstanceActionEvent(base.NovaPersistentObject, base.NovaObject,
         'finish_time': fields.DateTimeField(nullable=True),
         'result': fields.StringField(nullable=True),
         'traceback': fields.StringField(nullable=True),
+        'host': fields.StringField(nullable=True),
         }
+
+    def obj_make_compatible(self, primitive, target_version):
+        target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (1, 2) and 'host' in primitive:
+            del primitive['host']
 
     @staticmethod
     def _from_db_object(context, event, db_event):
@@ -136,11 +148,13 @@ class InstanceActionEvent(base.NovaPersistentObject, base.NovaObject,
         return event
 
     @staticmethod
-    def pack_action_event_start(context, instance_uuid, event_name):
+    def pack_action_event_start(context, instance_uuid, event_name,
+                                host=None):
         values = {'event': event_name,
                   'instance_uuid': instance_uuid,
                   'request_id': context.request_id,
-                  'start_time': timeutils.utcnow()}
+                  'start_time': timeutils.utcnow(),
+                  'host': host}
         return values
 
     @staticmethod
@@ -164,9 +178,10 @@ class InstanceActionEvent(base.NovaPersistentObject, base.NovaObject,
         return cls._from_db_object(context, cls(), db_event)
 
     @base.remotable_classmethod
-    def event_start(cls, context, instance_uuid, event_name, want_result=True):
+    def event_start(cls, context, instance_uuid, event_name, want_result=True,
+                    host=None):
         values = cls.pack_action_event_start(context, instance_uuid,
-                                             event_name)
+                                             event_name, host=host)
         db_event = db.action_event_start(context, values)
         if want_result:
             return cls._from_db_object(context, cls(), db_event)
@@ -204,13 +219,13 @@ class InstanceActionEvent(base.NovaPersistentObject, base.NovaObject,
         self.finish_with_failure(self._context, exc_val=None, exc_tb=None)
 
 
+@base.NovaObjectRegistry.register
 class InstanceActionEventList(base.ObjectListBase, base.NovaObject):
+    # Version 1.0: Initial version
+    # Version 1.1: InstanceActionEvent <= 1.1
+    VERSION = '1.1'
     fields = {
         'objects': fields.ListOfObjectsField('InstanceActionEvent'),
-        }
-    child_versions = {
-        '1.0': '1.0',
-        '1.1': '1.1',
         }
 
     @base.remotable_classmethod

@@ -19,48 +19,20 @@
 """Built-in instance properties."""
 
 import re
-import uuid
 
-from oslo_config import cfg
-from oslo_log import log as logging
 from oslo_utils import strutils
+from oslo_utils import uuidutils
 import six
 
-from nova.api.validation import parameter_types
+import nova.conf
 from nova import context
-from nova import db
+from nova.db import api as db
 from nova import exception
 from nova.i18n import _
-from nova.i18n import _LE
 from nova import objects
 from nova import utils
 
-flavor_opts = [
-    cfg.StrOpt('default_flavor',
-               default='m1.small',
-               help='Default flavor to use for the EC2 API only. The Nova API '
-               'does not support a default flavor.'),
-]
-
-CONF = cfg.CONF
-CONF.register_opts(flavor_opts)
-
-LOG = logging.getLogger(__name__)
-
-# NOTE(luisg): Flavor names can include non-ascii characters so that users can
-# create flavor names in locales that use them, however flavor IDs are limited
-# to ascii characters.
-VALID_ID_REGEX = re.compile("^[\w\.\- ]*$")
-VALID_NAME_REGEX = re.compile(parameter_types.valid_name_regex, re.UNICODE)
-
-# NOTE(dosaboy): This is supposed to represent the maximum value that we can
-# place into a SQL single precision float so that we can check whether values
-# are oversize. Postgres and MySQL both define this as their max whereas Sqlite
-# uses dynamic typing so this would not apply. Different dbs react in different
-# ways to oversize values e.g. postgres will raise an exception while mysql
-# will round off the value. Nevertheless we may still want to know prior to
-# insert whether the value is oversize.
-SQL_SP_FLOAT_MAX = 3.40282e+38
+CONF = nova.conf.CONF
 
 # Validate extra specs key names.
 VALID_EXTRASPEC_NAME_REGEX = re.compile(r"[\w\.\- :]+$", re.UNICODE)
@@ -91,10 +63,10 @@ system_metadata_flavor_extra_props = [
 
 
 def create(name, memory, vcpus, root_gb, ephemeral_gb=0, flavorid=None,
-           swap=0, rxtx_factor=1.0, is_public=True):
+           swap=0, rxtx_factor=1.0, is_public=True, description=None):
     """Creates flavors."""
     if not flavorid:
-        flavorid = uuid.uuid4()
+        flavorid = uuidutils.generate_uuid()
 
     kwargs = {
         'memory_mb': memory,
@@ -103,39 +75,15 @@ def create(name, memory, vcpus, root_gb, ephemeral_gb=0, flavorid=None,
         'ephemeral_gb': ephemeral_gb,
         'swap': swap,
         'rxtx_factor': rxtx_factor,
+        'description': description
     }
 
     if isinstance(name, six.string_types):
         name = name.strip()
-    # ensure name do not exceed 255 characters
-    utils.check_string_length(name, 'name', min_length=1, max_length=255)
-
-    # ensure name does not contain any special characters
-    valid_name = VALID_NAME_REGEX.search(name)
-    if not valid_name:
-        msg = _("Flavor names can only contain printable characters "
-                "and horizontal spaces.")
-        raise exception.InvalidInput(reason=msg)
 
     # NOTE(vish): Internally, flavorid is stored as a string but it comes
     #             in through json as an integer, so we convert it here.
-    flavorid = unicode(flavorid)
-
-    # ensure leading/trailing whitespaces not present.
-    if flavorid.strip() != flavorid:
-        msg = _("id cannot contain leading and/or trailing whitespace(s)")
-        raise exception.InvalidInput(reason=msg)
-
-    # ensure flavor id does not exceed 255 characters
-    utils.check_string_length(flavorid, 'id', min_length=1,
-                              max_length=255)
-
-    # ensure flavor id does not contain any special characters
-    valid_flavor_id = VALID_ID_REGEX.search(flavorid)
-    if not valid_flavor_id:
-        msg = _("Flavor id can only contain letters from A-Z (both cases), "
-                "periods, dashes, underscores and spaces.")
-        raise exception.InvalidInput(reason=msg)
+    flavorid = six.text_type(flavorid)
 
     # NOTE(wangbo): validate attributes of the creating flavor.
     # ram and vcpus should be positive ( > 0) integers.
@@ -156,11 +104,11 @@ def create(name, memory, vcpus, root_gb, ephemeral_gb=0, flavorid=None,
     try:
         kwargs['rxtx_factor'] = float(kwargs['rxtx_factor'])
         if (kwargs['rxtx_factor'] <= 0 or
-                kwargs['rxtx_factor'] > SQL_SP_FLOAT_MAX):
+                kwargs['rxtx_factor'] > db.SQL_SP_FLOAT_MAX):
             raise ValueError()
     except ValueError:
         msg = (_("'rxtx_factor' argument must be a float between 0 and %g") %
-               SQL_SP_FLOAT_MAX)
+               db.SQL_SP_FLOAT_MAX)
         raise exception.InvalidInput(reason=msg)
 
     kwargs['name'] = name
@@ -175,78 +123,6 @@ def create(name, memory, vcpus, root_gb, ephemeral_gb=0, flavorid=None,
     flavor = objects.Flavor(context=context.get_admin_context(), **kwargs)
     flavor.create()
     return flavor
-
-
-def destroy(name):
-    """Marks flavor as deleted."""
-    try:
-        if not name:
-            raise ValueError()
-        flavor = objects.Flavor(context=context.get_admin_context(), name=name)
-        flavor.destroy()
-    except (ValueError, exception.NotFound):
-        LOG.exception(_LE('Instance type %s not found for deletion'), name)
-        raise exception.FlavorNotFoundByName(flavor_name=name)
-
-
-def get_all_flavors(ctxt=None, inactive=False, filters=None):
-    """Get all non-deleted flavors as a dict.
-
-    Pass inactive=True if you want deleted flavors returned also.
-    """
-    if ctxt is None:
-        ctxt = context.get_admin_context()
-
-    inst_types = objects.FlavorList.get_all(ctxt, inactive=inactive,
-                                            filters=filters)
-
-    inst_type_dict = {}
-    for inst_type in inst_types:
-        inst_type_dict[inst_type.id] = inst_type
-    return inst_type_dict
-
-
-def get_all_flavors_sorted_list(ctxt=None, filters=None, sort_key='flavorid',
-                                sort_dir='asc', limit=None, marker=None):
-    """Get all non-deleted flavors as a sorted list.
-    """
-    if ctxt is None:
-        ctxt = context.get_admin_context()
-
-    return objects.FlavorList.get_all(ctxt, filters=filters, sort_key=sort_key,
-                                      sort_dir=sort_dir, limit=limit,
-                                      marker=marker)
-
-
-def get_default_flavor():
-    """Get the default flavor."""
-    name = CONF.default_flavor
-    return get_flavor_by_name(name)
-
-
-def get_flavor(instance_type_id, ctxt=None, inactive=False):
-    """Retrieves single flavor by id."""
-    if instance_type_id is None:
-        return get_default_flavor()
-
-    if ctxt is None:
-        ctxt = context.get_admin_context()
-
-    if inactive:
-        ctxt = ctxt.elevated(read_deleted="yes")
-
-    return objects.Flavor.get_by_id(ctxt, instance_type_id)
-
-
-def get_flavor_by_name(name, ctxt=None):
-    """Retrieves single flavor by name."""
-    if name is None:
-        return get_default_flavor()
-
-    if ctxt is None:
-        ctxt = context.get_admin_context()
-
-    return objects.Flavor.get_by_name(ctxt, name)
 
 
 # TODO(termie): flavor-specific code should probably be in the API that uses
@@ -332,30 +208,6 @@ def save_flavor_info(metadata, instance_type, prefix=''):
             if key.startswith(extra_prefix):
                 to_key = '%sinstance_type_extra_%s' % (prefix, key)
                 metadata[to_key] = extra_specs[key]
-
-    return metadata
-
-
-# NOTE(danms): This method is deprecated, do not use it!
-# Instances no longer store flavor information in system_metadata
-def delete_flavor_info(metadata, *prefixes):
-    """Delete flavor instance_type information from instance's system_metadata
-    by prefix.
-    """
-
-    for key in system_metadata_flavor_props.keys():
-        for prefix in prefixes:
-            to_key = '%sinstance_type_%s' % (prefix, key)
-            del metadata[to_key]
-
-    # NOTE(danms): We do NOT save all of extra_specs, but only the
-    # NUMA-related ones that we need to avoid an uglier alternative. This
-    # should be replaced by a general split-out of flavor information from
-    # system_metadata very soon.
-    for key in metadata.keys():
-        for prefix in prefixes:
-            if key.startswith('%sinstance_type_extra_' % prefix):
-                del metadata[key]
 
     return metadata
 

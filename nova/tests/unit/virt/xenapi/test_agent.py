@@ -15,14 +15,16 @@
 
 import base64
 import time
-import uuid
 
 import mock
+from os_xenapi.client import host_agent
+from os_xenapi.client import XenAPI
+from oslo_concurrency import processutils
+from oslo_utils import uuidutils
 
 from nova import exception
 from nova import test
 from nova.virt.xenapi import agent
-from nova.virt.xenapi import fake as xenapi_fake
 
 
 def _get_fake_instance(**kwargs):
@@ -124,26 +126,24 @@ class SkipFileInjectAtBootFlagTestCase(SysMetaKeyTestBase, AgentTestCaseBase):
 
 
 class InjectSshTestCase(AgentTestCaseBase):
-    def test_inject_ssh_key_succeeds(self):
+    @mock.patch.object(agent.XenAPIBasedAgent, 'inject_file')
+    def test_inject_ssh_key_succeeds(self, mock_inject_file):
         instance = _get_fake_instance()
         agent = self._create_agent(instance)
-        self.mox.StubOutWithMock(agent, "inject_file")
 
-        agent.inject_file("/root/.ssh/authorized_keys",
-            "\n# The following ssh key was injected by Nova"
-            "\nssh-rsa asdf\n")
-
-        self.mox.ReplayAll()
         agent.inject_ssh_key()
+        mock_inject_file.assert_called_once_with("/root/.ssh/authorized_keys",
+                                                 "\n# The following ssh key "
+                                                 "was injected by Nova"
+                                                 "\nssh-rsa asdf\n")
 
-    def _test_inject_ssh_key_skipped(self, instance):
+    @mock.patch.object(agent.XenAPIBasedAgent, 'inject_file')
+    def _test_inject_ssh_key_skipped(self, instance, mock_inject_file):
         agent = self._create_agent(instance)
 
         # make sure its not called
-        self.mox.StubOutWithMock(agent, "inject_file")
-        self.mox.ReplayAll()
-
         agent.inject_ssh_key()
+        mock_inject_file.assert_not_called()
 
     def test_inject_ssh_key_skipped_no_key_data(self):
         instance = _get_fake_instance()
@@ -162,76 +162,58 @@ class InjectSshTestCase(AgentTestCaseBase):
 
 
 class FileInjectionTestCase(AgentTestCaseBase):
-    def test_inject_file(self):
+    @mock.patch.object(agent.XenAPIBasedAgent, '_call_agent')
+    def test_inject_file(self, mock_call_agent):
         instance = _get_fake_instance()
         agent = self._create_agent(instance)
-        self.mox.StubOutWithMock(agent, "_call_agent")
 
-        b64_path = base64.b64encode('path')
-        b64_contents = base64.b64encode('contents')
-        agent._call_agent('inject_file',
-                          {'b64_contents': b64_contents,
-                           'b64_path': b64_path})
-
-        self.mox.ReplayAll()
+        b64_path = base64.b64encode(b'path')
+        b64_contents = base64.b64encode(b'contents')
 
         agent.inject_file("path", "contents")
+        mock_call_agent.assert_called_once_with(host_agent.inject_file,
+                                                {'b64_contents': b64_contents,
+                                                 'b64_path': b64_path})
 
-    def test_inject_files(self):
+    @mock.patch.object(agent.XenAPIBasedAgent, 'inject_file')
+    def test_inject_files(self, mock_inject_file):
         instance = _get_fake_instance()
         agent = self._create_agent(instance)
-        self.mox.StubOutWithMock(agent, "inject_file")
 
         files = [("path1", "content1"), ("path2", "content2")]
-        agent.inject_file(*files[0])
-        agent.inject_file(*files[1])
-
-        self.mox.ReplayAll()
 
         agent.inject_files(files)
+        mock_inject_file.assert_has_calls(
+            [mock.call("path1", "content1"), mock.call("path2", "content2")])
 
-    def test_inject_files_skipped_when_cloud_init_installed(self):
+    @mock.patch.object(agent.XenAPIBasedAgent, 'inject_file')
+    def test_inject_files_skipped_when_cloud_init_installed(self,
+                                                            mock_inject_file):
         instance = _get_fake_instance(
                 image_xenapi_skip_agent_inject_files_at_boot="True")
         agent = self._create_agent(instance)
-        self.mox.StubOutWithMock(agent, "inject_file")
 
         files = [("path1", "content1"), ("path2", "content2")]
 
-        self.mox.ReplayAll()
-
         agent.inject_files(files)
-
-
-class FakeRebootException(Exception):
-    details = ["", "", "", "asdf REBOOT: asdf"]
+        mock_inject_file.assert_not_called()
 
 
 class RebootRetryTestCase(AgentTestCaseBase):
     @mock.patch.object(agent, '_wait_for_new_dom_id')
     def test_retry_on_reboot(self, mock_wait):
         mock_session = mock.Mock()
-
-        def fake_call_plugin(*args, **kwargs):
-            if fake_call_plugin.called:
-                return {"returncode": '0', "message": "done"}
-            else:
-                fake_call_plugin.called = True
-                raise FakeRebootException()
-
-        fake_call_plugin.called = False
-        mock_session.XenAPI.Failure = FakeRebootException
         mock_session.VM.get_domid.return_value = "fake_dom_id"
-        mock_session.call_plugin.side_effect = fake_call_plugin
-
         agent = self._create_agent(None, mock_session)
-
-        result = agent._call_agent("asdf")
+        mock_method = mock.Mock().method()
+        mock_method.side_effect = [XenAPI.Failure(["REBOOT: fake"]),
+                                   {"returncode": '0', "message": "done"}]
+        result = agent._call_agent(mock_method)
         self.assertEqual("done", result)
         self.assertTrue(mock_session.VM.get_domid.called)
-        self.assertEqual(2, mock_session.call_plugin.call_count)
-        mock_wait.called_once_with(mock_session, self.vm_ref,
-                                   "fake_dom_id", "asdf")
+        self.assertEqual(2, mock_method.call_count)
+        mock_wait.assert_called_once_with(mock_session, self.vm_ref,
+                                          "fake_dom_id", mock_method)
 
     @mock.patch.object(time, 'sleep')
     @mock.patch.object(time, 'time')
@@ -250,9 +232,9 @@ class RebootRetryTestCase(AgentTestCaseBase):
         self.flags(agent_timeout=3, group="xenserver")
         mock_time.return_value = 0
         mock_session = mock.Mock()
-        old = 40
-        new = 42
-        mock_session.VM.get_domid.side_effect = [old, -1, new]
+        old = "40"
+        new = "42"
+        mock_session.VM.get_domid.side_effect = [old, "-1", new]
 
         agent._wait_for_new_dom_id(mock_session, "vm_ref", old, "method")
 
@@ -273,10 +255,12 @@ class RebootRetryTestCase(AgentTestCaseBase):
         mock_time.side_effect = fake_time
         mock_session = mock.Mock()
         mock_session.VM.get_domid.return_value = "old"
+        mock_method = mock.Mock().method()
+        mock_method.__name__ = "mock_method"
 
         self.assertRaises(exception.AgentTimeout,
                           agent._wait_for_new_dom_id,
-                          mock_session, "vm_ref", "old", "method")
+                          mock_session, "vm_ref", "old", mock_method)
 
         self.assertEqual(4, mock_session.VM.get_domid.call_count)
 
@@ -292,7 +276,8 @@ class SetAdminPasswordTestCase(AgentTestCaseBase):
 
         result = agent._exchange_key_with_agent()
 
-        mock_call_agent.assert_called_once_with('key_init', {"pub": "4321"},
+        mock_call_agent.assert_called_once_with(host_agent.key_init,
+                                                {"pub": "4321"},
                                                 success_codes=['D0'],
                                                 ignore_errors=False)
         result.compute_shared.assert_called_once_with(1234)
@@ -311,7 +296,7 @@ class SetAdminPasswordTestCase(AgentTestCaseBase):
         agent_inst.set_admin_password("new_pass")
 
         mock_dh.encrypt.assert_called_once_with("new_pass\n")
-        mock_call_agent.assert_called_once_with('password',
+        mock_call_agent.assert_called_once_with(host_agent.password,
                                                 {'enc_pass': 'enc_pass'})
         mock_save.assert_called_once_with("new_pass")
 
@@ -326,6 +311,19 @@ class SetAdminPasswordTestCase(AgentTestCaseBase):
         agent_inst.set_admin_password("new_pass")
 
         mock_add_fault.assert_called_once_with(error, mock.ANY)
+
+    @mock.patch('oslo_concurrency.processutils.execute')
+    def test_run_ssl_successful(self, mock_execute):
+        mock_execute.return_value = ('0',
+            '*** WARNING : deprecated key derivation used.'
+            'Using -iter or -pbkdf2 would be better.')
+        agent.SimpleDH()._run_ssl('foo')
+
+    @mock.patch('oslo_concurrency.processutils.execute',
+                side_effect=processutils.ProcessExecutionError(
+                    exit_code=1, stderr=('ERROR: Something bad happened')))
+    def test_run_ssl_failure(self, mock_execute):
+        self.assertRaises(RuntimeError, agent.SimpleDH()._run_ssl, 'foo')
 
 
 class UpgradeRequiredTestCase(test.NoDBTestCase):
@@ -345,7 +343,7 @@ class UpgradeRequiredTestCase(test.NoDBTestCase):
         self.assertTrue(agent.is_upgrade_required('1.2.3', '1.2.3.4'))
 
 
-@mock.patch.object(uuid, "uuid4")
+@mock.patch.object(uuidutils, 'generate_uuid')
 class CallAgentTestCase(AgentTestCaseBase):
     def test_call_agent_success(self, mock_uuid):
         session = mock.Mock()
@@ -354,83 +352,88 @@ class CallAgentTestCase(AgentTestCaseBase):
 
         session.VM.get_domid.return_value = '42'
         mock_uuid.return_value = 1
-        session.call_plugin.return_value = {'returncode': '4',
-                                            'message': "asdf\\r\\n"}
+        mock_method = mock.Mock().method()
+        mock_method.return_value = {'returncode': '4', 'message': "asdf\\r\\n"}
+        mock_method.__name__ = "mock_method"
 
         self.assertEqual("asdf",
                          agent._call_agent(session, instance, "vm_ref",
-                                           "method", addl_args, timeout=300,
+                                           mock_method, addl_args, timeout=300,
                                            success_codes=['0', '4']))
 
-        expected_args = {
-            'id': '1',
-            'dom_id': '42',
-            'timeout': '300',
-        }
+        expected_args = {}
         expected_args.update(addl_args)
+        mock_method.assert_called_once_with(session, 1, '42', 300,
+                                            **expected_args)
         session.VM.get_domid.assert_called_once_with("vm_ref")
-        session.call_plugin.assert_called_once_with("agent", "method",
-                                                    expected_args)
 
-    def _call_agent_setup(self, session, mock_uuid,
+    def _call_agent_setup(self, session, mock_uuid, mock_method,
                           returncode='0', success_codes=None,
                           exception=None):
-        session.XenAPI.Failure = xenapi_fake.Failure
+        session.XenAPI.Failure = XenAPI.Failure
         instance = {"uuid": "fake"}
+        addl_args = {"foo": "bar"}
 
-        session.VM.get_domid.return_value = 42
+        session.VM.get_domid.return_value = "42"
         mock_uuid.return_value = 1
         if exception:
-            session.call_plugin.side_effect = exception
+            mock_method.side_effect = exception
         else:
-            session.call_plugin.return_value = {'returncode': returncode,
-                                                'message': "asdf\\r\\n"}
+            mock_method.return_value = {'returncode': returncode,
+                                        'message': "asdf\\r\\n"}
 
-        return agent._call_agent(session, instance, "vm_ref", "method",
-                                 success_codes=success_codes)
+        return agent._call_agent(session, instance, "vm_ref", mock_method,
+                                 addl_args, success_codes=success_codes)
 
-    def _assert_agent_called(self, session, mock_uuid):
-        expected_args = {
-            'id': '1',
-            'dom_id': '42',
-            'timeout': '30',
-        }
-        session.call_plugin.assert_called_once_with("agent", "method",
-                                                    expected_args)
+    def _assert_agent_called(self, session, mock_uuid, mock_method):
+        expected_args = {"foo": "bar"}
+        mock_uuid.assert_called_once_with()
+        mock_method.assert_called_once_with(session, 1, '42', 30,
+                                            **expected_args)
         session.VM.get_domid.assert_called_once_with("vm_ref")
 
     def test_call_agent_works_with_defaults(self, mock_uuid):
         session = mock.Mock()
-        self._call_agent_setup(session, mock_uuid)
-        self._assert_agent_called(session, mock_uuid)
+        mock_method = mock.Mock().method()
+        mock_method.__name__ = "mock_method"
+        self._call_agent_setup(session, mock_uuid, mock_method)
+        self._assert_agent_called(session, mock_uuid, mock_method)
 
     def test_call_agent_fails_with_timeout(self, mock_uuid):
         session = mock.Mock()
+        mock_method = mock.Mock().method()
+        mock_method.__name__ = "mock_method"
         self.assertRaises(exception.AgentTimeout, self._call_agent_setup,
-                          session, mock_uuid,
-                          exception=xenapi_fake.Failure(["TIMEOUT:fake"]))
-        self._assert_agent_called(session, mock_uuid)
+                          session, mock_uuid, mock_method,
+                          exception=XenAPI.Failure(["TIMEOUT:fake"]))
+        self._assert_agent_called(session, mock_uuid, mock_method)
 
     def test_call_agent_fails_with_not_implemented(self, mock_uuid):
         session = mock.Mock()
+        mock_method = mock.Mock().method()
+        mock_method.__name__ = "mock_method"
         self.assertRaises(exception.AgentNotImplemented,
                           self._call_agent_setup,
-                          session, mock_uuid,
-                          exception=xenapi_fake.Failure(["NOT IMPLEMENTED:"]))
-        self._assert_agent_called(session, mock_uuid)
+                          session, mock_uuid, mock_method,
+                          exception=XenAPI.Failure(["NOT IMPLEMENTED:"]))
+        self._assert_agent_called(session, mock_uuid, mock_method)
 
     def test_call_agent_fails_with_other_error(self, mock_uuid):
         session = mock.Mock()
+        mock_method = mock.Mock().method()
+        mock_method.__name__ = "mock_method"
         self.assertRaises(exception.AgentError, self._call_agent_setup,
-                          session, mock_uuid,
-                          exception=xenapi_fake.Failure(["asdf"]))
-        self._assert_agent_called(session, mock_uuid)
+                          session, mock_uuid, mock_method,
+                          exception=XenAPI.Failure(["asdf"]))
+        self._assert_agent_called(session, mock_uuid, mock_method)
 
     def test_call_agent_fails_with_returned_error(self, mock_uuid):
         session = mock.Mock()
+        mock_method = mock.Mock().method()
+        mock_method.__name__ = "mock_method"
         self.assertRaises(exception.AgentError, self._call_agent_setup,
-                          session, mock_uuid, returncode='42')
-        self._assert_agent_called(session, mock_uuid)
+                          session, mock_uuid, mock_method, returncode='42')
+        self._assert_agent_called(session, mock_uuid, mock_method)
 
 
 class XenAPIBasedAgent(AgentTestCaseBase):

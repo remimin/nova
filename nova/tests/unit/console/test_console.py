@@ -16,35 +16,44 @@
 
 """Tests For Console proxy."""
 
+import fixtures
 import mock
-from oslo_config import cfg
-from oslo_utils import importutils
 
 from nova.compute import rpcapi as compute_rpcapi
 from nova.console import api as console_api
-from nova.console import rpcapi as console_rpcapi
+from nova.console import manager as console_manager
 from nova import context
-from nova import db
+from nova.db import api as db
 from nova import exception
 from nova import objects
 from nova import test
-
-CONF = cfg.CONF
-CONF.import_opt('console_manager', 'nova.service')
-CONF.import_opt('console_driver', 'nova.console.manager')
+from nova.tests.unit import fake_instance
+from nova.tests.unit import fake_xvp_console_proxy
 
 
 class ConsoleTestCase(test.TestCase):
     """Test case for console proxy manager."""
     def setUp(self):
         super(ConsoleTestCase, self).setUp()
-        self.flags(console_driver='nova.console.fake.FakeConsoleProxy',
-                   stub_compute=True)
-        self.console = importutils.import_object(CONF.console_manager)
+        self.useFixture(fixtures.MonkeyPatch(
+            'nova.console.manager.xvp.XVPConsoleProxy',
+            fake_xvp_console_proxy.FakeConsoleProxy))
+        self.console = console_manager.ConsoleProxyManager()
         self.user_id = 'fake'
         self.project_id = 'fake'
         self.context = context.RequestContext(self.user_id, self.project_id)
         self.host = 'test_compute_host'
+        self.pool_info = {'address': '127.0.0.1',
+                          'username': 'test',
+                          'password': '1234pass'}
+
+    def test_reset(self):
+        with mock.patch('nova.compute.rpcapi.ComputeAPI') as mock_rpc:
+            old_rpcapi = self.console.compute_rpcapi
+            self.console.reset()
+            mock_rpc.assert_called_once_with()
+            self.assertNotEqual(old_rpcapi,
+                                self.console.compute_rpcapi)
 
     def _create_instance(self):
         """Create a test instance."""
@@ -55,14 +64,18 @@ class ConsoleTestCase(test.TestCase):
         inst['project_id'] = self.project_id
         inst['instance_type_id'] = 1
         inst['ami_launch_index'] = 0
-        return db.instance_create(self.context, inst)
+        return fake_instance.fake_instance_obj(self.context, **inst)
 
-    def test_get_pool_for_instance_host(self):
+    @mock.patch.object(compute_rpcapi.ComputeAPI, 'get_console_pool_info')
+    def test_get_pool_for_instance_host(self, mock_get):
+        mock_get.return_value = self.pool_info
         pool = self.console._get_pool_for_instance_host(self.context,
                 self.host)
         self.assertEqual(pool['compute_host'], self.host)
 
-    def test_get_pool_creates_new_pool_if_needed(self):
+    @mock.patch.object(compute_rpcapi.ComputeAPI, 'get_console_pool_info')
+    def test_get_pool_creates_new_pool_if_needed(self, mock_get):
+        mock_get.return_value = self.pool_info
         self.assertRaises(exception.NotFound,
                           db.console_pool_get_by_host_type,
                           self.context,
@@ -89,38 +102,49 @@ class ConsoleTestCase(test.TestCase):
                                                        'sometesthostname')
         self.assertEqual(pool['id'], new_pool['id'])
 
-    def test_add_console(self):
+    @mock.patch.object(compute_rpcapi.ComputeAPI, 'get_console_pool_info')
+    @mock.patch('nova.objects.instance.Instance.get_by_id')
+    def test_add_console(self, mock_id, mock_get):
+        mock_get.return_value = self.pool_info
+
         instance = self._create_instance()
-        self.console.add_console(self.context, instance['id'])
-        instance = db.instance_get(self.context, instance['id'])
+        mock_id.return_value = instance
+        self.console.add_console(self.context, instance.id)
         pool = db.console_pool_get_by_host_type(self.context,
-                instance['host'], self.console.host,
+                instance.host, self.console.host,
                 self.console.driver.console_type)
 
         console_instances = [con['instance_uuid'] for con in pool['consoles']]
-        self.assertIn(instance['uuid'], console_instances)
-        db.instance_destroy(self.context, instance['uuid'])
+        self.assertIn(instance.uuid, console_instances)
 
-    def test_add_console_does_not_duplicate(self):
+    @mock.patch.object(compute_rpcapi.ComputeAPI, 'get_console_pool_info')
+    @mock.patch('nova.objects.instance.Instance.get_by_id')
+    def test_add_console_does_not_duplicate(self, mock_id, mock_get):
+        mock_get.return_value = self.pool_info
+
         instance = self._create_instance()
-        cons1 = self.console.add_console(self.context, instance['id'])
-        cons2 = self.console.add_console(self.context, instance['id'])
+        mock_id.return_value = instance
+        cons1 = self.console.add_console(self.context, instance.id)
+        cons2 = self.console.add_console(self.context, instance.id)
         self.assertEqual(cons1, cons2)
-        db.instance_destroy(self.context, instance['uuid'])
 
-    def test_remove_console(self):
+    @mock.patch.object(compute_rpcapi.ComputeAPI, 'get_console_pool_info')
+    @mock.patch('nova.objects.instance.Instance.get_by_id')
+    def test_remove_console(self, mock_id, mock_get):
+        mock_get.return_value = self.pool_info
+
         instance = self._create_instance()
-        console_id = self.console.add_console(self.context, instance['id'])
+        mock_id.return_value = instance
+        console_id = self.console.add_console(self.context, instance.id)
         self.console.remove_console(self.context, console_id)
 
         self.assertRaises(exception.NotFound,
                           db.console_get,
                           self.context,
                           console_id)
-        db.instance_destroy(self.context, instance['uuid'])
 
 
-class ConsoleAPITestCase(test.TestCase):
+class ConsoleAPITestCase(test.NoDBTestCase):
     """Test case for console API."""
     def setUp(self):
         super(ConsoleAPITestCase, self).setUp()
@@ -140,12 +164,12 @@ class ConsoleAPITestCase(test.TestCase):
 
         def _fake_db_console_get(_ctxt, _console_uuid, _instance_uuid):
             return self.fake_console
-        self.stubs.Set(db, 'console_get', _fake_db_console_get)
+        self.stub_out('nova.db.api.console_get', _fake_db_console_get)
 
         def _fake_db_console_get_all_by_instance(_ctxt, _instance_uuid,
                                                  columns_to_join):
             return [self.fake_console]
-        self.stubs.Set(db, 'console_get_all_by_instance',
+        self.stub_out('nova.db.api.console_get_all_by_instance',
                        _fake_db_console_get_all_by_instance)
 
     def test_get_consoles(self):
@@ -157,15 +181,11 @@ class ConsoleAPITestCase(test.TestCase):
                                                'fake_id')
         self.assertEqual(console, self.fake_console)
 
-    def test_delete_console(self):
-        self.mox.StubOutWithMock(console_rpcapi.ConsoleAPI, 'remove_console')
-
-        console_rpcapi.ConsoleAPI.remove_console(self.context, 'fake_id')
-
-        self.mox.ReplayAll()
-
+    @mock.patch('nova.console.rpcapi.ConsoleAPI.remove_console')
+    def test_delete_console(self, mock_remove):
         self.console_api.delete_console(self.context, self.fake_uuid,
                                         'fake_id')
+        mock_remove.assert_called_once_with(self.context, 'fake_id')
 
     @mock.patch.object(compute_rpcapi.ComputeAPI, 'get_console_topic',
                        return_value='compute.fake_host')

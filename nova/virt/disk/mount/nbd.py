@@ -18,24 +18,19 @@ import random
 import re
 import time
 
-from oslo_config import cfg
+from oslo_concurrency import processutils
 from oslo_log import log as logging
+import six
 
-from nova.i18n import _, _LE, _LI, _LW
+import nova.conf
+from nova.i18n import _
+import nova.privsep.fs
 from nova import utils
 from nova.virt.disk.mount import api
 
 LOG = logging.getLogger(__name__)
 
-nbd_opts = [
-    cfg.IntOpt('timeout_nbd',
-               default=10,
-               help='Amount of time, in seconds, to wait for NBD '
-               'device start up.'),
-    ]
-
-CONF = cfg.CONF
-CONF.register_opts(nbd_opts)
+CONF = nova.conf.CONF
 
 NBD_DEVICE_RE = re.compile('nbd[0-9]+')
 
@@ -54,14 +49,14 @@ class NbdMount(api.Mount):
                 if not os.path.exists('/var/lock/qemu-nbd-%s' % device):
                     return device
                 else:
-                    LOG.error(_LE('NBD error - previous umount did not '
-                                  'cleanup /var/lock/qemu-nbd-%s.'), device)
-        LOG.warning(_LW('No free nbd devices'))
+                    LOG.error('NBD error - previous umount did not '
+                              'cleanup /var/lock/qemu-nbd-%s.', device)
+        LOG.warning('No free nbd devices')
         return None
 
     def _allocate_nbd(self):
         if not os.path.exists('/sys/block/nbd0'):
-            LOG.error(_LE('nbd module not loaded'))
+            LOG.error('nbd module not loaded')
             self.error = _('nbd unavailable: module not loaded')
             return None
 
@@ -83,12 +78,15 @@ class NbdMount(api.Mount):
         # NOTE(mikal): qemu-nbd will return an error if the device file is
         # already in use.
         LOG.debug('Get nbd device %(dev)s for %(imgfile)s',
-                  {'dev': device, 'imgfile': self.image})
-        _out, err = utils.trycmd('qemu-nbd', '-c', device, self.image,
-                                 run_as_root=True)
+                  {'dev': device, 'imgfile': self.image.path})
+        try:
+            _out, err = nova.privsep.fs.nbd_connect(device, self.image.path)
+        except processutils.ProcessExecutionError as exc:
+            err = six.text_type(exc)
+
         if err:
             self.error = _('qemu-nbd error: %s') % err
-            LOG.info(_LI('NBD mount error: %s'), self.error)
+            LOG.info('NBD mount error: %s', self.error)
             return False
 
         # NOTE(vish): this forks into another process, so give it a chance
@@ -101,14 +99,17 @@ class NbdMount(api.Mount):
             time.sleep(1)
         else:
             self.error = _('nbd device %s did not show up') % device
-            LOG.info(_LI('NBD mount error: %s'), self.error)
+            LOG.info('NBD mount error: %s', self.error)
 
             # Cleanup
-            _out, err = utils.trycmd('qemu-nbd', '-d', device,
-                                     run_as_root=True)
+            try:
+                _out, err = nova.privsep.fs.nbd_disconnect(device)
+            except processutils.ProcessExecutionError as exc:
+                err = six.text_type(exc)
+
             if err:
-                LOG.warning(_LW('Detaching from erroneous nbd device returned '
-                                'error: %s'), err)
+                LOG.warning('Detaching from erroneous nbd device returned '
+                            'error: %s', err)
             return False
 
         self.error = ''
@@ -123,7 +124,7 @@ class NbdMount(api.Mount):
         if not self.linked:
             return
         LOG.debug('Release nbd device %s', self.device)
-        utils.execute('qemu-nbd', '-d', self.device, run_as_root=True)
+        nova.privsep.fs.nbd_disconnect(self.device)
         self.linked = False
         self.device = None
 
@@ -133,5 +134,4 @@ class NbdMount(api.Mount):
         # Without this flush, when a nbd device gets re-used the
         # qemu-nbd intermittently hangs.
         if self.device:
-            utils.execute('blockdev', '--flushbufs',
-                          self.device, run_as_root=True)
+            nova.privsep.fs.blockdev_flush(self.device)

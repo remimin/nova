@@ -20,147 +20,66 @@
 
 import errno
 import os
-import platform
 import re
+import uuid
 
-from lxml import etree
+import os_traits
 from oslo_concurrency import processutils
-from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_utils import fileutils
 
-from nova.compute import arch
+import nova.conf
 from nova.i18n import _
-from nova.i18n import _LI
-from nova.i18n import _LW
-from nova.storage import linuxscsi
+from nova.objects import fields as obj_fields
+import nova.privsep.fs
+import nova.privsep.idmapshift
+import nova.privsep.libvirt
 from nova import utils
 from nova.virt import images
 from nova.virt.libvirt import config as vconfig
-from nova.virt import volumeutils
+from nova.virt.libvirt.volume import remotefs
 
-libvirt_opts = [
-    cfg.BoolOpt('snapshot_compression',
-                default=False,
-                help='Compress snapshot images when possible. This '
-                     'currently applies exclusively to qcow2 images'),
-    ]
-
-CONF = cfg.CONF
-CONF.register_opts(libvirt_opts, 'libvirt')
-CONF.import_opt('instances_path', 'nova.compute.manager')
+CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
 
+RESIZE_SNAPSHOT_NAME = 'nova-resize'
 
-def execute(*args, **kwargs):
-    return utils.execute(*args, **kwargs)
-
-
-def get_iscsi_initiator():
-    return volumeutils.get_iscsi_initiator()
-
-
-def get_fc_hbas():
-    """Get the Fibre Channel HBA information."""
-    out = None
-    try:
-        out, err = execute('systool', '-c', 'fc_host', '-v',
-                           run_as_root=True)
-    except processutils.ProcessExecutionError as exc:
-        # This handles the case where rootwrap is used
-        # and systool is not installed
-        # 96 = nova.cmd.rootwrap.RC_NOEXECFOUND:
-        if exc.exit_code == 96:
-            LOG.warn(_LW("systool is not installed"))
-        return []
-    except OSError as exc:
-        # This handles the case where rootwrap is NOT used
-        # and systool is not installed
-        if exc.errno == errno.ENOENT:
-            LOG.warn(_LW("systool is not installed"))
-        return []
-
-    if out is None:
-        raise RuntimeError(_("Cannot find any Fibre Channel HBAs"))
-
-    lines = out.split('\n')
-    # ignore the first 2 lines
-    lines = lines[2:]
-    hbas = []
-    hba = {}
-    lastline = None
-    for line in lines:
-        line = line.strip()
-        # 2 newlines denotes a new hba port
-        if line == '' and lastline == '':
-            if len(hba) > 0:
-                hbas.append(hba)
-                hba = {}
-        else:
-            val = line.split('=')
-            if len(val) == 2:
-                key = val[0].strip().replace(" ", "")
-                value = val[1].strip()
-                hba[key] = value.replace('"', '')
-        lastline = line
-
-    return hbas
-
-
-def get_fc_hbas_info():
-    """Get Fibre Channel WWNs and device paths from the system, if any."""
-    # Note modern linux kernels contain the FC HBA's in /sys
-    # and are obtainable via the systool app
-    hbas = get_fc_hbas()
-    hbas_info = []
-    for hba in hbas:
-        # Systems implementing the S390 architecture support virtual HBAs
-        # may be online, or offline. This function should only return
-        # virtual HBAs in the online state
-        if (platform.machine() in (arch.S390, arch.S390X) and
-                              hba['port_state'].lower() != 'online'):
-            continue
-
-        wwpn = hba['port_name'].replace('0x', '')
-        wwnn = hba['node_name'].replace('0x', '')
-        device_path = hba['ClassDevicepath']
-        device = hba['ClassDevice']
-        hbas_info.append({'port_name': wwpn,
-                          'node_name': wwnn,
-                          'host_device': device,
-                          'device_path': device_path})
-    return hbas_info
-
-
-def get_fc_wwpns():
-    """Get Fibre Channel WWPNs from the system, if any."""
-    # Note modern linux kernels contain the FC HBA's in /sys
-    # and are obtainable via the systool app
-    hbas = get_fc_hbas()
-
-    wwpns = []
-    if hbas:
-        for hba in hbas:
-            if hba['port_state'] == 'Online':
-                wwpn = hba['port_name'].replace('0x', '')
-                wwpns.append(wwpn)
-
-    return wwpns
-
-
-def get_fc_wwnns():
-    """Get Fibre Channel WWNNs from the system, if any."""
-    # Note modern linux kernels contain the FC HBA's in /sys
-    # and are obtainable via the systool app
-    hbas = get_fc_hbas()
-
-    wwnns = []
-    if hbas:
-        for hba in hbas:
-            if hba['port_state'] == 'Online':
-                wwnn = hba['node_name'].replace('0x', '')
-                wwnns.append(wwnn)
-
-    return wwnns
+# Mapping used to convert libvirt cpu features to traits, for more details, see
+# https://github.com/libvirt/libvirt/blob/master/src/cpu/cpu_map.xml.
+CPU_TRAITS_MAPPING = {
+    '3dnow': os_traits.HW_CPU_X86_3DNOW,
+    'abm': os_traits.HW_CPU_X86_ABM,
+    'aes': os_traits.HW_CPU_X86_AESNI,
+    'avx': os_traits.HW_CPU_X86_AVX,
+    'avx2': os_traits.HW_CPU_X86_AVX2,
+    'avx512bw': os_traits.HW_CPU_X86_AVX512BW,
+    'avx512cd': os_traits.HW_CPU_X86_AVX512CD,
+    'avx512dq': os_traits.HW_CPU_X86_AVX512DQ,
+    'avx512er': os_traits.HW_CPU_X86_AVX512ER,
+    'avx512f': os_traits.HW_CPU_X86_AVX512F,
+    'avx512pf': os_traits.HW_CPU_X86_AVX512PF,
+    'avx512vl': os_traits.HW_CPU_X86_AVX512VL,
+    'bmi1': os_traits.HW_CPU_X86_BMI,
+    'bmi2': os_traits.HW_CPU_X86_BMI2,
+    'pclmuldq': os_traits.HW_CPU_X86_CLMUL,
+    'f16c': os_traits.HW_CPU_X86_F16C,
+    'fma': os_traits.HW_CPU_X86_FMA3,
+    'fma4': os_traits.HW_CPU_X86_FMA4,
+    'mmx': os_traits.HW_CPU_X86_MMX,
+    'mpx': os_traits.HW_CPU_X86_MPX,
+    'sha-ni': os_traits.HW_CPU_X86_SHA,
+    'sse': os_traits.HW_CPU_X86_SSE,
+    'sse2': os_traits.HW_CPU_X86_SSE2,
+    'sse3': os_traits.HW_CPU_X86_SSE3,
+    'sse4.1': os_traits.HW_CPU_X86_SSE41,
+    'sse4.2': os_traits.HW_CPU_X86_SSE42,
+    'sse4a': os_traits.HW_CPU_X86_SSE4A,
+    'ssse3': os_traits.HW_CPU_X86_SSSE3,
+    'svm': os_traits.HW_CPU_X86_SVM,
+    'tbm': os_traits.HW_CPU_X86_TBM,
+    'vmx': os_traits.HW_CPU_X86_VMX,
+    'xop': os_traits.HW_CPU_X86_XOP
+}
 
 
 def create_image(disk_format, path, size):
@@ -175,7 +94,7 @@ def create_image(disk_format, path, size):
                  M for Mebibytes, 'G' for Gibibytes, 'T' for Tebibytes).
                  If no suffix is given, it will be interpreted as bytes.
     """
-    execute('qemu-img', 'create', '-f', disk_format, path, size)
+    processutils.execute('qemu-img', 'create', '-f', disk_format, path, size)
 
 
 def create_cow_image(backing_file, path, size=None):
@@ -193,17 +112,13 @@ def create_cow_image(backing_file, path, size=None):
         base_details = images.qemu_img_info(backing_file)
     else:
         base_details = None
-    # This doesn't seem to get inherited so force it to...
-    # http://paste.ubuntu.com/1213295/
-    # TODO(harlowja) probably file a bug against qemu-img/qemu
+    # Explicitly inherit the value of 'cluster_size' property of a qcow2
+    # overlay image from its backing file. This can be useful in cases
+    # when people create a base image with a non-default 'cluster_size'
+    # value or cases when images were created with very old QEMU
+    # versions which had a different default 'cluster_size'.
     if base_details and base_details.cluster_size is not None:
         cow_opts += ['cluster_size=%s' % base_details.cluster_size]
-    # For now don't inherit this due the following discussion...
-    # See: http://www.gossamer-threads.com/lists/openstack/dev/10592
-    # if 'preallocation' in base_details:
-    #     cow_opts += ['preallocation=%s' % base_details['preallocation']]
-    if base_details and base_details.encrypted:
-        cow_opts += ['encryption=%s' % base_details.encrypted]
     if size is not None:
         cow_opts += ['size=%s' % size]
     if cow_opts:
@@ -211,7 +126,28 @@ def create_cow_image(backing_file, path, size=None):
         csv_opts = ",".join(cow_opts)
         cow_opts = ['-o', csv_opts]
     cmd = base_cmd + cow_opts + [path]
-    execute(*cmd)
+    processutils.execute(*cmd)
+
+
+def create_ploop_image(disk_format, path, size, fs_type):
+    """Create ploop image
+
+    :param disk_format: Disk image format (as known by ploop)
+    :param path: Desired location of the ploop image
+    :param size: Desired size of ploop image. May be given as an int or
+                 a string. If given as an int, it will be interpreted
+                 as bytes. If it's a string, it should consist of a number
+                 with an optional suffix ('K' for Kibibytes,
+                 M for Mebibytes, 'G' for Gibibytes, 'T' for Tebibytes).
+                 If no suffix is given, it will be interpreted as bytes.
+    :param fs_type: Filesystem type
+    """
+    if not fs_type:
+        fs_type = CONF.default_ephemeral_format or \
+                  nova.privsep.fs.FS_FORMAT_EXT4
+    fileutils.ensure_tree(path)
+    disk_path = os.path.join(path, 'root.hds')
+    nova.privsep.libvirt.ploop_init(size, disk_format, fs_type, disk_path)
 
 
 def pick_disk_driver_name(hypervisor_version, is_block_dev=False):
@@ -233,8 +169,7 @@ def pick_disk_driver_name(hypervisor_version, is_block_dev=False):
             # 4002000 == 4.2.0
             if hypervisor_version >= 4002000:
                 try:
-                    execute('xend', 'status',
-                            run_as_root=True, check_exit_code=True)
+                    nova.privsep.libvirt.xend_probe()
                 except OSError as exc:
                     if exc.errno == errno.ENOENT:
                         LOG.debug("xend is not found")
@@ -242,13 +177,14 @@ def pick_disk_driver_name(hypervisor_version, is_block_dev=False):
                         return 'qemu'
                     else:
                         raise
-                except processutils.ProcessExecutionError as exc:
+                except processutils.ProcessExecutionError:
                     LOG.debug("xend is not started")
                     # libvirt will try to use libxl toolstack
                     return 'qemu'
             # libvirt will use xend/xm toolstack
             try:
-                out, err = execute('tap-ctl', 'check', check_exit_code=False)
+                out, err = processutils.execute('tap-ctl', 'check',
+                                                check_exit_code=False)
                 if out == 'ok\n':
                     # 4000000 == 4.0.0
                     if hypervisor_version > 4000000:
@@ -256,7 +192,7 @@ def pick_disk_driver_name(hypervisor_version, is_block_dev=False):
                     else:
                         return "tap"
                 else:
-                    LOG.info(_LI("tap-ctl check: %s"), out)
+                    LOG.info("tap-ctl check: %s", out)
             except OSError as exc:
                 if exc.errno == errno.ENOENT:
                     LOG.debug("tap-ctl tool is not installed")
@@ -270,37 +206,44 @@ def pick_disk_driver_name(hypervisor_version, is_block_dev=False):
         return None
 
 
-def get_disk_size(path):
+def get_disk_size(path, format=None):
     """Get the (virtual) size of a disk image
 
     :param path: Path to the disk image
+    :param format: the on-disk format of path
     :returns: Size (in bytes) of the given disk image as it would be seen
               by a virtual machine.
     """
-    size = images.qemu_img_info(path).virtual_size
+    size = images.qemu_img_info(path, format).virtual_size
     return int(size)
 
 
-def get_disk_backing_file(path, basename=True):
+def get_disk_backing_file(path, basename=True, format=None):
     """Get the backing file of a disk image
 
     :param path: Path to the disk image
     :returns: a path to the image's backing store
     """
-    backing_file = images.qemu_img_info(path).backing_file
+    backing_file = images.qemu_img_info(path, format).backing_file
     if backing_file and basename:
         backing_file = os.path.basename(backing_file)
 
     return backing_file
 
 
-def copy_image(src, dest, host=None, receive=False):
+def copy_image(src, dest, host=None, receive=False,
+               on_execute=None, on_completion=None,
+               compression=True):
     """Copy a disk image to an existing directory
 
     :param src: Source image
     :param dest: Destination path
     :param host: Remote host
     :param receive: Reverse the rsync direction
+    :param on_execute: Callback method to store pid of process in cache
+    :param on_completion: Callback method to remove pid of process from cache
+    :param compression: Allows to use rsync operation with or without
+                        compression
     """
 
     if not host:
@@ -308,25 +251,18 @@ def copy_image(src, dest, host=None, receive=False):
         # sparse files.  I.E. holes will not be written to DEST,
         # rather recreated efficiently.  In addition, since
         # coreutils 8.11, holes can be read efficiently too.
-        execute('cp', src, dest)
+        # we add '-r' argument because ploop disks are directories
+        processutils.execute('cp', '-r', src, dest)
     else:
         if receive:
             src = "%s:%s" % (utils.safe_ip_format(host), src)
         else:
             dest = "%s:%s" % (utils.safe_ip_format(host), dest)
-        # Try rsync first as that can compress and create sparse dest files.
-        # Note however that rsync currently doesn't read sparse files
-        # efficiently: https://bugzilla.samba.org/show_bug.cgi?id=8918
-        # At least network traffic is mitigated with compression.
-        try:
-            # Do a relatively light weight test first, so that we
-            # can fall back to scp, without having run out of space
-            # on the destination for example.
-            execute('rsync', '--sparse', '--compress', '--dry-run', src, dest)
-        except processutils.ProcessExecutionError:
-            execute('scp', src, dest)
-        else:
-            execute('rsync', '--sparse', '--compress', src, dest)
+
+        remote_filesystem_driver = remotefs.RemoteFilesystem()
+        remote_filesystem_driver.copy_file(src, dest,
+            on_execute=on_execute, on_completion=on_completion,
+            compression=compression)
 
 
 def write_to_file(path, contents, umask=None):
@@ -347,19 +283,6 @@ def write_to_file(path, contents, umask=None):
             os.umask(saved_umask)
 
 
-def chown(path, owner):
-    """Change ownership of file or directory
-
-    :param path: File or directory whose ownership to change
-    :param owner: Desired new owner (given as uid or username)
-    """
-    execute('chown', owner, path, run_as_root=True)
-
-
-def _id_map_to_config(id_map):
-    return "%s:%s:%s" % (id_map.start, id_map.target, id_map.count)
-
-
 def chown_for_id_maps(path, id_maps):
     """Change ownership of file or directory for an id mapped
     environment
@@ -367,14 +290,11 @@ def chown_for_id_maps(path, id_maps):
     :param path: File or directory whose ownership to change
     :param id_maps: List of type LibvirtConfigGuestIDMap
     """
-    uid_maps_str = ','.join([_id_map_to_config(id_map) for id_map in id_maps if
-                             isinstance(id_map,
-                                        vconfig.LibvirtConfigGuestUIDMap)])
-    gid_maps_str = ','.join([_id_map_to_config(id_map) for id_map in id_maps if
-                             isinstance(id_map,
-                                        vconfig.LibvirtConfigGuestGIDMap)])
-    execute('nova-idmapshift', '-i', '-u', uid_maps_str,
-            '-g', gid_maps_str, path, run_as_root=True)
+    uid_maps = [id_map for id_map in id_maps if
+                isinstance(id_map, vconfig.LibvirtConfigGuestUIDMap)]
+    gid_maps = [id_map for id_map in id_maps if
+                isinstance(id_map, vconfig.LibvirtConfigGuestGIDMap)]
+    nova.privsep.idmapshift.shift(path, uid_maps, gid_maps)
 
 
 def extract_snapshot(disk_path, source_fmt, out_path, dest_fmt):
@@ -387,15 +307,12 @@ def extract_snapshot(disk_path, source_fmt, out_path, dest_fmt):
     # NOTE(markmc): ISO is just raw to qemu-img
     if dest_fmt == 'iso':
         dest_fmt = 'raw'
+    if dest_fmt == 'ploop':
+        dest_fmt = 'parallels'
 
-    qemu_img_cmd = ('qemu-img', 'convert', '-f', source_fmt, '-O', dest_fmt)
-
-    # Conditionally enable compression of snapshots.
-    if CONF.libvirt.snapshot_compression and dest_fmt == "qcow2":
-        qemu_img_cmd += ('-c',)
-
-    qemu_img_cmd += (disk_path, out_path)
-    execute(*qemu_img_cmd)
+    compress = CONF.libvirt.snapshot_compression and dest_fmt == "qcow2"
+    images.convert_image(disk_path, out_path, source_fmt, dest_fmt,
+                         compress=compress)
 
 
 def load_file(path):
@@ -410,52 +327,42 @@ def load_file(path):
 def file_open(*args, **kwargs):
     """Open file
 
-    see built-in file() documentation for more details
+    see built-in open() documentation for more details
 
     Note: The reason this is kept in a separate module is to easily
           be able to provide a stub module that doesn't alter system
           state at all (for unit tests)
     """
-    return file(*args, **kwargs)
+    return open(*args, **kwargs)
 
 
-def file_delete(path):
-    """Delete (unlink) file
-
-    Note: The reason this is kept in a separate module is to easily
-          be able to provide a stub module that doesn't alter system
-          state at all (for unit tests)
-    """
-    return os.unlink(path)
-
-
-def path_exists(path):
-    """Returns if path exists
-
-    Note: The reason this is kept in a separate module is to easily
-          be able to provide a stub module that doesn't alter system
-          state at all (for unit tests)
-    """
-    return os.path.exists(path)
-
-
-def find_disk(virt_dom):
+def find_disk(guest):
     """Find root device path for instance
 
     May be file or device
     """
-    xml_desc = virt_dom.XMLDesc(0)
-    domain = etree.fromstring(xml_desc)
-    if CONF.libvirt.virt_type == 'lxc':
-        source = domain.find('devices/filesystem/source')
-        disk_path = source.get('dir')
+    guest_config = guest.get_config()
+
+    disk_format = None
+    if guest_config.virt_type == 'lxc':
+        filesystem = next(d for d in guest_config.devices
+                          if isinstance(d, vconfig.LibvirtConfigGuestFilesys))
+        disk_path = filesystem.source_dir
         disk_path = disk_path[0:disk_path.rfind('rootfs')]
         disk_path = os.path.join(disk_path, 'disk')
+    elif (guest_config.virt_type == 'parallels' and
+          guest_config.os_type == obj_fields.VMMode.EXE):
+        filesystem = next(d for d in guest_config.devices
+                          if isinstance(d, vconfig.LibvirtConfigGuestFilesys))
+        disk_format = filesystem.driver_type
+        disk_path = filesystem.source_file
     else:
-        source = domain.find('devices/disk/source')
-        disk_path = source.get('file') or source.get('dev')
-        if not disk_path and CONF.libvirt.images_type == 'rbd':
-            disk_path = source.get('name')
+        disk = next(d for d in guest_config.devices
+                    if isinstance(d, vconfig.LibvirtConfigGuestDisk))
+        disk_format = disk.driver_format
+        disk_path = disk.source_path if disk.source_type != 'mount' else None
+        if not disk_path and disk.source_protocol == 'rbd':
+            disk_path = disk.source_name
             if disk_path:
                 disk_path = 'rbd:' + disk_path
 
@@ -463,17 +370,25 @@ def find_disk(virt_dom):
         raise RuntimeError(_("Can't retrieve root device path "
                              "from instance libvirt configuration"))
 
-    return disk_path
+    # This is a legacy quirk of libvirt/xen. Everything else should
+    # report the on-disk format in type.
+    if disk_format == 'aio':
+        disk_format = 'raw'
+    return (disk_path, disk_format)
 
 
-def get_disk_type(path):
-    """Retrieve disk type (raw, qcow2, lvm) for given file."""
+def get_disk_type_from_path(path):
+    """Retrieve disk type (raw, qcow2, lvm, ploop) for given file."""
     if path.startswith('/dev'):
         return 'lvm'
     elif path.startswith('rbd:'):
         return 'rbd'
+    elif (os.path.isdir(path) and
+          os.path.exists(os.path.join(path, "DiskDescriptor.xml"))):
+        return 'ploop'
 
-    return images.qemu_img_info(path).file_format
+    # We can't reliably determine the type from this path
+    return None
 
 
 def get_fs_info(path):
@@ -495,38 +410,48 @@ def get_fs_info(path):
             'used': used}
 
 
-def fetch_image(context, target, image_id, user_id, project_id, max_size=0):
-    """Grab image."""
-    images.fetch_to_raw(context, image_id, target, user_id, project_id,
-                        max_size=max_size)
+def fetch_image(context, target, image_id, trusted_certs=None):
+    """Grab image.
+
+    :param context: nova.context.RequestContext auth request context
+    :param target: target path to put the image
+    :param image_id: id of the image to fetch
+    :param trusted_certs: optional objects.TrustedCerts for image validation
+    """
+    images.fetch_to_raw(context, image_id, target, trusted_certs)
 
 
-def get_instance_path(instance, forceold=False, relative=False):
+def fetch_raw_image(context, target, image_id, trusted_certs=None):
+    """Grab initrd or kernel image.
+
+    This function does not attempt raw conversion, as these images will
+    already be in raw format.
+
+    :param context: nova.context.RequestContext auth request context
+    :param target: target path to put the image
+    :param image_id: id of the image to fetch
+    :param trusted_certs: optional objects.TrustedCerts for image validation
+    """
+    images.fetch(context, image_id, target, trusted_certs)
+
+
+def get_instance_path(instance, relative=False):
     """Determine the correct path for instance storage.
 
-    This method determines the directory name for instance storage, while
-    handling the fact that we changed the naming style to something more
-    unique in the grizzly release.
+    This method determines the directory name for instance storage.
 
     :param instance: the instance we want a path for
-    :param forceold: force the use of the pre-grizzly format
     :param relative: if True, just the relative path is returned
 
     :returns: a path to store information about that instance
     """
-    pre_grizzly_name = os.path.join(CONF.instances_path, instance.name)
-    if forceold or os.path.exists(pre_grizzly_name):
-        if relative:
-            return instance.name
-        return pre_grizzly_name
-
     if relative:
         return instance.uuid
     return os.path.join(CONF.instances_path, instance.uuid)
 
 
 def get_instance_path_at_destination(instance, migrate_data=None):
-    """Get the the instance path on destination node while live migration.
+    """Get the instance path on destination node while live migration.
 
     This method determines the directory name for instance storage on
     destination node, while live migration.
@@ -540,7 +465,7 @@ def get_instance_path_at_destination(instance, migrate_data=None):
     """
     instance_relative_path = None
     if migrate_data:
-        instance_relative_path = migrate_data.get('instance_relative_path')
+        instance_relative_path = migrate_data.instance_relative_path
     # NOTE(mikal): this doesn't use libvirt_utils.get_instance_path
     # because we are ensuring that the same instance directory name
     # is used as was at the source
@@ -565,78 +490,102 @@ def get_arch(image_meta):
     :returns: guest (or host) architecture
     """
     if image_meta:
-        image_arch = image_meta.get('properties', {}).get('architecture')
+        image_arch = image_meta.properties.get('hw_architecture')
         if image_arch is not None:
-            return arch.canonicalize(image_arch)
+            return image_arch
 
-    return arch.from_host()
+    return obj_fields.Architecture.from_host()
 
 
 def is_mounted(mount_path, source=None):
     """Check if the given source is mounted at given destination point."""
-    try:
-        check_cmd = ['findmnt', '--target', mount_path]
-        if source:
-            check_cmd.extend(['--source', source])
+    if not os.path.ismount(mount_path):
+        return False
 
-        utils.execute(*check_cmd)
+    if source is None:
         return True
-    except processutils.ProcessExecutionError as exc:
-        return False
-    except OSError as exc:
-        # info since it's not required to have this tool.
-        if exc.errno == errno.ENOENT:
-            LOG.info(_LI("findmnt tool is not installed"))
-        return False
+
+    with open('/proc/mounts', 'r') as proc_mounts:
+        mounts = [mount.split() for mount in proc_mounts.readlines()]
+        return any(mnt[0] == source and mnt[1] == mount_path for mnt in mounts)
 
 
 def is_valid_hostname(hostname):
     return re.match(r"^[\w\-\.:]+$", hostname)
 
 
-def perform_unit_add_for_s390(device_number, target_wwn, lun):
-    """Write the LUN to the port's unit_add attribute."""
-    # NOTE If LUN scanning is turned off on systems following the s390,
-    # or s390x architecture LUNs need to be added to the configuration
-    # using the unit_add call. The unit_add call may fail if a target_wwn
-    # is not accessible for the HBA specified by the device_number.
-    # This can be an expected situation in multipath configurations.
-    # This method will thus only log a warning message in case the
-    # unit_add call fails.
-    LOG.debug("perform unit_add for s390: device_number=(%(device_num)s) "
-              "target_wwn=(%(target_wwn)s) target_lun=(%(target_lun)s)",
-                {'device_num': device_number,
-                 'target_wwn': target_wwn,
-                 'target_lun': lun})
-    zfcp_device_command = ("/sys/bus/ccw/drivers/zfcp/%s/%s/unit_add" %
-                           (device_number, target_wwn))
-    try:
-        linuxscsi.echo_scsi_command(zfcp_device_command, lun)
-    except processutils.ProcessExecutionError as exc:
-            LOG.warn(_LW("unit_add call failed; exit code (%(code)s), "
-                         "stderr (%(stderr)s)"),
-                         {'code': exc.exit_code, 'stderr': exc.stderr})
+def version_to_string(version):
+    """Returns string version based on tuple"""
+    return '.'.join([str(x) for x in version])
 
 
-def perform_unit_remove_for_s390(device_number, target_wwn, lun):
-    """Write the LUN to the port's unit_remove attribute."""
-    # If LUN scanning is turned off on systems following the s390, or s390x
-    # architecture LUNs need to be removed from the configuration using the
-    # unit_remove call. The unit_remove call may fail if the LUN is not
-    # part of the configuration anymore. This may be an expected situation.
-    # For exmple, if LUN scanning is turned on.
-    # This method will thus only log a warning message in case the
-    # unit_remove call fails.
-    LOG.debug("perform unit_remove for s390: device_number=(%(device_num)s) "
-              "target_wwn=(%(target_wwn)s) target_lun=(%(target_lun)s)",
-                {'device_num': device_number,
-                 'target_wwn': target_wwn,
-                 'target_lun': lun})
-    zfcp_device_command = ("/sys/bus/ccw/drivers/zfcp/%s/%s/unit_remove" %
-                           (device_number, target_wwn))
-    try:
-        linuxscsi.echo_scsi_command(zfcp_device_command, lun)
-    except processutils.ProcessExecutionError as exc:
-            LOG.warn(_LW("unit_remove call failed; exit code (%(code)s), "
-                         "stderr (%(stderr)s)"),
-                         {'code': exc.exit_code, 'stderr': exc.stderr})
+def cpu_features_to_traits(features):
+    """Returns this driver's CPU traits dict where keys are trait names from
+    CPU_TRAITS_MAPPING, values are boolean indicates whether the trait should
+    be set in the provider tree.
+    """
+    traits = {trait_name: False for trait_name in CPU_TRAITS_MAPPING.values()}
+    for f in features:
+        if f in CPU_TRAITS_MAPPING:
+            traits[CPU_TRAITS_MAPPING[f]] = True
+
+    return traits
+
+
+def get_cpu_model_from_arch(arch):
+    mode = 'qemu64'
+    if arch == obj_fields.Architecture.I686:
+        mode = 'qemu32'
+    elif arch == obj_fields.Architecture.PPC64LE:
+        mode = 'POWER8'
+    return mode
+
+
+def get_machine_type(image_meta):
+    """The guest machine type can be set as an image metadata property, or
+    otherwise based on architecture-specific defaults. If no defaults are
+    found then None will be returned. This will ultimately lead to QEMU using
+    its own default which is currently the 'pc' machine type.
+    """
+    if image_meta.properties.get('hw_machine_type') is not None:
+        return image_meta.properties.hw_machine_type
+
+    # If set in the config, use that as the default.
+    return get_default_machine_type(get_arch(image_meta))
+
+
+def get_default_machine_type(arch):
+    # NOTE(lyarwood): Values defined in [libvirt]/hw_machine_type take
+    # precedence here if available for the provided arch.
+    for mapping in CONF.libvirt.hw_machine_type or {}:
+        host_arch, _, machine_type = mapping.partition('=')
+        if machine_type == '':
+            LOG.warning("Invalid hw_machine_type config value %s", mapping)
+        elif host_arch == arch:
+            return machine_type
+    # NOTE(kchamart): For ARMv7 and AArch64, use the 'virt' board as the
+    # default machine type.  It is the recommended board, which is designed
+    # to be used with virtual machines.  The 'virt' board is more flexible,
+    # supports PCI, 'virtio', has decent RAM limits, etc.
+    if arch in (obj_fields.Architecture.ARMV7,
+                obj_fields.Architecture.AARCH64):
+        return "virt"
+
+    if arch in (obj_fields.Architecture.S390,
+                obj_fields.Architecture.S390X):
+        return "s390-ccw-virtio"
+    return None
+
+
+def mdev_name2uuid(mdev_name):
+    """Convert an mdev name (of the form mdev_<uuid_with_underscores>) to a
+    uuid (of the form 8-4-4-4-12).
+    """
+    return str(uuid.UUID(mdev_name[5:].replace('_', '-')))
+
+
+def mdev_uuid2name(mdev_uuid):
+    """Convert an mdev uuid (of the form 8-4-4-4-12) to a name (of the form
+    mdev_<uuid_with_underscores>).
+    """
+    return "mdev_" + mdev_uuid.replace('-', '_')

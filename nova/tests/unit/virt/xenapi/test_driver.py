@@ -16,22 +16,26 @@
 import math
 
 import mock
+import os_resource_classes as orc
+from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import units
 
-from nova.compute import arch
+from nova import exception
+from nova.objects import fields as obj_fields
 from nova.tests.unit.virt.xenapi import stubs
 from nova.virt import driver
 from nova.virt import fake
 from nova.virt import xenapi
 from nova.virt.xenapi import driver as xenapi_driver
+from nova.virt.xenapi import host
 
 
 class XenAPIDriverTestCase(stubs.XenAPITestBaseNoDB):
     """Unit tests for Driver operations."""
 
     def _get_driver(self):
-        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
-        self.flags(connection_url='test_url',
+        stubs.stubout_session(self, stubs.FakeSessionForVMTests)
+        self.flags(connection_url='http://localhost',
                    connection_password='test_pass', group='xenserver')
         return xenapi.XenAPIDriver(fake.FakeVirtAPI(), False)
 
@@ -42,7 +46,7 @@ class XenAPIDriverTestCase(stubs.XenAPITestBaseNoDB):
                 'disk_used': 2 * units.Gi,
                 'disk_allocated': 4 * units.Gi,
                 'host_hostname': 'somename',
-                'supported_instances': arch.X86_64,
+                'supported_instances': obj_fields.Architecture.X86_64,
                 'host_cpu_info': {'cpu_count': 50},
                 'cpu_model': {
                     'vendor': 'GenuineIntel',
@@ -66,25 +70,36 @@ class XenAPIDriverTestCase(stubs.XenAPITestBaseNoDB):
                 },
                 'vcpus_used': 10,
                 'pci_passthrough_devices': '',
-                'host_other-config': {'iscsi_iqn': 'someiqn'}}
+                'host_other-config': {'iscsi_iqn': 'someiqn'},
+                'vgpu_stats': {
+                    'c8328467-badf-43d8-8e28-0e096b0f88b1':
+                        {'uuid': '6444c6ee-3a49-42f5-bebb-606b52175e67',
+                         'type_name': 'Intel GVT-g',
+                         'max_heads': 1,
+                         'total': 7,
+                         'remaining': 7,
+                         },
+                     }}
 
     def test_available_resource(self):
         driver = self._get_driver()
         driver._session.product_version = (6, 8, 2)
 
-        self.stubs.Set(driver.host_state, 'get_host_stats', self.host_stats)
+        with mock.patch.object(driver.host_state, 'get_host_stats',
+                               side_effect=self.host_stats) as mock_get:
 
-        resources = driver.get_available_resource(None)
-        self.assertEqual(6008002, resources['hypervisor_version'])
-        self.assertEqual(50, resources['vcpus'])
-        self.assertEqual(3, resources['memory_mb'])
-        self.assertEqual(5, resources['local_gb'])
-        self.assertEqual(10, resources['vcpus_used'])
-        self.assertEqual(3 - 2, resources['memory_mb_used'])
-        self.assertEqual(2, resources['local_gb_used'])
-        self.assertEqual('xen', resources['hypervisor_type'])
-        self.assertEqual('somename', resources['hypervisor_hostname'])
-        self.assertEqual(1, resources['disk_available_least'])
+            resources = driver.get_available_resource(None)
+            self.assertEqual(6008002, resources['hypervisor_version'])
+            self.assertEqual(50, resources['vcpus'])
+            self.assertEqual(3, resources['memory_mb'])
+            self.assertEqual(5, resources['local_gb'])
+            self.assertEqual(10, resources['vcpus_used'])
+            self.assertEqual(3 - 2, resources['memory_mb_used'])
+            self.assertEqual(2, resources['local_gb_used'])
+            self.assertEqual('XenServer', resources['hypervisor_type'])
+            self.assertEqual('somename', resources['hypervisor_hostname'])
+            self.assertEqual(1, resources['disk_available_least'])
+            mock_get.assert_called_once_with(refresh=True)
 
     def test_overhead(self):
         driver = self._get_driver()
@@ -102,11 +117,10 @@ class XenAPIDriverTestCase(stubs.XenAPITestBaseNoDB):
     def test_set_bootable(self):
         driver = self._get_driver()
 
-        self.mox.StubOutWithMock(driver._vmops, 'set_bootable')
-        driver._vmops.set_bootable('inst', True)
-        self.mox.ReplayAll()
-
-        driver.set_bootable('inst', True)
+        with mock.patch.object(driver._vmops,
+                               'set_bootable') as mock_set_bootable:
+            driver.set_bootable('inst', True)
+            mock_set_bootable.assert_called_once_with('inst', True)
 
     def test_post_interrupted_snapshot_cleanup(self):
         driver = self._get_driver()
@@ -126,13 +140,15 @@ class XenAPIDriverTestCase(stubs.XenAPITestBaseNoDB):
         driver = self._get_driver()
         self.flags(connection_url='http://%s' % ip,
                    connection_password='test_pass', group='xenserver')
-        self.stubs.Set(driver.host_state, 'get_host_stats', self.host_stats)
+        with mock.patch.object(driver.host_state, 'get_host_stats',
+                               side_effect=self.host_stats) as mock_get:
 
-        connector = driver.get_volume_connector({'uuid': 'fake'})
-        self.assertIn('ip', connector)
-        self.assertEqual(connector['ip'], ip)
-        self.assertIn('initiator', connector)
-        self.assertEqual(connector['initiator'], 'someiqn')
+            connector = driver.get_volume_connector({'uuid': 'fake'})
+            self.assertIn('ip', connector)
+            self.assertEqual(connector['ip'], ip)
+            self.assertIn('initiator', connector)
+            self.assertEqual(connector['initiator'], 'someiqn')
+            mock_get.assert_called_once_with(refresh=True)
 
     def test_get_block_storage_ip(self):
         my_ip = '123.123.123.123'
@@ -153,3 +169,255 @@ class XenAPIDriverTestCase(stubs.XenAPITestBaseNoDB):
 
         ip = driver._get_block_storage_ip()
         self.assertEqual(my_block_storage_ip, ip)
+
+    @mock.patch.object(xenapi_driver, 'invalid_option')
+    @mock.patch.object(xenapi_driver.vm_utils, 'ensure_correct_host')
+    def test_invalid_options(self, mock_ensure, mock_invalid):
+        driver = self._get_driver()
+        self.flags(independent_compute=True, group='xenserver')
+        self.flags(check_host=True, group='xenserver')
+        self.flags(flat_injected=True)
+        self.flags(default_ephemeral_format='vfat')
+
+        driver.init_host('host')
+
+        expected_calls = [
+            mock.call('CONF.xenserver.check_host', False),
+            mock.call('CONF.flat_injected', False),
+            mock.call('CONF.default_ephemeral_format', 'ext3')]
+        mock_invalid.assert_has_calls(expected_calls)
+
+    @mock.patch.object(xenapi_driver.vm_utils, 'cleanup_attached_vdis')
+    @mock.patch.object(xenapi_driver.vm_utils, 'ensure_correct_host')
+    def test_independent_compute_no_vdi_cleanup(self, mock_ensure,
+                                                mock_cleanup):
+        driver = self._get_driver()
+        self.flags(independent_compute=True, group='xenserver')
+        self.flags(check_host=False, group='xenserver')
+        self.flags(flat_injected=False)
+
+        driver.init_host('host')
+
+        self.assertFalse(mock_cleanup.called)
+        self.assertFalse(mock_ensure.called)
+
+    @mock.patch.object(xenapi_driver.vm_utils, 'cleanup_attached_vdis')
+    @mock.patch.object(xenapi_driver.vm_utils, 'ensure_correct_host')
+    def test_dependent_compute_vdi_cleanup(self, mock_ensure, mock_cleanup):
+        driver = self._get_driver()
+        self.assertFalse(mock_cleanup.called)
+        self.flags(independent_compute=False, group='xenserver')
+        self.flags(check_host=True, group='xenserver')
+
+        driver.init_host('host')
+
+        self.assertTrue(mock_cleanup.called)
+        self.assertTrue(mock_ensure.called)
+
+    @mock.patch.object(xenapi_driver.vmops.VMOps, 'attach_interface')
+    def test_attach_interface(self, mock_attach_interface):
+        driver = self._get_driver()
+        driver.attach_interface('fake_context', 'fake_instance',
+                                'fake_image_meta', 'fake_vif')
+        mock_attach_interface.assert_called_once_with('fake_instance',
+                                                      'fake_vif')
+
+    @mock.patch.object(xenapi_driver.vmops.VMOps, 'detach_interface')
+    def test_detach_interface(self, mock_detach_interface):
+        driver = self._get_driver()
+        driver.detach_interface('fake_context', 'fake_instance', 'fake_vif')
+        mock_detach_interface.assert_called_once_with('fake_instance',
+                                                      'fake_vif')
+
+    @mock.patch.object(xenapi_driver.vmops.VMOps,
+                       'post_live_migration_at_source')
+    def test_post_live_migration_at_source(self, mock_post_live_migration):
+        driver = self._get_driver()
+        driver.post_live_migration_at_source('fake_context', 'fake_instance',
+                                             'fake_network_info')
+        mock_post_live_migration.assert_called_once_with(
+            'fake_context', 'fake_instance', 'fake_network_info')
+
+    @mock.patch.object(xenapi_driver.vmops.VMOps,
+                       'rollback_live_migration_at_destination')
+    def test_rollback_live_migration_at_destination(self, mock_rollback):
+        driver = self._get_driver()
+        driver.rollback_live_migration_at_destination(
+            'fake_context', 'fake_instance', 'fake_network_info',
+            'fake_block_device')
+        mock_rollback.assert_called_once_with('fake_instance',
+                                              'fake_network_info',
+                                              'fake_block_device')
+
+    @mock.patch.object(host.HostState, 'get_host_stats')
+    def test_get_inventory(self, mock_get_stats):
+        expected_inv = {
+            orc.VCPU: {
+                'total': 50,
+                'min_unit': 1,
+                'max_unit': 50,
+                'step_size': 1,
+            },
+            orc.MEMORY_MB: {
+                'total': 3,
+                'min_unit': 1,
+                'max_unit': 3,
+                'step_size': 1,
+            },
+            orc.DISK_GB: {
+                'total': 5,
+                'min_unit': 1,
+                'max_unit': 5,
+                'step_size': 1,
+            },
+            orc.VGPU: {
+                'total': 7,
+                'min_unit': 1,
+                'max_unit': 1,
+                'step_size': 1,
+            },
+        }
+
+        mock_get_stats.side_effect = self.host_stats
+        drv = self._get_driver()
+        inv = drv.get_inventory(mock.sentinel.nodename)
+
+        mock_get_stats.assert_called_once_with(refresh=True)
+        self.assertEqual(expected_inv, inv)
+
+    @mock.patch.object(host.HostState, 'get_host_stats')
+    def test_get_inventory_no_vgpu(self, mock_get_stats):
+        # Test when there are no vGPU resources in the inventory.
+        host_stats = self.host_stats()
+        host_stats.update(vgpu_stats={})
+        mock_get_stats.return_value = host_stats
+
+        drv = self._get_driver()
+        inv = drv.get_inventory(mock.sentinel.nodename)
+
+        # check if the inventory data does NOT contain VGPU.
+        self.assertNotIn(orc.VGPU, inv)
+
+    def test_get_vgpu_total_single_grp(self):
+        # Test when only one group included in the host_stats.
+        vgpu_stats = {
+            'grp_uuid_1': {
+                'total': 7
+            }
+        }
+
+        drv = self._get_driver()
+        vgpu_total = drv._get_vgpu_total(vgpu_stats)
+
+        self.assertEqual(7, vgpu_total)
+
+    def test_get_vgpu_total_multiple_grps(self):
+        # Test when multiple groups included in the host_stats.
+        vgpu_stats = {
+            'grp_uuid_1': {
+                'total': 7
+            },
+            'grp_uuid_2': {
+                'total': 4
+            }
+        }
+
+        drv = self._get_driver()
+        vgpu_total = drv._get_vgpu_total(vgpu_stats)
+
+        self.assertEqual(11, vgpu_total)
+
+    def test_get_vgpu_info_no_vgpu_alloc(self):
+        # no vgpu in allocation.
+        alloc = {
+            'rp1': {
+                'resources': {
+                    'VCPU': 1,
+                    'MEMORY_MB': 512,
+                    'DISK_GB': 1,
+                }
+            }
+        }
+
+        drv = self._get_driver()
+        vgpu_info = drv._get_vgpu_info(alloc)
+
+        self.assertIsNone(vgpu_info)
+
+    @mock.patch.object(host.HostState, 'get_host_stats')
+    def test_get_vgpu_info_has_vgpu_alloc(self, mock_get_stats):
+        # Have vgpu in allocation.
+        alloc = {
+            'rp1': {
+                'resources': {
+                    'VCPU': 1,
+                    'MEMORY_MB': 512,
+                    'DISK_GB': 1,
+                    'VGPU': 1,
+                }
+            }
+        }
+        # The following fake data assumes there are two GPU
+        # groups both of which supply the same type of vGPUs.
+        # If the 1st GPU group has no remaining available vGPUs;
+        # the 2nd GPU group still has remaining available vGPUs.
+        # it should return the uuid from the 2nd GPU group.
+        vgpu_stats = {
+            uuids.gpu_group_1: {
+                'uuid': uuids.vgpu_type,
+                'type_name': 'GRID K180Q',
+                'max_heads': 4,
+                'total': 2,
+                'remaining': 0,
+            },
+            uuids.gpu_group_2: {
+                'uuid': uuids.vgpu_type,
+                'type_name': 'GRID K180Q',
+                'max_heads': 4,
+                'total': 2,
+                'remaining': 2,
+            },
+        }
+
+        host_stats = self.host_stats()
+        host_stats.update(vgpu_stats=vgpu_stats)
+        mock_get_stats.return_value = host_stats
+
+        drv = self._get_driver()
+        vgpu_info = drv._get_vgpu_info(alloc)
+
+        expected_info = {'gpu_grp_uuid': uuids.gpu_group_2,
+                         'vgpu_type_uuid': uuids.vgpu_type}
+        self.assertEqual(expected_info, vgpu_info)
+
+    @mock.patch.object(host.HostState, 'get_host_stats')
+    def test_get_vgpu_info_has_vgpu_alloc_except(self, mock_get_stats):
+        # Allocated vGPU but got exception due to no remaining vGPU.
+        alloc = {
+            'rp1': {
+                'resources': {
+                    'VCPU': 1,
+                    'MEMORY_MB': 512,
+                    'DISK_GB': 1,
+                    'VGPU': 1,
+                }
+            }
+        }
+        vgpu_stats = {
+            uuids.gpu_group: {
+                'uuid': uuids.vgpu_type,
+                'type_name': 'Intel GVT-g',
+                'max_heads': 1,
+                'total': 7,
+                'remaining': 0,
+            },
+        }
+
+        host_stats = self.host_stats()
+        host_stats.update(vgpu_stats=vgpu_stats)
+        mock_get_stats.return_value = host_stats
+
+        drv = self._get_driver()
+        self.assertRaises(exception.ComputeResourcesUnavailable,
+                          drv._get_vgpu_info,
+                          alloc)

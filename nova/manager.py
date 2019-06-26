@@ -51,22 +51,47 @@ This module provides Manager, a base class for managers.
 
 """
 
-from oslo_config import cfg
-from oslo_log import log as logging
+from oslo_service import periodic_task
+import six
 
+import nova.conf
 from nova.db import base
-from nova.openstack.common import periodic_task
+from nova import profiler
 from nova import rpc
 
 
-CONF = cfg.CONF
-CONF.import_opt('host', 'nova.netconf')
-LOG = logging.getLogger(__name__)
+CONF = nova.conf.CONF
 
 
-class Manager(base.Base, periodic_task.PeriodicTasks):
+class PeriodicTasks(periodic_task.PeriodicTasks):
+    def __init__(self):
+        super(PeriodicTasks, self).__init__(CONF)
 
-    def __init__(self, host=None, db_driver=None, service_name='undefined'):
+
+class ManagerMeta(profiler.get_traced_meta(), type(PeriodicTasks)):
+    """Metaclass to trace all children of a specific class.
+
+    This metaclass wraps every public method (not starting with _ or __)
+    of the class using it. All children classes of the class using ManagerMeta
+    will be profiled as well.
+
+    Adding this metaclass requires that the __trace_args__ attribute be added
+    to the class we want to modify. That attribute is a dictionary
+    with one mandatory key: "name". "name" defines the name
+    of the action to be traced (for example, wsgi, rpc, db).
+
+    The OSprofiler-based tracing, although, will only happen if profiler
+    instance was initiated somewhere before in the thread, that can only happen
+    if profiling is enabled in nova.conf and the API call to Nova API contained
+    specific headers.
+    """
+
+
+@six.add_metaclass(ManagerMeta)
+class Manager(base.Base, PeriodicTasks):
+    __trace_args__ = {"name": "rpc"}
+
+    def __init__(self, host=None, service_name='undefined'):
         if not host:
             host = CONF.host
         self.host = host
@@ -74,7 +99,7 @@ class Manager(base.Base, periodic_task.PeriodicTasks):
         self.service_name = service_name
         self.notifier = rpc.get_notifier(self.service_name, self.host)
         self.additional_endpoints = []
-        super(Manager, self).__init__(db_driver)
+        super(Manager, self).__init__()
 
     def periodic_tasks(self, context, raise_on_error=False):
         """Tasks to be run at a periodic interval."""
@@ -112,5 +137,11 @@ class Manager(base.Base, periodic_task.PeriodicTasks):
         and starts 'running'.
 
         Child classes should override this method.
+        """
+        pass
+
+    def reset(self):
+        """Hook called on SIGHUP to signal the manager to re-read any
+        dynamic configuration or do any reconfiguration tasks.
         """
         pass

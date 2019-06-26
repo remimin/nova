@@ -18,7 +18,7 @@ import tempfile
 
 import fixtures
 
-from nova import db
+from nova.db import api as db
 from nova import test
 from nova.tests.unit import utils as test_utils
 
@@ -37,12 +37,6 @@ class TestUtilsTestCase(test.TestCase):
         instance_ref = test_utils.get_test_instance()
         ctxt = test_utils.get_test_admin_context()
         db.instance_get(ctxt, instance_ref['id'])
-
-    def _test_get_test_network_info(self):
-        """Does the return value match a real network_info structure."""
-        # The challenge here is to define what exactly such a structure
-        # must look like.
-        pass
 
     def test_ipv6_supported(self):
         self.assertIn(test_utils.is_ipv6_supported(), (False, True))
@@ -66,5 +60,6 @@ class TestUtilsTestCase(test.TestCase):
                 self.assertTrue(test_utils.is_ipv6_supported())
 
             with fixtures.MonkeyPatch('sys.platform', 'linux2'):
-                with fixtures.MonkeyPatch('__builtin__.open', fake_open):
+                with fixtures.MonkeyPatch('six.moves.builtins.open',
+                                          fake_open):
                     self.assertFalse(test_utils.is_ipv6_supported())

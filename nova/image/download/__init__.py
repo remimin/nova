@@ -13,14 +13,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo_config import cfg
 from oslo_log import log as logging
 import stevedore.driver
 import stevedore.extension
 
-from nova.i18n import _LE
-
-CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
 
 
@@ -38,11 +34,21 @@ def load_transfer_modules():
         schemes_list = mgr.driver.get_schemes()
         for scheme in schemes_list:
             if scheme in module_dictionary:
-                LOG.error(_LE('%(scheme)s is registered as a module twice. '
-                              '%(module_name)s is not being used.'),
+                LOG.error('%(scheme)s is registered as a module twice. '
+                          '%(module_name)s is not being used.',
                           {'scheme': scheme,
                            'module_name': module_name})
             else:
                 module_dictionary[scheme] = mgr.driver
+
+    if module_dictionary:
+        LOG.warning('The nova.image.download.modules extension point is '
+                    'deprecated for removal starting in the 17.0.0 Queens '
+                    'release and may be removed as early as the 18.0.0 Rocky '
+                    'release. It is not maintained and there is no indication '
+                    'of its use in production clouds. If you are using this '
+                    'extension point, please make the nova development team '
+                    'aware by contacting us in the #openstack-nova freenode '
+                    'IRC channel or on the openstack-discuss mailing list.')
 
     return module_dictionary

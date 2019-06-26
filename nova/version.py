@@ -29,11 +29,11 @@ def _load_config():
     # Don't load in global context, since we can't assume
     # these modules are accessible when distutils uses
     # this module
-    import ConfigParser
+    from six.moves import configparser
 
     from oslo_config import cfg
 
-    import logging
+    from oslo_log import log as logging
 
     global loaded, NOVA_VENDOR, NOVA_PRODUCT, NOVA_PACKAGE
     if loaded:
@@ -46,7 +46,7 @@ def _load_config():
         return
 
     try:
-        cfg = ConfigParser.RawConfigParser()
+        cfg = configparser.RawConfigParser()
         cfg.read(cfgfile)
 
         if cfg.has_option("Nova", "vendor"):

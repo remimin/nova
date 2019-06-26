@@ -42,11 +42,5 @@ def upgrade(migrate_engine):
         mysql_engine='InnoDB',
         mysql_charset='utf8'
     )
+
     instance_mappings.create(checkfirst=True)
-
-
-def downgrade(migrate_engine):
-    meta = MetaData(migrate_engine)
-
-    instance_mappings = Table('instance_mappings', meta)
-    instance_mappings.drop(checkfirst=True)

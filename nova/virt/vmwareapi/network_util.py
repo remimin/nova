@@ -17,6 +17,8 @@
 """
 Utility functions for ESX Networking.
 """
+import re
+
 from oslo_log import log as logging
 from oslo_vmware import exceptions as vexc
 from oslo_vmware import vim_util as vutil
@@ -27,6 +29,20 @@ from nova.virt.vmwareapi import vim_util
 from nova.virt.vmwareapi import vm_util
 
 LOG = logging.getLogger(__name__)
+
+# a virtual wire will have the following format:
+# vxw-<dvs-moref>-<virtualwire-moref>-<sid-moref>-<name>
+# Examples:
+# - vxw-dvs-22-virtualwire-89-sid-5008-NAME
+# - vxw-dvs-22-virtualwire-89-sid-5008-UUID
+VWIRE_REGEX = re.compile('vxw-dvs-(\d+)-virtualwire-(\d+)-sid-(\d+)-(.*)')
+
+
+def _get_name_from_dvs_name(dvs_name):
+    vwire = VWIRE_REGEX.match(dvs_name)
+    if not vwire:
+        return dvs_name
+    return vwire.group(4)
 
 
 def _get_network_obj(session, network_objects, network_name):
@@ -58,28 +74,27 @@ def _get_network_obj(session, network_objects, network_name):
             for network in network_refs:
                 # Get network properties
                 if network._type == 'DistributedVirtualPortgroup':
-                    props = session._call_method(vim_util,
-                                "get_dynamic_property", network,
-                                "DistributedVirtualPortgroup", "config")
+                    props = session._call_method(vutil,
+                                                 "get_object_property",
+                                                 network,
+                                                 "config")
                     # NOTE(asomya): This only works on ESXi if the port binding
                     # is set to ephemeral
-                    # For a VLAN the network name will be the UUID. For a VXLAN
-                    # network this will have a VXLAN prefix and then the
-                    # network name.
-                    if network_name in props.name:
+                    net_name = _get_name_from_dvs_name(props.name)
+                    if network_name in net_name:
                         network_obj['type'] = 'DistributedVirtualPortgroup'
                         network_obj['dvpg'] = props.key
-                        dvs_props = session._call_method(vim_util,
-                                        "get_dynamic_property",
+                        dvs_props = session._call_method(vutil,
+                                        "get_object_property",
                                         props.distributedVirtualSwitch,
-                                        "VmwareDistributedVirtualSwitch",
                                         "uuid")
                         network_obj['dvsw'] = dvs_props
                         return network_obj
                 else:
-                    props = session._call_method(vim_util,
-                                "get_dynamic_property", network,
-                                "Network", "summary.name")
+                    props = session._call_method(vutil,
+                                                 "get_object_property",
+                                                 network,
+                                                 "summary.name")
                     if props == network_name:
                         network_obj['type'] = 'Network'
                         network_obj['name'] = network_name
@@ -94,16 +109,12 @@ def get_network_with_the_name(session, network_name="vmnet0", cluster=None):
                                        'get_object_properties',
                                        None, cluster,
                                        'ClusterComputeResource', ['network'])
-    while vm_networks:
-        if vm_networks.objects:
-            network_obj = _get_network_obj(session, vm_networks.objects,
-                                           network_name)
-            if network_obj:
-                session._call_method(vutil, 'cancel_retrieval',
-                                     vm_networks)
-                return network_obj
-        vm_networks = session._call_method(vutil, 'continue_retrieval',
-                                           vm_networks)
+
+    with vutil.WithRetrieval(session.vim, vm_networks) as network_objs:
+        network_obj = _get_network_obj(session, network_objs, network_name)
+        if network_obj:
+            return network_obj
+
     LOG.debug("Network %s not found on cluster!", network_name)
 
 
@@ -113,9 +124,10 @@ def get_vswitch_for_vlan_interface(session, vlan_interface, cluster=None):
     """
     # Get the list of vSwicthes on the Host System
     host_mor = vm_util.get_host_ref(session, cluster)
-    vswitches_ret = session._call_method(vim_util,
-                "get_dynamic_property", host_mor,
-                "HostSystem", "config.network.vswitch")
+    vswitches_ret = session._call_method(vutil,
+                                         "get_object_property",
+                                         host_mor,
+                                         "config.network.vswitch")
     # Meaning there are no vSwitches on the host. Shouldn't be the case,
     # but just doing code check
     if not vswitches_ret:
@@ -136,9 +148,10 @@ def get_vswitch_for_vlan_interface(session, vlan_interface, cluster=None):
 def check_if_vlan_interface_exists(session, vlan_interface, cluster=None):
     """Checks if the vlan_interface exists on the esx host."""
     host_mor = vm_util.get_host_ref(session, cluster)
-    physical_nics_ret = session._call_method(vim_util,
-                "get_dynamic_property", host_mor,
-                "HostSystem", "config.network.pnic")
+    physical_nics_ret = session._call_method(vutil,
+                                             "get_object_property",
+                                             host_mor,
+                                             "config.network.pnic")
     # Meaning there are no physical nics on the host
     if not physical_nics_ret:
         return False
@@ -150,11 +163,12 @@ def check_if_vlan_interface_exists(session, vlan_interface, cluster=None):
 
 
 def get_vlanid_and_vswitch_for_portgroup(session, pg_name, cluster=None):
-    """Get the vlan id and vswicth associated with the port group."""
+    """Get the vlan id and vswitch associated with the port group."""
     host_mor = vm_util.get_host_ref(session, cluster)
-    port_grps_on_host_ret = session._call_method(vim_util,
-                "get_dynamic_property", host_mor,
-                "HostSystem", "config.network.portgroup")
+    port_grps_on_host_ret = session._call_method(vutil,
+                                                 "get_object_property",
+                                                 host_mor,
+                                                 "config.network.portgroup")
     if not port_grps_on_host_ret:
         msg = _("ESX SOAP server returned an empty port group "
                 "for the host system in its response")
@@ -163,8 +177,9 @@ def get_vlanid_and_vswitch_for_portgroup(session, pg_name, cluster=None):
     port_grps_on_host = port_grps_on_host_ret.HostPortGroup
     for p_gp in port_grps_on_host:
         if p_gp.spec.name == pg_name:
-            p_grp_vswitch_name = p_gp.vswitch.split("-")[-1]
+            p_grp_vswitch_name = p_gp.spec.vswitchName
             return p_gp.spec.vlanId, p_grp_vswitch_name
+    return None, None
 
 
 def create_port_group(session, pg_name, vswitch_name, vlan_id=0, cluster=None):
@@ -178,9 +193,10 @@ def create_port_group(session, pg_name, vswitch_name, vlan_id=0, cluster=None):
                     pg_name,
                     vlan_id)
     host_mor = vm_util.get_host_ref(session, cluster)
-    network_system_mor = session._call_method(vim_util,
-        "get_dynamic_property", host_mor,
-        "HostSystem", "configManager.networkSystem")
+    network_system_mor = session._call_method(vutil,
+                                              "get_object_property",
+                                              host_mor,
+                                              "configManager.networkSystem")
     LOG.debug("Creating Port Group with name %s on "
               "the ESX host", pg_name)
     try:

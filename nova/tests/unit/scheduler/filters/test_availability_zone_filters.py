@@ -12,6 +12,7 @@
 
 import mock
 
+from nova import objects
 from nova.scheduler.filters import availability_zone_filter
 from nova import test
 from nova.tests.unit.scheduler import fakes
@@ -26,29 +27,24 @@ class TestAvailabilityZoneFilter(test.NoDBTestCase):
 
     @staticmethod
     def _make_zone_request(zone):
-        return {
-            'context': mock.sentinel.ctx,
-            'request_spec': {
-                'instance_properties': {
-                    'availability_zone': zone
-                }
-            }
-        }
+        return objects.RequestSpec(
+            context=mock.sentinel.ctx,
+            availability_zone=zone)
 
     def test_availability_zone_filter_same(self, agg_mock):
-        agg_mock.return_value = {'availability_zone': 'nova'}
+        agg_mock.return_value = {'availability_zone': set(['nova'])}
         request = self._make_zone_request('nova')
         host = fakes.FakeHostState('host1', 'node1', {})
         self.assertTrue(self.filt_cls.host_passes(host, request))
 
     def test_availability_zone_filter_same_comma(self, agg_mock):
-        agg_mock.return_value = {'availability_zone': 'nova,nova2'}
+        agg_mock.return_value = {'availability_zone': set(['nova', 'nova2'])}
         request = self._make_zone_request('nova')
         host = fakes.FakeHostState('host1', 'node1', {})
         self.assertTrue(self.filt_cls.host_passes(host, request))
 
     def test_availability_zone_filter_different(self, agg_mock):
-        agg_mock.return_value = {'availability_zone': 'nova'}
+        agg_mock.return_value = {'availability_zone': set(['nova'])}
         request = self._make_zone_request('bad')
         host = fakes.FakeHostState('host1', 'node1', {})
         self.assertFalse(self.filt_cls.host_passes(host, request))

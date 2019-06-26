@@ -20,23 +20,16 @@ noVNC consoles. Leverages websockify.py by Joel Martin
 
 import sys
 
-from oslo_config import cfg
 
 from nova.cmd import baseproxy
+import nova.conf
+from nova.conf import vnc
 from nova import config
+from nova.console.securityproxy import rfb
 
 
-opts = [
-    cfg.StrOpt('novncproxy_host',
-               default='0.0.0.0',
-               help='Host on which to listen for incoming requests'),
-    cfg.IntOpt('novncproxy_port',
-               default=6080,
-               help='Port on which to listen for incoming requests'),
-    ]
-
-CONF = cfg.CONF
-CONF.register_cli_opts(opts)
+CONF = nova.conf.CONF
+vnc.register_cli_opts(CONF)
 
 
 def main():
@@ -44,6 +37,13 @@ def main():
     CONF.set_default('web', '/usr/share/novnc')
     config.parse_args(sys.argv)
 
+    # TODO(stephenfin): Always enable the security proxy once we support RFB
+    # version 3.3, as used in XenServer.
+    security_proxy = None
+    if CONF.compute_driver != 'xenapi.XenAPIDriver':
+        security_proxy = rfb.RFBSecurityProxy()
+
     baseproxy.proxy(
-        host=CONF.novncproxy_host,
-        port=CONF.novncproxy_port)
+        host=CONF.vnc.novncproxy_host,
+        port=CONF.vnc.novncproxy_port,
+        security_proxy=security_proxy)

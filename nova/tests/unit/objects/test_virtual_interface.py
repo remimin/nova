@@ -13,8 +13,9 @@
 #    under the License.
 
 import mock
+from oslo_utils.fixture import uuidsentinel as uuids
 
-from nova import db
+from nova.db import api as db
 from nova.objects import virtual_interface as vif_obj
 from nova.tests.unit.objects import test_objects
 
@@ -27,8 +28,9 @@ fake_vif = {
     'id': 1,
     'address': '00:00:00:00:00:00',
     'network_id': 123,
-    'instance_uuid': 'fake-uuid',
-    'uuid': 'fake-uuid-2',
+    'instance_uuid': uuids.instance,
+    'uuid': uuids.uuid,
+    'tag': 'fake-tag',
 }
 
 
@@ -36,7 +38,7 @@ class _TestVirtualInterface(object):
     @staticmethod
     def _compare(test, db, obj):
         for field, value in db.items():
-            test.assertEqual(db[field], obj[field])
+            test.assertEqual(db[field], getattr(obj, field))
 
     def test_get_by_id(self):
         with mock.patch.object(db, 'virtual_interface_get') as get:
@@ -70,8 +72,9 @@ class _TestVirtualInterface(object):
         vif = vif_obj.VirtualInterface(context=self.context)
         vif.address = '00:00:00:00:00:00'
         vif.network_id = 123
-        vif.instance_uuid = 'fake-uuid'
-        vif.uuid = 'fake-uuid-2'
+        vif.instance_uuid = uuids.instance
+        vif.uuid = uuids.uuid
+        vif.tag = 'fake-tag'
 
         with mock.patch.object(db, 'virtual_interface_create') as create:
             create.return_value = fake_vif
@@ -81,12 +84,72 @@ class _TestVirtualInterface(object):
         vif._context = None
         self._compare(self, fake_vif, vif)
 
+    def test_create_neutron_styyyyle(self):
+        vif = vif_obj.VirtualInterface(context=self.context)
+        vif.address = '00:00:00:00:00:00/%s' % uuids.port
+        vif.instance_uuid = uuids.instance
+        vif.uuid = uuids.uuid
+        vif.tag = 'fake-tag'
+
+        with mock.patch.object(db, 'virtual_interface_create') as create:
+            create.return_value = dict(fake_vif,
+                                       address=vif.address)
+            vif.create()
+
+        self.assertEqual(self.context, vif._context)
+        vif._context = None
+        # NOTE(danms): The actual vif should now have the namespace
+        # stripped out
+        self._compare(self, fake_vif, vif)
+
+    def test_save(self):
+        vif = vif_obj.VirtualInterface(context=self.context)
+        vif.address = '00:00:00:00:00:00'
+        vif.network_id = 123
+        vif.instance_uuid = uuids.instance_uuid
+        vif.uuid = uuids.vif_uuid
+        vif.tag = 'foo'
+        vif.create()
+
+        with mock.patch.object(db, 'virtual_interface_update') as update:
+            update.return_value = fake_vif
+            vif.tag = 'bar'
+            vif.save()
+            update.assert_called_once_with(self.context, '00:00:00:00:00:00',
+                                          {'tag': 'bar'})
+
     def test_delete_by_instance_uuid(self):
         with mock.patch.object(db,
                 'virtual_interface_delete_by_instance') as delete:
             vif_obj.VirtualInterface.delete_by_instance_uuid(self.context,
                                                              'fake-uuid')
             delete.assert_called_with(self.context, 'fake-uuid')
+
+    def test_destroy(self):
+        vif = vif_obj.VirtualInterface(context=self.context)
+        vif.address = '00:00:00:00:00:00'
+        vif.network_id = 123
+        vif.instance_uuid = uuids.instance_uuid
+        vif.uuid = uuids.vif_uuid
+        vif.tag = 'foo'
+        vif.create()
+
+        vif = vif_obj.VirtualInterface.get_by_id(self.context, vif.id)
+        vif.destroy()
+        self.assertIsNone(vif_obj.VirtualInterface.get_by_id(self.context,
+                                                             vif.id))
+
+    def test_obj_make_compatible_pre_1_1(self):
+        vif = vif_obj.VirtualInterface(context=self.context)
+        vif.address = '00:00:00:00:00:00'
+        vif.network_id = 123
+        vif.instance_uuid = uuids.instance
+        vif.uuid = uuids.uuid
+        vif.tag = 'fake-tag'
+        data = lambda x: x['nova_object.data']
+        primitive = data(vif.obj_to_primitive(target_version='1.0'))
+        self.assertNotIn('tag', primitive)
+        self.assertIn('uuid', primitive)
 
 
 class TestVirtualInterfaceObject(test_objects._LocalTest,

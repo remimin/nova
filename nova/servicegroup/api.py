@@ -16,28 +16,20 @@
 
 """Define APIs for the servicegroup access."""
 
-from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import importutils
 
-from nova.i18n import _, _LW
+import nova.conf
+from nova.i18n import _LW
 
 LOG = logging.getLogger(__name__)
 
 _driver_name_class_mapping = {
     'db': 'nova.servicegroup.drivers.db.DbDriver',
-    'zk': 'nova.servicegroup.drivers.zk.ZooKeeperDriver',
     'mc': 'nova.servicegroup.drivers.mc.MemcachedDriver'
 }
-_default_driver = 'db'
-servicegroup_driver_opt = cfg.StrOpt('servicegroup_driver',
-                                     default=_default_driver,
-                                     help='The driver for servicegroup '
-                                          'service (valid options are: '
-                                          'db, zk, mc)')
 
-CONF = cfg.CONF
-CONF.register_opt(servicegroup_driver_opt)
+CONF = nova.conf.CONF
 
 # NOTE(geekinutah): By default drivers wait 5 seconds before reporting
 INITIAL_REPORTING_DELAY = 5
@@ -64,14 +56,8 @@ class API(object):
                          'report_interval': report_interval,
                          'new_service_down_time': new_service_down_time})
             CONF.set_override('service_down_time', new_service_down_time)
-        LOG.debug('ServiceGroup driver defined as an instance of %s',
-                  str(CONF.servicegroup_driver))
-        driver_name = CONF.servicegroup_driver
-        try:
-            driver_class = _driver_name_class_mapping[driver_name]
-        except KeyError:
-            raise TypeError(_("unknown ServiceGroup driver name: %s")
-                            % driver_name)
+
+        driver_class = _driver_name_class_mapping[CONF.servicegroup_driver]
         self._driver = importutils.import_object(driver_class,
                                                  *args, **kwargs)
 
@@ -88,10 +74,11 @@ class API(object):
         """Check if the given member is up."""
         # NOTE(johngarbutt) no logging in this method,
         # so this doesn't slow down the scheduler
+        if member.get('forced_down'):
+            return False
+
         return self._driver.is_up(member)
 
-    def get_all(self, group_id):
-        """Returns ALL members of the given group."""
-        LOG.debug('Returns ALL members of the [%s] '
-                  'ServiceGroup', group_id)
-        return self._driver.get_all(group_id)
+    def get_updated_time(self, member):
+        """Get the updated time from drivers except db"""
+        return self._driver.updated_time(member)

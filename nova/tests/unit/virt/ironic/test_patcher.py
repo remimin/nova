@@ -13,9 +13,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import operator
+
 from oslo_config import cfg
 
 from nova import context as nova_context
+from nova import objects
 from nova import test
 from nova.tests.unit import fake_instance
 from nova.tests.unit.virt.ironic import utils as ironic_utils
@@ -32,33 +35,52 @@ class IronicDriverFieldsTestCase(test.NoDBTestCase):
         self.flavor = ironic_utils.get_test_flavor()
         self.ctx = nova_context.get_admin_context()
         self.instance = fake_instance.fake_instance_obj(self.ctx)
+        self.instance.flavor = self.flavor
+        self.node = ironic_utils.get_test_node(driver='fake')
         # Generic expected patches
-        self._expected_deploy_patch = [{'path': '/instance_info/image_source',
-                                        'value': self.image_meta['id'],
-                                        'op': 'add'},
-                                       {'path': '/instance_info/root_gb',
-                                        'value': str(self.instance['root_gb']),
-                                        'op': 'add'},
-                                       {'path': '/instance_info/swap_mb',
-                                        'value': str(self.flavor['swap']),
-                                        'op': 'add'}]
-        self._expected_cleanup_patch = []
+        self._expected_deploy_patch = [
+            {'path': '/instance_info/image_source',
+             'value': self.image_meta.id,
+             'op': 'add'},
+            {'path': '/instance_info/root_gb',
+             'value': str(self.instance.flavor.root_gb),
+             'op': 'add'},
+            {'path': '/instance_info/swap_mb',
+             'value': str(self.flavor['swap']),
+             'op': 'add'},
+            {'path': '/instance_info/display_name',
+             'value': self.instance['display_name'],
+             'op': 'add'},
+            {'path': '/instance_info/vcpus',
+             'value': str(self.instance.flavor.vcpus),
+             'op': 'add'},
+            {'path': '/instance_info/memory_mb',
+             'value': str(self.instance.flavor.memory_mb),
+             'op': 'add'},
+            {'path': '/instance_info/local_gb',
+             'value': str(self.node.properties.get('local_gb', 0)),
+             'op': 'add'},
+            {'path': '/instance_info/nova_host_id',
+             'value': u'fake-host',
+             'op': 'add'},
+        ]
+
+    def assertPatchEqual(self, expected, observed):
+        self.assertEqual(
+            sorted(expected, key=operator.itemgetter('path', 'value')),
+            sorted(observed, key=operator.itemgetter('path', 'value'))
+        )
 
     def test_create_generic(self):
-        node = ironic_utils.get_test_node(driver='fake')
-        patcher_obj = patcher.create(node)
-        self.assertIsInstance(patcher_obj, patcher.GenericDriverFields)
-
-    def test_create_pxe(self):
         node = ironic_utils.get_test_node(driver='pxe_fake')
         patcher_obj = patcher.create(node)
-        self.assertIsInstance(patcher_obj, patcher.PXEDriverFields)
+        self.assertIsInstance(patcher_obj, patcher.GenericDriverFields)
 
     def test_generic_get_deploy_patch(self):
         node = ironic_utils.get_test_node(driver='fake')
         patch = patcher.create(node).get_deploy_patch(
                 self.instance, self.image_meta, self.flavor)
-        self.assertEqual(sorted(self._expected_deploy_patch), sorted(patch))
+        self.assertPatchEqual(self._expected_deploy_patch, patch)
 
     def test_generic_get_deploy_patch_capabilities(self):
         node = ironic_utils.get_test_node(driver='fake')
@@ -69,7 +91,7 @@ class IronicDriverFieldsTestCase(test.NoDBTestCase):
         expected += self._expected_deploy_patch
         patch = patcher.create(node).get_deploy_patch(
                 self.instance, self.image_meta, self.flavor)
-        self.assertEqual(sorted(expected), sorted(patch))
+        self.assertPatchEqual(expected, patch)
 
     def test_generic_get_deploy_patch_capabilities_op(self):
         node = ironic_utils.get_test_node(driver='fake')
@@ -80,7 +102,7 @@ class IronicDriverFieldsTestCase(test.NoDBTestCase):
         expected += self._expected_deploy_patch
         patch = patcher.create(node).get_deploy_patch(
                 self.instance, self.image_meta, self.flavor)
-        self.assertEqual(sorted(expected), sorted(patch))
+        self.assertPatchEqual(expected, patch)
 
     def test_generic_get_deploy_patch_capabilities_nested_key(self):
         node = ironic_utils.get_test_node(driver='fake')
@@ -91,23 +113,106 @@ class IronicDriverFieldsTestCase(test.NoDBTestCase):
         expected += self._expected_deploy_patch
         patch = patcher.create(node).get_deploy_patch(
                 self.instance, self.image_meta, self.flavor)
-        self.assertEqual(sorted(expected), sorted(patch))
+        self.assertPatchEqual(expected, patch)
+
+    def test_generic_get_deploy_patch_traits(self):
+        node = ironic_utils.get_test_node(driver='fake')
+        self.flavor['extra_specs']['trait:CUSTOM_FOO'] = 'required'
+        expected = [{'path': '/instance_info/traits',
+                     'value': ["CUSTOM_FOO"],
+                     'op': 'add'}]
+        expected += self._expected_deploy_patch
+        patch = patcher.create(node).get_deploy_patch(
+                self.instance, self.image_meta, self.flavor)
+        self.assertPatchEqual(expected, patch)
+
+    def test_generic_get_deploy_patch_traits_granular(self):
+        node = ironic_utils.get_test_node(driver='fake')
+        self.flavor['extra_specs']['trait1:CUSTOM_FOO'] = 'required'
+        expected = [{'path': '/instance_info/traits',
+                     'value': ["CUSTOM_FOO"],
+                     'op': 'add'}]
+        expected += self._expected_deploy_patch
+        patch = patcher.create(node).get_deploy_patch(
+                self.instance, self.image_meta, self.flavor)
+        self.assertPatchEqual(expected, patch)
+
+    def test_generic_get_deploy_patch_traits_ignores_not_required(self):
+        node = ironic_utils.get_test_node(driver='fake')
+        self.flavor['extra_specs']['trait:CUSTOM_FOO'] = 'invalid'
+        expected = self._expected_deploy_patch
+        patch = patcher.create(node).get_deploy_patch(
+                self.instance, self.image_meta, self.flavor)
+        self.assertPatchEqual(expected, patch)
+
+    def test_generic_get_deploy_patch_image_traits_required(self):
+        node = ironic_utils.get_test_node(driver='fake')
+        self.image_meta.properties = objects.ImageMetaProps(
+            traits_required=['CUSTOM_TRUSTED'])
+        expected = [{'path': '/instance_info/traits',
+                     'value': ["CUSTOM_TRUSTED"],
+                     'op': 'add'}]
+        expected += self._expected_deploy_patch
+        patch = patcher.create(node).get_deploy_patch(
+            self.instance, self.image_meta, self.flavor)
+        self.assertPatchEqual(expected, patch)
+
+    def test_generic_get_deploy_patch_image_flavor_traits_required(self):
+        node = ironic_utils.get_test_node(driver='fake')
+        self.flavor['extra_specs']['trait:CUSTOM_FOO'] = 'required'
+        self.image_meta.properties = objects.ImageMetaProps(
+            traits_required=['CUSTOM_TRUSTED'])
+        expected = [{'path': '/instance_info/traits',
+                     'value': ["CUSTOM_FOO", "CUSTOM_TRUSTED"],
+                     'op': 'add'}]
+        expected += self._expected_deploy_patch
+        patch = patcher.create(node).get_deploy_patch(
+            self.instance, self.image_meta, self.flavor)
+        self.assertPatchEqual(expected, patch)
+
+    def test_generic_get_deploy_patch_image_flavor_traits_none(self):
+        node = ironic_utils.get_test_node(driver='fake')
+        self.image_meta.properties = objects.ImageMetaProps()
+        expected = self._expected_deploy_patch
+        patch = patcher.create(node).get_deploy_patch(
+            self.instance, self.image_meta, self.flavor)
+        self.assertPatchEqual(expected, patch)
+
+    def test_generic_get_deploy_patch_boot_from_volume_image_traits_required(
+            self):
+        node = ironic_utils.get_test_node(driver='fake')
+        self.image_meta.properties = objects.ImageMetaProps(
+            traits_required=['CUSTOM_TRUSTED'])
+        expected_deploy_patch_volume = [patch for patch in
+                                        self._expected_deploy_patch
+                                        if patch['path'] !=
+                                        '/instance_info/image_source']
+        expected = [{'path': '/instance_info/traits',
+                     'value': ["CUSTOM_TRUSTED"],
+                     'op': 'add'}]
+        expected += expected_deploy_patch_volume
+        patch = patcher.create(node).get_deploy_patch(
+            self.instance, self.image_meta, self.flavor,
+            boot_from_volume=True)
+        self.assertPatchEqual(expected, patch)
 
     def test_generic_get_deploy_patch_ephemeral(self):
         CONF.set_override('default_ephemeral_format', 'testfmt')
         node = ironic_utils.get_test_node(driver='fake')
-        instance = fake_instance.fake_instance_obj(self.ctx,
-                                                   ephemeral_gb=10)
+        instance = fake_instance.fake_instance_obj(
+            self.ctx,
+            flavor=objects.Flavor(root_gb=1, vcpus=1,
+                                  memory_mb=1, ephemeral_gb=10))
         patch = patcher.create(node).get_deploy_patch(
                 instance, self.image_meta, self.flavor)
         expected = [{'path': '/instance_info/ephemeral_gb',
-                     'value': str(instance.ephemeral_gb),
+                     'value': str(instance.flavor.ephemeral_gb),
                      'op': 'add'},
                     {'path': '/instance_info/ephemeral_format',
                      'value': 'testfmt',
                      'op': 'add'}]
         expected += self._expected_deploy_patch
-        self.assertEqual(sorted(expected), sorted(patch))
+        self.assertPatchEqual(expected, patch)
 
     def test_generic_get_deploy_patch_preserve_ephemeral(self):
         node = ironic_utils.get_test_node(driver='fake')
@@ -118,55 +223,13 @@ class IronicDriverFieldsTestCase(test.NoDBTestCase):
             expected = [{'path': '/instance_info/preserve_ephemeral',
                          'value': str(preserve), 'op': 'add', }]
             expected += self._expected_deploy_patch
-            self.assertEqual(sorted(expected), sorted(patch))
+            self.assertPatchEqual(expected, patch)
 
-    def test_generic_get_cleanup_patch(self):
+    def test_generic_get_deploy_patch_boot_from_volume(self):
         node = ironic_utils.get_test_node(driver='fake')
-        patch = patcher.create(node).get_cleanup_patch(self.instance, None,
-                                                       self.flavor)
-        self.assertEqual(self._expected_cleanup_patch, patch)
-
-    def test_pxe_get_deploy_patch(self):
-        node = ironic_utils.get_test_node(driver='pxe_fake')
-        extra_specs = self.flavor['extra_specs']
-        expected = [{'path': '/driver_info/pxe_deploy_kernel',
-                     'value': extra_specs['baremetal:deploy_kernel_id'],
-                     'op': 'add'},
-                    {'path': '/driver_info/pxe_deploy_ramdisk',
-                     'value': extra_specs['baremetal:deploy_ramdisk_id'],
-                     'op': 'add'}]
-        expected += self._expected_deploy_patch
+        expected = [patch for patch in self._expected_deploy_patch
+                    if patch['path'] != '/instance_info/image_source']
         patch = patcher.create(node).get_deploy_patch(
-                self.instance, self.image_meta, self.flavor)
-        self.assertEqual(sorted(expected), sorted(patch))
-
-    def test_pxe_get_deploy_patch_no_flavor_kernel_ramdisk_ids(self):
-        flavor = ironic_utils.get_test_flavor(extra_specs={})
-        node = ironic_utils.get_test_node(driver='pxe_fake')
-        patch = patcher.create(node).get_deploy_patch(
-                self.instance, self.image_meta, flavor)
-        # If there's no extra_specs patch should be exactly like a
-        # generic patch
-        self.assertEqual(sorted(self._expected_deploy_patch), sorted(patch))
-
-    def test_pxe_get_cleanup_patch(self):
-        driver_info = {'pxe_deploy_kernel': 'fake-kernel-id',
-                       'pxe_deploy_ramdisk': 'fake-ramdisk-id'}
-        node = ironic_utils.get_test_node(driver='pxe_fake',
-                                          driver_info=driver_info)
-        patch = patcher.create(node).get_cleanup_patch(self.instance, None,
-                                                       self.flavor)
-        expected = [{'path': '/driver_info/pxe_deploy_kernel',
-                     'op': 'remove'},
-                    {'path': '/driver_info/pxe_deploy_ramdisk',
-                     'op': 'remove'}]
-        self.assertEqual(sorted(expected), sorted(patch))
-
-    def test_pxe_get_cleanup_patch_no_flavor_kernel_ramdisk_ids(self):
-        self.flavor = ironic_utils.get_test_flavor(extra_specs={})
-        node = ironic_utils.get_test_node(driver='pxe_fake')
-        patch = patcher.create(node).get_cleanup_patch(self.instance, None,
-                                                       self.flavor)
-        # If there's no extra_specs patch should be exactly like a
-        # generic patch
-        self.assertEqual(self._expected_cleanup_patch, patch)
+                self.instance, self.image_meta, self.flavor,
+                boot_from_volume=True)
+        self.assertPatchEqual(expected, patch)

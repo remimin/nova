@@ -13,22 +13,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo_config import cfg
 from oslo_log import log as logging
 
+
+import nova.conf
 from nova.scheduler import filters
 from nova.scheduler.filters import utils
 
-opts = [
-    cfg.StrOpt('aggregate_image_properties_isolation_namespace',
-                help='Force the filter to consider only keys matching '
-                     'the given namespace.'),
-    cfg.StrOpt('aggregate_image_properties_isolation_separator',
-                default=".",
-                help='The separator used between the namespace and keys'),
-]
-CONF = cfg.CONF
-CONF.register_opts(opts)
+CONF = nova.conf.CONF
 
 LOG = logging.getLogger(__name__)
 
@@ -39,23 +31,37 @@ class AggregateImagePropertiesIsolation(filters.BaseHostFilter):
     # Aggregate data and instance type does not change within a request
     run_filter_once_per_request = True
 
-    def host_passes(self, host_state, filter_properties):
+    RUN_ON_REBUILD = True
+
+    def host_passes(self, host_state, spec_obj):
         """Checks a host in an aggregate that metadata key/value match
         with image properties.
         """
-        cfg_namespace = CONF.aggregate_image_properties_isolation_namespace
-        cfg_separator = CONF.aggregate_image_properties_isolation_separator
+        cfg_namespace = (CONF.filter_scheduler.
+            aggregate_image_properties_isolation_namespace)
+        cfg_separator = (CONF.filter_scheduler.
+            aggregate_image_properties_isolation_separator)
 
-        spec = filter_properties.get('request_spec', {})
-        image_props = spec.get('image', {}).get('properties', {})
+        image_props = spec_obj.image.properties if spec_obj.image else {}
         metadata = utils.aggregate_metadata_get_by_host(host_state)
 
-        for key, options in metadata.iteritems():
+        for key, options in metadata.items():
             if (cfg_namespace and
                     not key.startswith(cfg_namespace + cfg_separator)):
                 continue
-            prop = image_props.get(key)
-            if prop and prop not in options:
+            prop = None
+            try:
+                prop = image_props.get(key)
+            except AttributeError:
+                LOG.warning("Host '%(host)s' has a metadata key '%(key)s' "
+                            "that is not present in the image metadata.",
+                            {"host": host_state.host, "key": key})
+                continue
+
+            # NOTE(sbauza): Aggregate metadata is only strings, we need to
+            # stringify the property to match with the option
+            # TODO(sbauza): Fix that very ugly pattern matching
+            if prop and str(prop) not in options:
                 LOG.debug("%(host_state)s fails image aggregate properties "
                             "requirements. Property %(prop)s does not "
                             "match %(options)s.",

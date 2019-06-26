@@ -17,13 +17,16 @@ import random
 import time
 
 import mock
-from mox3 import mox
-from oslo_log import log as logging
+from os_xenapi.client import exception as xenapi_exception
+from os_xenapi.client import host_glance
+from os_xenapi.client import XenAPI
 
 from nova.compute import utils as compute_utils
 from nova import context
 from nova import exception
+from nova.image import glance as common_glance
 from nova.tests.unit.virt.xenapi import stubs
+from nova import utils
 from nova.virt.xenapi import driver as xenapi_conn
 from nova.virt.xenapi import fake
 from nova.virt.xenapi.image import glance
@@ -35,10 +38,8 @@ class TestGlanceStore(stubs.XenAPITestBaseNoDB):
         super(TestGlanceStore, self).setUp()
         self.store = glance.GlanceStore()
 
-        self.flags(host='1.1.1.1',
-                   port=123,
-                   api_insecure=False, group='glance')
-        self.flags(connection_url='test_url',
+        self.flags(api_servers=['http://localhost:9292'], group='glance')
+        self.flags(connection_url='http://localhost',
                    connection_password='test_pass',
                    group='xenserver')
 
@@ -46,12 +47,12 @@ class TestGlanceStore(stubs.XenAPITestBaseNoDB):
                 'user', 'project', auth_token='foobar')
 
         fake.reset()
-        stubs.stubout_session(self.stubs, fake.SessionBase)
+        stubs.stubout_session(self, fake.SessionBase)
         driver = xenapi_conn.XenAPIDriver(False)
         self.session = driver._session
 
-        self.stubs.Set(
-                vm_utils, 'get_sr_path', lambda *a, **kw: '/fake/sr/path')
+        self.stub_out('nova.virt.xenapi.vm_utils.get_sr_path',
+                      lambda *a, **kw: '/fake/sr/path')
 
         self.instance = {'uuid': 'blah',
                          'system_metadata': [],
@@ -61,12 +62,10 @@ class TestGlanceStore(stubs.XenAPITestBaseNoDB):
 
     def _get_params(self):
         return {'image_id': 'fake_image_uuid',
-                'glance_host': '1.1.1.1',
-                'glance_port': 123,
-                'glance_use_ssl': False,
+                'endpoint': 'http://localhost:9292',
                 'sr_path': '/fake/sr/path',
-                'extra_headers': {'X-Service-Catalog': '[]',
-                                  'X-Auth-Token': 'foobar',
+                'api_version': 2,
+                'extra_headers': {'X-Auth-Token': 'foobar',
                                   'X-Roles': '',
                                   'X-Tenant-Id': 'project',
                                   'X-User-Id': 'user',
@@ -77,48 +76,37 @@ class TestGlanceStore(stubs.XenAPITestBaseNoDB):
         params['uuid_stack'] = ['uuid1']
         return params
 
-    def test_download_image(self):
+    @mock.patch.object(vm_utils, '_make_uuid_stack', return_value=['uuid1'])
+    def test_download_image(self, mock_make_uuid_stack):
         params = self._get_download_params()
+        with mock.patch.object(self.session, 'call_plugin_serialized'
+                               ) as mock_call_plugin:
+            self.store.download_image(self.context, self.session,
+                                      self.instance, 'fake_image_uuid')
 
-        self.stubs.Set(vm_utils, '_make_uuid_stack',
-                       lambda *a, **kw: ['uuid1'])
-
-        self.mox.StubOutWithMock(self.session, 'call_plugin_serialized')
-        self.session.call_plugin_serialized('glance', 'download_vhd', **params)
-        self.mox.ReplayAll()
-
-        self.store.download_image(self.context, self.session,
-                                  self.instance, 'fake_image_uuid')
-
-        self.mox.VerifyAll()
+            mock_call_plugin.assert_called_once_with('glance.py',
+                                                     'download_vhd2',
+                                                     **params)
+            mock_make_uuid_stack.assert_called_once_with()
 
     @mock.patch.object(vm_utils, '_make_uuid_stack', return_value=['uuid1'])
     @mock.patch.object(random, 'shuffle')
     @mock.patch.object(time, 'sleep')
     @mock.patch.object(compute_utils, 'add_instance_fault_from_exc')
-    @mock.patch.object(logging.getLogger('nova.virt.xenapi.client.session'),
-                       'debug')
-    def test_download_image_retry(self, mock_log_debug, mock_fault, mock_sleep,
+    def test_download_image_retry(self, mock_fault, mock_sleep,
                                   mock_shuffle, mock_make_uuid_stack):
         params = self._get_download_params()
         self.flags(num_retries=2, group='glance')
 
-        params.pop("glance_port")
-        params.pop("glance_host")
-        calls = [mock.call('glance', 'download_vhd', glance_port=9292,
-                           glance_host='10.0.1.1', **params),
-                 mock.call('glance', 'download_vhd', glance_port=9293,
-                            glance_host='10.0.0.1', **params)]
-        log_calls = [mock.call(mock.ANY, {'callback_result': '10.0.1.1',
-                                          'attempts': 3, 'attempt': 1,
-                                          'fn': 'download_vhd',
-                                          'plugin': 'glance'}),
-                     mock.call(mock.ANY, {'callback_result': '10.0.0.1',
-                                          'attempts': 3, 'attempt': 2,
-                                          'fn': 'download_vhd',
-                                          'plugin': 'glance'})]
+        params.pop("endpoint")
+        calls = [mock.call('glance.py', 'download_vhd2',
+                           endpoint='http://10.0.1.1:9292',
+                           **params),
+                 mock.call('glance.py', 'download_vhd2',
+                           endpoint='http://10.0.0.1:9293',
+                           **params)]
 
-        glance_api_servers = ['10.0.1.1:9292',
+        glance_api_servers = ['http://10.0.1.1:9292',
                               'http://10.0.0.1:9293']
         self.flags(api_servers=glance_api_servers, group='glance')
 
@@ -132,125 +120,215 @@ class TestGlanceStore(stubs.XenAPITestBaseNoDB):
                                       self.instance, 'fake_image_uuid')
 
             mock_call_plugin_serialized.assert_has_calls(calls)
-            mock_log_debug.assert_has_calls(log_calls, any_order=True)
 
             self.assertEqual(1, mock_fault.call_count)
 
     def _get_upload_params(self, auto_disk_config=True,
                            expected_os_type='default'):
-        params = self._get_params()
+        params = {}
         params['vdi_uuids'] = ['fake_vdi_uuid']
         params['properties'] = {'auto_disk_config': auto_disk_config,
                                 'os_type': expected_os_type}
         return params
 
-    def _test_upload_image(self, auto_disk_config, expected_os_type='default'):
-        params = self._get_upload_params(auto_disk_config, expected_os_type)
-
-        self.mox.StubOutWithMock(self.session, 'call_plugin_serialized')
-        self.session.call_plugin_serialized('glance', 'upload_vhd', **params)
-
-        self.mox.ReplayAll()
+    @mock.patch.object(utils, 'get_auto_disk_config_from_instance')
+    @mock.patch.object(common_glance, 'generate_identity_headers')
+    @mock.patch.object(vm_utils, 'get_sr_path')
+    @mock.patch.object(host_glance, 'upload_vhd')
+    def test_upload_image(self, mock_upload, mock_sr_path, mock_extra_header,
+                          mock_disk_config):
+        params = self._get_upload_params()
+        mock_upload.return_value = 'fake_upload'
+        mock_sr_path.return_value = 'fake_sr_path'
+        mock_extra_header.return_value = 'fake_extra_header'
+        mock_disk_config.return_value = 'true'
         self.store.upload_image(self.context, self.session, self.instance,
                                 'fake_image_uuid', ['fake_vdi_uuid'])
-        self.mox.VerifyAll()
 
-    def test_upload_image(self):
-        self._test_upload_image(True)
+        mock_sr_path.assert_called_once_with(self.session)
+        mock_extra_header.assert_called_once_with(self.context)
+        mock_upload.assert_called_once_with(
+            self.session, 0, mock.ANY, mock.ANY, 'fake_image_uuid',
+            'fake_sr_path', 'fake_extra_header', **params)
 
-    def test_upload_image_None_os_type(self):
+    @mock.patch.object(utils, 'get_auto_disk_config_from_instance')
+    @mock.patch.object(common_glance, 'generate_identity_headers')
+    @mock.patch.object(vm_utils, 'get_sr_path')
+    @mock.patch.object(host_glance, 'upload_vhd')
+    def test_upload_image_None_os_type(self, mock_upload, mock_sr_path,
+                                       mock_extra_header, mock_disk_config):
         self.instance['os_type'] = None
-        self._test_upload_image(True, 'linux')
+        mock_sr_path.return_value = 'fake_sr_path'
+        mock_extra_header.return_value = 'fake_extra_header'
+        mock_upload.return_value = 'fake_upload'
+        mock_disk_config.return_value = 'true'
+        params = self._get_upload_params(True, 'linux')
+        self.store.upload_image(self.context, self.session, self.instance,
+                                'fake_image_uuid', ['fake_vdi_uuid'])
 
-    def test_upload_image_no_os_type(self):
+        mock_sr_path.assert_called_once_with(self.session)
+        mock_extra_header.assert_called_once_with(self.context)
+        mock_upload.assert_called_once_with(
+            self.session, 0, mock.ANY, mock.ANY, 'fake_image_uuid',
+            'fake_sr_path', 'fake_extra_header', **params)
+        mock_disk_config.assert_called_once_with(self.instance)
+
+    @mock.patch.object(utils, 'get_auto_disk_config_from_instance')
+    @mock.patch.object(common_glance, 'generate_identity_headers')
+    @mock.patch.object(vm_utils, 'get_sr_path')
+    @mock.patch.object(host_glance, 'upload_vhd')
+    def test_upload_image_no_os_type(self, mock_upload, mock_sr_path,
+                                     mock_extra_header, mock_disk_config):
+        mock_sr_path.return_value = 'fake_sr_path'
+        mock_extra_header.return_value = 'fake_extra_header'
+        mock_upload.return_value = 'fake_upload'
         del self.instance['os_type']
-        self._test_upload_image(True, 'linux')
+        params = self._get_upload_params(True, 'linux')
+        self.store.upload_image(self.context, self.session, self.instance,
+                                'fake_image_uuid', ['fake_vdi_uuid'])
 
-    def test_upload_image_auto_config_disk_disabled(self):
+        mock_sr_path.assert_called_once_with(self.session)
+        mock_extra_header.assert_called_once_with(self.context)
+        mock_upload.assert_called_once_with(
+            self.session, 0, mock.ANY, mock.ANY, 'fake_image_uuid',
+            'fake_sr_path', 'fake_extra_header', **params)
+        mock_disk_config.assert_called_once_with(self.instance)
+
+    @mock.patch.object(common_glance, 'generate_identity_headers')
+    @mock.patch.object(vm_utils, 'get_sr_path')
+    @mock.patch.object(host_glance, 'upload_vhd')
+    def test_upload_image_auto_config_disk_disabled(
+            self, mock_upload, mock_sr_path, mock_extra_header):
+        mock_sr_path.return_value = 'fake_sr_path'
+        mock_extra_header.return_value = 'fake_extra_header'
+        mock_upload.return_value = 'fake_upload'
         sys_meta = [{"key": "image_auto_disk_config", "value": "Disabled"}]
         self.instance["system_metadata"] = sys_meta
-        self._test_upload_image("disabled")
+        params = self._get_upload_params("disabled")
+        self.store.upload_image(self.context, self.session, self.instance,
+                                'fake_image_uuid', ['fake_vdi_uuid'])
 
-    def test_upload_image_raises_exception(self):
+        mock_sr_path.assert_called_once_with(self.session)
+        mock_extra_header.assert_called_once_with(self.context)
+        mock_upload.assert_called_once_with(
+            self.session, 0, mock.ANY, mock.ANY, 'fake_image_uuid',
+            'fake_sr_path', 'fake_extra_header', **params)
+
+    @mock.patch.object(common_glance, 'generate_identity_headers')
+    @mock.patch.object(vm_utils, 'get_sr_path')
+    @mock.patch.object(host_glance, 'upload_vhd')
+    def test_upload_image_raises_exception(self, mock_upload, mock_sr_path,
+                                           mock_extra_header):
+
+        mock_sr_path.return_value = 'fake_sr_path'
+        mock_extra_header.return_value = 'fake_extra_header'
+        mock_upload.side_effect = RuntimeError
         params = self._get_upload_params()
-
-        self.mox.StubOutWithMock(self.session, 'call_plugin_serialized')
-        self.session.call_plugin_serialized('glance', 'upload_vhd',
-                                            **params).AndRaise(RuntimeError)
-        self.mox.ReplayAll()
-
         self.assertRaises(RuntimeError, self.store.upload_image,
                           self.context, self.session, self.instance,
                           'fake_image_uuid', ['fake_vdi_uuid'])
-        self.mox.VerifyAll()
 
-    def test_upload_image_retries_then_raises_exception(self):
+        mock_sr_path.assert_called_once_with(self.session)
+        mock_extra_header.assert_called_once_with(self.context)
+        mock_upload.assert_called_once_with(
+            self.session, 0, mock.ANY, mock.ANY, 'fake_image_uuid',
+            'fake_sr_path', 'fake_extra_header', **params)
+
+    @mock.patch.object(time, 'sleep')
+    @mock.patch.object(compute_utils, 'add_instance_fault_from_exc')
+    def test_upload_image_retries_then_raises_exception(self,
+                                                        mock_add_inst,
+                                                        mock_time_sleep):
         self.flags(num_retries=2, group='glance')
-        params = self._get_upload_params()
+        params = self._get_params()
+        params.update(self._get_upload_params())
 
-        self.mox.StubOutWithMock(self.session, 'call_plugin_serialized')
-        self.mox.StubOutWithMock(time, 'sleep')
-        self.mox.StubOutWithMock(compute_utils, 'add_instance_fault_from_exc')
         error_details = ["", "", "RetryableError", ""]
-        error = self.session.XenAPI.Failure(details=error_details)
-        self.session.call_plugin_serialized('glance', 'upload_vhd',
-                                            **params).AndRaise(error)
-        compute_utils.add_instance_fault_from_exc(self.context, self.instance,
-                                                  error, (fake.Failure,
-                                                          error,
-                                                          mox.IgnoreArg()))
-        time.sleep(0.5)
-        self.session.call_plugin_serialized('glance', 'upload_vhd',
-                                            **params).AndRaise(error)
-        compute_utils.add_instance_fault_from_exc(self.context, self.instance,
-                                                  error, (fake.Failure,
-                                                          error,
-                                                          mox.IgnoreArg()))
-        time.sleep(1)
-        self.session.call_plugin_serialized('glance', 'upload_vhd',
-                                            **params).AndRaise(error)
-        compute_utils.add_instance_fault_from_exc(self.context, self.instance,
-                                                  error, (fake.Failure,
-                                                          error,
-                                                          mox.IgnoreArg()))
-        self.mox.ReplayAll()
+        error = XenAPI.Failure(details=error_details)
 
-        self.assertRaises(exception.CouldNotUploadImage,
-                          self.store.upload_image,
+        with mock.patch.object(self.session, 'call_plugin_serialized',
+                               side_effect=error) as mock_call_plugin:
+            self.assertRaises(exception.CouldNotUploadImage,
+                              self.store.upload_image,
+                              self.context, self.session, self.instance,
+                              'fake_image_uuid', ['fake_vdi_uuid'])
+
+            time_sleep_args = [mock.call(0.5), mock.call(1)]
+            call_plugin_args = [
+                mock.call('glance.py', 'upload_vhd2', **params),
+                mock.call('glance.py', 'upload_vhd2', **params),
+                mock.call('glance.py', 'upload_vhd2', **params)]
+            add_inst_args = [
+                mock.call(self.context, self.instance, error,
+                          (XenAPI.Failure, error, mock.ANY)),
+                mock.call(self.context, self.instance, error,
+                          (XenAPI.Failure, error, mock.ANY)),
+                mock.call(self.context, self.instance, error,
+                          (XenAPI.Failure, error, mock.ANY))]
+            mock_time_sleep.assert_has_calls(time_sleep_args)
+            mock_call_plugin.assert_has_calls(call_plugin_args)
+            mock_add_inst.assert_has_calls(add_inst_args)
+
+    @mock.patch.object(time, 'sleep')
+    @mock.patch.object(compute_utils, 'add_instance_fault_from_exc')
+    def test_upload_image_retries_on_signal_exception(self,
+                                                      mock_add_inst,
+                                                      mock_time_sleep):
+        self.flags(num_retries=2, group='glance')
+        params = self._get_params()
+        params.update(self._get_upload_params())
+
+        error_details = ["", "task signaled", "", ""]
+        error = XenAPI.Failure(details=error_details)
+
+        # Note(johngarbutt) XenServer 6.1 and later has this error
+        error_details_v61 = ["", "signal: SIGTERM", "", ""]
+        error_v61 = self.session.XenAPI.Failure(details=error_details_v61)
+
+        with mock.patch.object(self.session, 'call_plugin_serialized',
+                               side_effect=[error, error_v61, None]
+                               ) as mock_call_plugin:
+            self.store.upload_image(self.context, self.session, self.instance,
+                                    'fake_image_uuid', ['fake_vdi_uuid'])
+
+            time_sleep_args = [mock.call(0.5), mock.call(1)]
+            call_plugin_args = [
+                mock.call('glance.py', 'upload_vhd2', **params),
+                mock.call('glance.py', 'upload_vhd2', **params),
+                mock.call('glance.py', 'upload_vhd2', **params)]
+            add_inst_args = [
+                mock.call(self.context, self.instance, error,
+                          (XenAPI.Failure, error, mock.ANY)),
+                mock.call(self.context, self.instance, error_v61,
+                          (XenAPI.Failure, error_v61, mock.ANY))]
+            mock_time_sleep.assert_has_calls(time_sleep_args)
+            mock_call_plugin.assert_has_calls(call_plugin_args)
+            mock_add_inst.assert_has_calls(add_inst_args)
+
+    @mock.patch.object(utils, 'get_auto_disk_config_from_instance')
+    @mock.patch.object(common_glance, 'generate_identity_headers')
+    @mock.patch.object(vm_utils, 'get_sr_path')
+    @mock.patch.object(host_glance, 'upload_vhd')
+    def test_upload_image_raises_exception_image_not_found(self,
+                                                           mock_upload,
+                                                           mock_sr_path,
+                                                           mock_extra_header,
+                                                           mock_disk_config):
+        params = self._get_upload_params()
+        mock_upload.return_value = 'fake_upload'
+        mock_sr_path.return_value = 'fake_sr_path'
+        mock_extra_header.return_value = 'fake_extra_header'
+        mock_disk_config.return_value = 'true'
+        image_id = 'fake_image_id'
+        mock_upload.side_effect = xenapi_exception.PluginImageNotFound(
+            image_id=image_id
+        )
+        self.assertRaises(exception.ImageNotFound, self.store.upload_image,
                           self.context, self.session, self.instance,
                           'fake_image_uuid', ['fake_vdi_uuid'])
-        self.mox.VerifyAll()
 
-    def test_upload_image_retries_on_signal_exception(self):
-        self.flags(num_retries=2, group='glance')
-        params = self._get_upload_params()
-
-        self.mox.StubOutWithMock(self.session, 'call_plugin_serialized')
-        self.mox.StubOutWithMock(time, 'sleep')
-        self.mox.StubOutWithMock(compute_utils, 'add_instance_fault_from_exc')
-        error_details = ["", "task signaled", "", ""]
-        error = self.session.XenAPI.Failure(details=error_details)
-        self.session.call_plugin_serialized('glance', 'upload_vhd',
-                                            **params).AndRaise(error)
-        compute_utils.add_instance_fault_from_exc(self.context, self.instance,
-                                                  error, (fake.Failure,
-                                                          error,
-                                                          mox.IgnoreArg()))
-        time.sleep(0.5)
-        # Note(johngarbutt) XenServer 6.1 and later has this error
-        error_details = ["", "signal: SIGTERM", "", ""]
-        error = self.session.XenAPI.Failure(details=error_details)
-        self.session.call_plugin_serialized('glance', 'upload_vhd',
-                                            **params).AndRaise(error)
-        compute_utils.add_instance_fault_from_exc(self.context, self.instance,
-                                                  error, (fake.Failure,
-                                                          error,
-                                                          mox.IgnoreArg()))
-        time.sleep(1)
-        self.session.call_plugin_serialized('glance', 'upload_vhd',
-                                            **params)
-        self.mox.ReplayAll()
-
-        self.store.upload_image(self.context, self.session, self.instance,
-                                'fake_image_uuid', ['fake_vdi_uuid'])
-        self.mox.VerifyAll()
+        mock_sr_path.assert_called_once_with(self.session)
+        mock_extra_header.assert_called_once_with(self.context)
+        mock_upload.assert_called_once_with(
+            self.session, 0, mock.ANY, mock.ANY, 'fake_image_uuid',
+            'fake_sr_path', 'fake_extra_header', **params)

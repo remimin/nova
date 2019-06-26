@@ -22,26 +22,33 @@ import collections
 import copy
 import functools
 
-from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import excutils
 from oslo_utils import units
 from oslo_vmware import exceptions as vexc
 from oslo_vmware.objects import datastore as ds_obj
 from oslo_vmware import pbm
+from oslo_vmware import vim_util as vutil
 
+
+import nova.conf
 from nova import exception
-from nova.i18n import _, _LE, _LI, _LW
+from nova.i18n import _
 from nova.network import model as network_model
 from nova.virt.vmwareapi import constants
 from nova.virt.vmwareapi import vim_util
 
-CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
+
+CONF = nova.conf.CONF
 
 ALL_SUPPORTED_NETWORK_DEVICES = ['VirtualE1000', 'VirtualE1000e',
                                  'VirtualPCNet32', 'VirtualSriovEthernetCard',
-                                 'VirtualVmxnet']
+                                 'VirtualVmxnet', 'VirtualVmxnet3']
+
+# A simple cache for storing inventory folder references.
+# Format: {inventory_path: folder_ref}
+_FOLDER_PATH_REF_MAPPING = {}
 
 # A cache for VM references. The key will be the VM name
 # and the value is the VM reference. The VM name is unique. This
@@ -51,32 +58,51 @@ ALL_SUPPORTED_NETWORK_DEVICES = ['VirtualE1000', 'VirtualE1000e',
 _VM_REFS_CACHE = {}
 
 
-class CpuLimits(object):
+class Limits(object):
 
-    def __init__(self, cpu_limit=None, cpu_reservation=None,
-                 cpu_shares_level=None, cpu_shares_share=None):
-        """CpuLimits object holds instance cpu limits for convenience."""
-        self.cpu_limit = cpu_limit
-        self.cpu_reservation = cpu_reservation
-        self.cpu_shares_level = cpu_shares_level
-        self.cpu_shares_share = cpu_shares_share
+    def __init__(self, limit=None, reservation=None,
+                 shares_level=None, shares_share=None):
+        """imits object holds instance limits for convenience."""
+        self.limit = limit
+        self.reservation = reservation
+        self.shares_level = shares_level
+        self.shares_share = shares_share
+
+    def validate(self):
+        if self.shares_level in ('high', 'normal', 'low'):
+            if self.shares_share:
+                reason = _("Share level '%s' cannot have share "
+                           "configured") % self.shares_level
+                raise exception.InvalidInput(reason=reason)
+            return
+        if self.shares_level == 'custom':
+            return
+        if self.shares_level:
+            reason = _("Share '%s' is not supported") % self.shares_level
+            raise exception.InvalidInput(reason=reason)
+
+    def has_limits(self):
+        return bool(self.limit or
+                    self.reservation or
+                    self.shares_level)
 
 
 class ExtraSpecs(object):
 
     def __init__(self, cpu_limits=None, hw_version=None,
-                 storage_policy=None):
+                 storage_policy=None, cores_per_socket=None,
+                 memory_limits=None, disk_io_limits=None,
+                 vif_limits=None, firmware=None, hw_video_ram=None):
         """ExtraSpecs object holds extra_specs for the instance."""
-        if cpu_limits is None:
-            cpu_limits = CpuLimits()
-        self.cpu_limits = cpu_limits
+        self.cpu_limits = cpu_limits or Limits()
+        self.memory_limits = memory_limits or Limits()
+        self.disk_io_limits = disk_io_limits or Limits()
+        self.vif_limits = vif_limits or Limits()
         self.hw_version = hw_version
         self.storage_policy = storage_policy
-
-    def has_cpu_limits(self):
-        return bool(self.cpu_limits.cpu_limit or
-                    self.cpu_limits.cpu_reservation or
-                    self.cpu_limits.cpu_shares_level)
+        self.cores_per_socket = cores_per_socket
+        self.firmware = firmware
+        self.hw_video_ram = hw_video_ram
 
 
 def vm_refs_cache_reset():
@@ -119,6 +145,7 @@ def vm_ref_cache_from_name(func):
         return _vm_ref_cache(id, func, session, name)
     return wrapper
 
+
 # the config key which stores the VNC port
 VNC_CONFIG_KEY = 'config.extraConfig["RemoteDisplay.vnc.port"]'
 
@@ -135,47 +162,55 @@ def _iface_id_option_value(client_factory, iface_id, port_index):
     return opt
 
 
-def _get_allocation_info(client_factory, extra_specs):
-    allocation = client_factory.create('ns0:ResourceAllocationInfo')
-    if extra_specs.cpu_limits.cpu_limit:
-        allocation.limit = extra_specs.cpu_limits.cpu_limit
+def _get_allocation_info(client_factory, limits, allocation_type):
+    allocation = client_factory.create(allocation_type)
+    if limits.limit:
+        allocation.limit = limits.limit
     else:
-        # Set as 'umlimited'
+        # Set as 'unlimited'
         allocation.limit = -1
-    if extra_specs.cpu_limits.cpu_reservation:
-        allocation.reservation = extra_specs.cpu_limits.cpu_reservation
+    if limits.reservation:
+        allocation.reservation = limits.reservation
     else:
         allocation.reservation = 0
     shares = client_factory.create('ns0:SharesInfo')
-    if extra_specs.cpu_limits.cpu_shares_level:
-        shares.level = extra_specs.cpu_limits.cpu_shares_level
+    if limits.shares_level:
+        shares.level = limits.shares_level
         if (shares.level == 'custom' and
-            extra_specs.cpu_limits.cpu_shares_share):
-            shares.shares = extra_specs.cpu_limits.cpu_shares_share
+            limits.shares_share):
+            shares.shares = limits.shares_share
         else:
             shares.shares = 0
     else:
         shares.level = 'normal'
         shares.shares = 0
-    allocation.shares = shares
+    # The VirtualEthernetCardResourceAllocation has 'share' instead of
+    # 'shares'.
+    if hasattr(allocation, 'share'):
+        allocation.share = shares
+    else:
+        allocation.shares = shares
     return allocation
 
 
 def get_vm_create_spec(client_factory, instance, data_store_name,
                        vif_infos, extra_specs,
                        os_type=constants.DEFAULT_OS_TYPE,
-                       profile_spec=None):
+                       profile_spec=None, metadata=None):
     """Builds the VM Create spec."""
     config_spec = client_factory.create('ns0:VirtualMachineConfigSpec')
     config_spec.name = instance.uuid
     config_spec.guestId = os_type
     # The name is the unique identifier for the VM.
     config_spec.instanceUuid = instance.uuid
+    if metadata:
+        config_spec.annotation = metadata
     # set the Hardware version
     config_spec.version = extra_specs.hw_version
 
-    # Allow nested ESX instances to host 64 bit VMs.
-    if os_type == "vmkernel5Guest":
+    # Allow nested hypervisor instances to host 64 bit VMs.
+    if os_type in ("vmkernel5Guest", "vmkernel6Guest", "vmkernel65Guest",
+                   "windowsHyperVGuest"):
         config_spec.nestedHVEnabled = "True"
 
     # Append the profile spec
@@ -195,27 +230,53 @@ def get_vm_create_spec(client_factory, instance, data_store_name,
 
     config_spec.tools = tools_info
     config_spec.numCPUs = int(instance.vcpus)
+    if extra_specs.cores_per_socket:
+        config_spec.numCoresPerSocket = int(extra_specs.cores_per_socket)
     config_spec.memoryMB = int(instance.memory_mb)
 
     # Configure cpu information
-    if extra_specs.has_cpu_limits():
-        config_spec.cpuAllocation = _get_allocation_info(client_factory,
-                                                         extra_specs)
+    if extra_specs.cpu_limits.has_limits():
+        config_spec.cpuAllocation = _get_allocation_info(
+            client_factory, extra_specs.cpu_limits,
+            'ns0:ResourceAllocationInfo')
 
-    vif_spec_list = []
+    # Configure memory information
+    if extra_specs.memory_limits.has_limits():
+        config_spec.memoryAllocation = _get_allocation_info(
+            client_factory, extra_specs.memory_limits,
+            'ns0:ResourceAllocationInfo')
+
+    if extra_specs.firmware:
+        config_spec.firmware = extra_specs.firmware
+
+    devices = []
     for vif_info in vif_infos:
-        vif_spec = _create_vif_spec(client_factory, vif_info)
-        vif_spec_list.append(vif_spec)
+        vif_spec = _create_vif_spec(client_factory, vif_info,
+                                    extra_specs.vif_limits)
+        devices.append(vif_spec)
 
-    device_config_spec = vif_spec_list
+    serial_port_spec = create_serial_port_spec(client_factory)
+    if serial_port_spec:
+        devices.append(serial_port_spec)
 
-    config_spec.deviceChange = device_config_spec
+    virtual_device_config_spec = create_video_card_spec(client_factory,
+                                                        extra_specs)
+    if virtual_device_config_spec:
+        devices.append(virtual_device_config_spec)
+
+    config_spec.deviceChange = devices
 
     # add vm-uuid and iface-id.x values for Neutron
     extra_config = []
     opt = client_factory.create('ns0:OptionValue')
     opt.key = "nvp.vm-uuid"
     opt.value = instance.uuid
+    extra_config.append(opt)
+
+    # enable to provide info needed by udev to generate /dev/disk/by-id
+    opt = client_factory.create('ns0:OptionValue')
+    opt.key = "disk.EnableUUID"
+    opt.value = True
     extra_config.append(opt)
 
     port_index = 0
@@ -226,6 +287,13 @@ def get_vm_create_spec(client_factory, instance, data_store_name,
                                                        port_index))
             port_index += 1
 
+    if (CONF.vmware.console_delay_seconds and
+        CONF.vmware.console_delay_seconds > 0):
+        opt = client_factory.create('ns0:OptionValue')
+        opt.key = 'keyboard.typematicMinDelay'
+        opt.value = CONF.vmware.console_delay_seconds * 1000000
+        extra_config.append(opt)
+
     config_spec.extraConfig = extra_config
 
     # Set the VM to be 'managed' by 'OpenStack'
@@ -235,6 +303,45 @@ def get_vm_create_spec(client_factory, instance, data_store_name,
     config_spec.managedBy = managed_by
 
     return config_spec
+
+
+def create_video_card_spec(client_factory, extra_specs):
+    if extra_specs.hw_video_ram:
+        video_card = client_factory.create('ns0:VirtualMachineVideoCard')
+        video_card.videoRamSizeInKB = extra_specs.hw_video_ram
+        video_card.key = -1
+        virtual_device_config_spec = client_factory.create(
+            'ns0:VirtualDeviceConfigSpec')
+        virtual_device_config_spec.operation = "add"
+        virtual_device_config_spec.device = video_card
+        return virtual_device_config_spec
+
+
+def create_serial_port_spec(client_factory):
+    """Creates config spec for serial port."""
+    if not CONF.vmware.serial_port_service_uri:
+        return
+
+    backing = client_factory.create('ns0:VirtualSerialPortURIBackingInfo')
+    backing.direction = "server"
+    backing.serviceURI = CONF.vmware.serial_port_service_uri
+    backing.proxyURI = CONF.vmware.serial_port_proxy_uri
+
+    connectable_spec = client_factory.create('ns0:VirtualDeviceConnectInfo')
+    connectable_spec.startConnected = True
+    connectable_spec.allowGuestControl = True
+    connectable_spec.connected = True
+
+    serial_port = client_factory.create('ns0:VirtualSerialPort')
+    serial_port.connectable = connectable_spec
+    serial_port.backing = backing
+    # we are using unique negative integers as temporary keys
+    serial_port.key = -2
+    serial_port.yieldOnPoll = True
+    dev_spec = client_factory.create('ns0:VirtualDeviceConfigSpec')
+    dev_spec.operation = "add"
+    dev_spec.device = serial_port
+    return dev_spec
 
 
 def get_vm_boot_spec(client_factory, device):
@@ -253,18 +360,23 @@ def get_vm_boot_spec(client_factory, device):
     return config_spec
 
 
-def get_vm_resize_spec(client_factory, vcpus, memory_mb, extra_specs):
+def get_vm_resize_spec(client_factory, vcpus, memory_mb, extra_specs,
+                       metadata=None):
     """Provides updates for a VM spec."""
     resize_spec = client_factory.create('ns0:VirtualMachineConfigSpec')
     resize_spec.numCPUs = vcpus
     resize_spec.memoryMB = memory_mb
-    resize_spec.cpuAllocation = _get_allocation_info(client_factory,
-                                                     extra_specs)
+    resize_spec.cpuAllocation = _get_allocation_info(
+        client_factory, extra_specs.cpu_limits,
+        'ns0:ResourceAllocationInfo')
+    if metadata:
+        resize_spec.annotation = metadata
     return resize_spec
 
 
 def create_controller_spec(client_factory, key,
-                           adapter_type=constants.DEFAULT_ADAPTER_TYPE):
+                           adapter_type=constants.DEFAULT_ADAPTER_TYPE,
+                           bus_number=0):
     """Builds a Config Spec for the LSI or Bus Logic Controller's addition
     which acts as the controller for the virtual hard disk to be attached
     to the VM.
@@ -286,7 +398,7 @@ def create_controller_spec(client_factory, key,
         virtual_controller = client_factory.create(
                                 'ns0:VirtualLsiLogicController')
     virtual_controller.key = key
-    virtual_controller.busNumber = 0
+    virtual_controller.busNumber = bus_number
     virtual_controller.sharedBus = "noSharing"
     virtual_device_config.device = virtual_controller
     return virtual_device_config
@@ -298,13 +410,21 @@ def convert_vif_model(name):
         return 'VirtualE1000'
     if name == network_model.VIF_MODEL_E1000E:
         return 'VirtualE1000e'
+    if name == network_model.VIF_MODEL_PCNET:
+        return 'VirtualPCNet32'
+    if name == network_model.VIF_MODEL_SRIOV:
+        return 'VirtualSriovEthernetCard'
+    if name == network_model.VIF_MODEL_VMXNET:
+        return 'VirtualVmxnet'
+    if name == network_model.VIF_MODEL_VMXNET3:
+        return 'VirtualVmxnet3'
     if name not in ALL_SUPPORTED_NETWORK_DEVICES:
         msg = _('%s is not supported.') % name
         raise exception.Invalid(msg)
     return name
 
 
-def _create_vif_spec(client_factory, vif_info):
+def _create_vif_spec(client_factory, vif_info, vif_limits=None):
     """Builds a config spec for the addition of a new network
     adapter to the VM.
     """
@@ -329,6 +449,16 @@ def _create_vif_spec(client_factory, vif_info):
                 'ns0:VirtualEthernetCardOpaqueNetworkBackingInfo')
         backing.opaqueNetworkId = network_ref['network-id']
         backing.opaqueNetworkType = network_ref['network-type']
+        # Configure externalId
+        if network_ref['use-external-id']:
+            # externalId is only supported from vCenter 6.0 onwards
+            if hasattr(net_device, 'externalId'):
+                net_device.externalId = vif_info['iface_id']
+            else:
+                dp = client_factory.create('ns0:DynamicProperty')
+                dp.name = "__externalId__"
+                dp.val = vif_info['iface_id']
+                net_device.dynamicProperty = [dp]
     elif (network_ref and
             network_ref['type'] == "DistributedVirtualPortgroup"):
         backing = client_factory.create(
@@ -337,6 +467,8 @@ def _create_vif_spec(client_factory, vif_info):
                     'ns0:DistributedVirtualSwitchPortConnection')
         portgroup.switchUuid = network_ref['dvsw']
         portgroup.portgroupKey = network_ref['dvpg']
+        if 'dvs_port_key' in network_ref:
+            portgroup.portKey = network_ref['dvs_port_key']
         backing.port = portgroup
     else:
         backing = client_factory.create(
@@ -359,14 +491,25 @@ def _create_vif_spec(client_factory, vif_info):
     net_device.macAddress = mac_address
     net_device.wakeOnLanEnabled = True
 
+    # vnic limits are only supported from version 6.0
+    if vif_limits and vif_limits.has_limits():
+        if hasattr(net_device, 'resourceAllocation'):
+            net_device.resourceAllocation = _get_allocation_info(
+                client_factory, vif_limits,
+                'ns0:VirtualEthernetCardResourceAllocation')
+        else:
+            msg = _('Limits only supported from vCenter 6.0 and above')
+            raise exception.Invalid(msg)
+
     network_spec.device = net_device
     return network_spec
 
 
-def get_network_attach_config_spec(client_factory, vif_info, index):
+def get_network_attach_config_spec(client_factory, vif_info, index,
+                                   vif_limits=None):
     """Builds the vif attach config spec."""
     config_spec = client_factory.create('ns0:VirtualMachineConfigSpec')
-    vif_spec = _create_vif_spec(client_factory, vif_info)
+    vif_spec = _create_vif_spec(client_factory, vif_info, vif_limits)
     config_spec.deviceChange = [vif_spec]
     if vif_info['iface_id'] is not None:
         config_spec.extraConfig = [_iface_id_option_value(client_factory,
@@ -395,6 +538,44 @@ def get_network_detach_config_spec(client_factory, device, port_index):
     return config_spec
 
 
+def update_vif_spec(client_factory, vif_info, device):
+    """Updates the backing for the VIF spec."""
+    network_spec = client_factory.create('ns0:VirtualDeviceConfigSpec')
+    network_spec.operation = 'edit'
+    network_ref = vif_info['network_ref']
+    network_name = vif_info['network_name']
+    if network_ref and network_ref['type'] == 'OpaqueNetwork':
+        backing = client_factory.create(
+                'ns0:VirtualEthernetCardOpaqueNetworkBackingInfo')
+        backing.opaqueNetworkId = network_ref['network-id']
+        backing.opaqueNetworkType = network_ref['network-type']
+        # Configure externalId
+        if network_ref['use-external-id']:
+            if hasattr(device, 'externalId'):
+                device.externalId = vif_info['iface_id']
+            else:
+                dp = client_factory.create('ns0:DynamicProperty')
+                dp.name = "__externalId__"
+                dp.val = vif_info['iface_id']
+                device.dynamicProperty = [dp]
+    elif (network_ref and
+            network_ref['type'] == "DistributedVirtualPortgroup"):
+        backing = client_factory.create(
+                'ns0:VirtualEthernetCardDistributedVirtualPortBackingInfo')
+        portgroup = client_factory.create(
+                    'ns0:DistributedVirtualSwitchPortConnection')
+        portgroup.switchUuid = network_ref['dvsw']
+        portgroup.portgroupKey = network_ref['dvpg']
+        backing.port = portgroup
+    else:
+        backing = client_factory.create(
+                  'ns0:VirtualEthernetCardNetworkBackingInfo')
+        backing.deviceName = network_name
+    device.backing = backing
+    network_spec.device = device
+    return network_spec
+
+
 def get_storage_profile_spec(session, storage_policy):
     """Gets the vm profile spec configured for storage policy."""
     profile_id = pbm.get_profile_id_by_name(session, storage_policy)
@@ -413,15 +594,16 @@ def get_vmdk_attach_config_spec(client_factory,
                                 linked_clone=False,
                                 controller_key=None,
                                 unit_number=None,
-                                device_name=None):
+                                device_name=None,
+                                disk_io_limits=None):
     """Builds the vmdk attach config spec."""
     config_spec = client_factory.create('ns0:VirtualMachineConfigSpec')
 
     device_config_spec = []
-    virtual_device_config_spec = create_virtual_disk_spec(client_factory,
+    virtual_device_config_spec = _create_virtual_disk_spec(client_factory,
                                 controller_key, disk_type, file_path,
                                 disk_size, linked_clone,
-                                unit_number, device_name)
+                                unit_number, device_name, disk_io_limits)
 
     device_config_spec.append(virtual_device_config_spec)
 
@@ -471,7 +653,7 @@ def get_vm_extra_config_spec(client_factory, extra_opts):
     config_spec = client_factory.create('ns0:VirtualMachineConfigSpec')
     # add the key value pairs
     extra_config = []
-    for key, value in extra_opts.iteritems():
+    for key, value in extra_opts.items():
         opt = client_factory.create('ns0:OptionValue')
         opt.key = key
         opt.value = value
@@ -502,16 +684,16 @@ def _get_device_disk_type(device):
 
 def get_vmdk_info(session, vm_ref, uuid=None):
     """Returns information for the primary VMDK attached to the given VM."""
-    hardware_devices = session._call_method(vim_util,
-            "get_dynamic_property", vm_ref, "VirtualMachine",
-            "config.hardware.device")
+    hardware_devices = session._call_method(vutil,
+                                            "get_object_property",
+                                            vm_ref,
+                                            "config.hardware.device")
     if hardware_devices.__class__.__name__ == "ArrayOfVirtualDevice":
         hardware_devices = hardware_devices.VirtualDevice
     vmdk_file_path = None
     vmdk_controller_key = None
     disk_type = None
     capacity_in_bytes = 0
-    vmdk_device = None
 
     # Determine if we need to get the details of the root disk
     root_disk = None
@@ -558,7 +740,7 @@ scsi_controller_classes = {
     'ParaVirtualSCSIController': constants.ADAPTER_TYPE_PARAVIRTUAL,
     'VirtualLsiLogicController': constants.DEFAULT_ADAPTER_TYPE,
     'VirtualLsiLogicSASController': constants.ADAPTER_TYPE_LSILOGICSAS,
-    'VirtualBusLogicController': constants.ADAPTER_TYPE_PARAVIRTUAL,
+    'VirtualBusLogicController': constants.ADAPTER_TYPE_BUSLOGIC,
 }
 
 
@@ -613,6 +795,19 @@ def _find_allocated_slots(devices):
     return taken
 
 
+def _get_bus_number_for_scsi_controller(devices):
+    """Return usable bus number when create new SCSI controller."""
+    # Every SCSI controller will take a unique bus number
+    taken = [dev.busNumber for dev in devices if _is_scsi_controller(dev)]
+    # The max bus number for SCSI controllers is 3
+    for i in range(constants.SCSI_MAX_CONTROLLER_NUMBER):
+        if i not in taken:
+            return i
+    msg = _('Only %d SCSI controllers are allowed to be '
+            'created on this instance.') % constants.SCSI_MAX_CONTROLLER_NUMBER
+    raise vexc.VMwareDriverException(msg)
+
+
 def allocate_controller_key_and_unit_number(client_factory, devices,
                                             adapter_type):
     """This function inspects the current set of hardware devices and returns
@@ -628,10 +823,7 @@ def allocate_controller_key_and_unit_number(client_factory, devices,
     if adapter_type == constants.ADAPTER_TYPE_IDE:
         ide_keys = [dev.key for dev in devices if _is_ide_controller(dev)]
         ret = _find_controller_slot(ide_keys, taken, 2)
-    elif adapter_type in [constants.DEFAULT_ADAPTER_TYPE,
-                          constants.ADAPTER_TYPE_LSILOGICSAS,
-                          constants.ADAPTER_TYPE_BUSLOGIC,
-                          constants.ADAPTER_TYPE_PARAVIRTUAL]:
+    elif adapter_type in constants.SCSI_ADAPTER_TYPES:
         scsi_keys = [dev.key for dev in devices if _is_scsi_controller(dev)]
         ret = _find_controller_slot(scsi_keys, taken, 16)
     if ret:
@@ -639,8 +831,14 @@ def allocate_controller_key_and_unit_number(client_factory, devices,
 
     # create new controller with the specified type and return its spec
     controller_key = -101
+
+    # Get free bus number for new SCSI controller.
+    bus_number = 0
+    if adapter_type in constants.SCSI_ADAPTER_TYPES:
+        bus_number = _get_bus_number_for_scsi_controller(devices)
+
     controller_spec = create_controller_spec(client_factory, controller_key,
-                                             adapter_type)
+                                             adapter_type, bus_number)
     return controller_key, 0, controller_spec
 
 
@@ -701,13 +899,14 @@ def create_virtual_cdrom_spec(client_factory,
     return config_spec
 
 
-def create_virtual_disk_spec(client_factory, controller_key,
-                             disk_type=constants.DEFAULT_DISK_TYPE,
-                             file_path=None,
-                             disk_size=None,
-                             linked_clone=False,
-                             unit_number=None,
-                             device_name=None):
+def _create_virtual_disk_spec(client_factory, controller_key,
+                              disk_type=constants.DEFAULT_DISK_TYPE,
+                              file_path=None,
+                              disk_size=None,
+                              linked_clone=False,
+                              unit_number=None,
+                              device_name=None,
+                              disk_io_limits=None):
     """Builds spec for the creation of a new/ attaching of an already existing
     Virtual Disk to the VM.
     """
@@ -730,10 +929,10 @@ def create_virtual_disk_spec(client_factory, controller_key,
         disk_file_backing = client_factory.create(
                             'ns0:VirtualDiskFlatVer2BackingInfo')
         disk_file_backing.diskMode = "persistent"
-        if disk_type == "thin":
+        if disk_type == constants.DISK_TYPE_THIN:
             disk_file_backing.thinProvisioned = True
         else:
-            if disk_type == "eagerZeroedThick":
+            if disk_type == constants.DISK_TYPE_EAGER_ZEROED_THICK:
                 disk_file_backing.eagerlyScrub = True
     disk_file_backing.fileName = file_path or ""
 
@@ -757,6 +956,11 @@ def create_virtual_disk_spec(client_factory, controller_key,
     virtual_disk.controllerKey = controller_key
     virtual_disk.unitNumber = unit_number or 0
     virtual_disk.capacityInKB = disk_size or 0
+
+    if disk_io_limits and disk_io_limits.has_limits():
+        virtual_disk.storageIOAllocation = _get_allocation_info(
+            client_factory, disk_io_limits,
+            'ns0:StorageIOAllocationInfo')
 
     virtual_device_config.device = virtual_disk
 
@@ -790,15 +994,28 @@ def clone_vm_spec(client_factory, location,
     return clone_spec
 
 
-def relocate_vm_spec(client_factory, datastore=None, host=None,
-                     disk_move_type="moveAllDiskBackingsAndAllowSharing"):
-    """Builds the VM relocation spec."""
+def relocate_vm_spec(client_factory, res_pool=None, datastore=None, host=None,
+                     disk_move_type="moveAllDiskBackingsAndAllowSharing",
+                     devices=None):
     rel_spec = client_factory.create('ns0:VirtualMachineRelocateSpec')
     rel_spec.datastore = datastore
+    rel_spec.host = host
+    rel_spec.pool = res_pool
     rel_spec.diskMoveType = disk_move_type
-    if host:
-        rel_spec.host = host
+    if devices is not None:
+        rel_spec.deviceChange = devices
     return rel_spec
+
+
+def relocate_vm(session, vm_ref, res_pool=None, datastore=None, host=None,
+                disk_move_type="moveAllDiskBackingsAndAllowSharing",
+                devices=None):
+    client_factory = session.vim.client.factory
+    rel_spec = relocate_vm_spec(client_factory, res_pool, datastore, host,
+                                disk_move_type, devices)
+    relocate_task = session._call_method(session.vim, "RelocateVM_Task",
+                                         vm_ref, spec=rel_spec)
+    session._wait_for_task(relocate_task)
 
 
 def get_machine_id_change_spec(client_factory, machine_id_str):
@@ -843,7 +1060,15 @@ def get_vnc_config_spec(client_factory, port):
     opt_port = client_factory.create('ns0:OptionValue')
     opt_port.key = "RemoteDisplay.vnc.port"
     opt_port.value = port
-    extras = [opt_enabled, opt_port]
+    opt_keymap = client_factory.create('ns0:OptionValue')
+    opt_keymap.key = "RemoteDisplay.vnc.keyMap"
+    if CONF.vnc.keymap:
+        opt_keymap.value = CONF.vnc.keymap
+    else:
+        opt_keymap.value = CONF.vmware.vnc_keymap
+
+    extras = [opt_enabled, opt_port, opt_keymap]
+
     virtual_machine_config_spec.extraConfig = extras
     return virtual_machine_config_spec
 
@@ -876,30 +1101,9 @@ def _get_allocated_vnc_ports(session):
             option_value = dynamic_prop.val
             vnc_port = option_value.value
             vnc_ports.add(int(vnc_port))
-        token = _get_token(result)
-        if token:
-            result = session._call_method(vim_util,
-                                          "continue_to_get_objects",
-                                          token)
-        else:
-            break
+        result = session._call_method(vutil, 'continue_retrieval',
+                                      result)
     return vnc_ports
-
-
-# NOTE(mdbooth): this convenience function is temporarily duplicated in
-# ds_util. The correct fix is to handle paginated results as they are returned
-# from the relevant vim_util function. However, vim_util is currently
-# effectively deprecated as we migrate to oslo.vmware. This duplication will be
-# removed when we fix it properly in oslo.vmware.
-def _get_token(results):
-    """Get the token from the property results."""
-    return getattr(results, 'token', None)
-
-
-def _get_reference_for_value(results, value):
-    for object in results.objects:
-        if object.obj.value == value:
-            return object
 
 
 def _get_object_for_value(results, value):
@@ -917,33 +1121,22 @@ def _get_object_for_optionvalue(results, value):
 
 def _get_object_from_results(session, results, value, func):
     while results:
-        token = _get_token(results)
         object = func(results, value)
         if object:
-            if token:
-                session._call_method(vim_util,
-                                     "cancel_retrieve",
-                                     token)
+            session._call_method(vutil, 'cancel_retrieval',
+                                 results)
             return object
-
-        if token:
-            results = session._call_method(vim_util,
-                                           "continue_to_get_objects",
-                                           token)
-        else:
-            return None
-
-
-def _cancel_retrieve_if_necessary(session, results):
-    token = _get_token(results)
-    if token:
-        results = session._call_method(vim_util,
-                                       "cancel_retrieve",
-                                       token)
+        results = session._call_method(vutil, 'continue_retrieval',
+                                       results)
 
 
 def _get_vm_ref_from_name(session, vm_name):
-    """Get reference to the VM with the name specified."""
+    """Get reference to the VM with the name specified.
+
+    This method reads all of the names of the VM's that are running
+    on the backend, then it filters locally the matching vm_name.
+    It is far more optimal to use _get_vm_ref_from_vm_uuid.
+    """
     vms = session._call_method(vim_util, "get_objects",
                 "VirtualMachine", ["name"])
     return _get_object_from_results(session, vms, vm_name,
@@ -954,20 +1147,6 @@ def _get_vm_ref_from_name(session, vm_name):
 def get_vm_ref_from_name(session, vm_name):
     return (_get_vm_ref_from_vm_uuid(session, vm_name) or
             _get_vm_ref_from_name(session, vm_name))
-
-
-def _get_vm_ref_from_uuid(session, instance_uuid):
-    """Get reference to the VM with the uuid specified.
-
-    This method reads all of the names of the VM's that are running
-    on the backend, then it filters locally the matching
-    instance_uuid. It is far more optimal to use
-    _get_vm_ref_from_vm_uuid.
-    """
-    vms = session._call_method(vim_util, "get_objects",
-                "VirtualMachine", ["name"])
-    return _get_object_from_results(session, vms, instance_uuid,
-                                    _get_object_for_value)
 
 
 def _get_vm_ref_from_vm_uuid(session, instance_uuid):
@@ -1018,7 +1197,7 @@ def search_vm_ref_by_identifier(session, identifier):
     """
     vm_ref = (_get_vm_ref_from_vm_uuid(session, identifier) or
               _get_vm_ref_from_extraconfig(session, identifier) or
-              _get_vm_ref_from_uuid(session, identifier))
+              _get_vm_ref_from_name(session, identifier))
     return vm_ref
 
 
@@ -1026,33 +1205,37 @@ def get_host_ref_for_vm(session, instance):
     """Get a MoRef to the ESXi host currently running an instance."""
 
     vm_ref = get_vm_ref(session, instance)
-    return session._call_method(vim_util, "get_dynamic_property",
-                                vm_ref, "VirtualMachine", "runtime.host")
+    return session._call_method(vutil, "get_object_property",
+                                vm_ref, "runtime.host")
 
 
 def get_host_name_for_vm(session, instance):
     """Get the hostname of the ESXi host currently running an instance."""
 
     host_ref = get_host_ref_for_vm(session, instance)
-    return session._call_method(vim_util, "get_dynamic_property",
-                                host_ref, "HostSystem", "name")
+    return session._call_method(vutil, "get_object_property",
+                                host_ref, "name")
 
 
 def get_vm_state(session, instance):
     vm_ref = get_vm_ref(session, instance)
-    vm_state = session._call_method(vim_util, "get_dynamic_property",
-                vm_ref, "VirtualMachine", "runtime.powerState")
-    return vm_state
+    vm_state = session._call_method(vutil, "get_object_property",
+                                    vm_ref, "runtime.powerState")
+    return constants.POWER_STATES[vm_state]
 
 
 def get_stats_from_cluster(session, cluster):
     """Get the aggregate resource stats of a cluster."""
     vcpus = 0
-    mem_info = {'total': 0, 'free': 0}
+    max_vcpus_per_host = 0
+    used_mem_mb = 0
+    total_mem_mb = 0
+    max_mem_mb_per_host = 0
     # Get the Host and Resource Pool Managed Object Refs
-    prop_dict = session._call_method(vim_util, "get_dynamic_properties",
-                                     cluster, "ClusterComputeResource",
-                                     ["host", "resourcePool"])
+    prop_dict = session._call_method(vutil,
+                                     "get_object_properties_dict",
+                                     cluster,
+                                     ["host"])
     if prop_dict:
         host_ret = prop_dict.get('host')
         if host_ret:
@@ -1060,27 +1243,29 @@ def get_stats_from_cluster(session, cluster):
             result = session._call_method(vim_util,
                          "get_properties_for_a_collection_of_objects",
                          "HostSystem", host_mors,
-                         ["summary.hardware", "summary.runtime"])
+                         ["summary.hardware", "summary.runtime",
+                          "summary.quickStats"])
             for obj in result.objects:
-                hardware_summary = obj.propSet[0].val
-                runtime_summary = obj.propSet[1].val
+                host_props = propset_dict(obj.propSet)
+                hardware_summary = host_props['summary.hardware']
+                runtime_summary = host_props['summary.runtime']
+                stats_summary = host_props['summary.quickStats']
                 if (runtime_summary.inMaintenanceMode is False and
                     runtime_summary.connectionState == "connected"):
                     # Total vcpus is the sum of all pCPUs of individual hosts
                     # The overcommitment ratio is factored in by the scheduler
-                    vcpus += hardware_summary.numCpuThreads
-
-        res_mor = prop_dict.get('resourcePool')
-        if res_mor:
-            res_usage = session._call_method(vim_util, "get_dynamic_property",
-                            res_mor, "ResourcePool", "summary.runtime.memory")
-            if res_usage:
-                # maxUsage is the memory limit of the cluster available to VM's
-                mem_info['total'] = int(res_usage.maxUsage / units.Mi)
-                # overallUsage is the hypervisor's view of memory usage by VM's
-                consumed = int(res_usage.overallUsage / units.Mi)
-                mem_info['free'] = mem_info['total'] - consumed
-    stats = {'vcpus': vcpus, 'mem': mem_info}
+                    threads = hardware_summary.numCpuThreads
+                    vcpus += threads
+                    max_vcpus_per_host = max(max_vcpus_per_host, threads)
+                    used_mem_mb += stats_summary.overallMemoryUsage
+                    mem_mb = hardware_summary.memorySize // units.Mi
+                    total_mem_mb += mem_mb
+                    max_mem_mb_per_host = max(max_mem_mb_per_host, mem_mb)
+    stats = {'cpu': {'vcpus': vcpus,
+                     'max_vcpus_per_host': max_vcpus_per_host},
+             'mem': {'total': total_mem_mb,
+                     'free': total_mem_mb - used_mem_mb,
+                     'max_mem_mb_per_host': max_mem_mb_per_host}}
     return stats
 
 
@@ -1089,12 +1274,12 @@ def get_host_ref(session, cluster=None):
     if cluster is None:
         results = session._call_method(vim_util, "get_objects",
                                        "HostSystem")
-        _cancel_retrieve_if_necessary(session, results)
+        session._call_method(vutil, 'cancel_retrieval',
+                             results)
         host_mor = results.objects[0].obj
     else:
-        host_ret = session._call_method(vim_util, "get_dynamic_property",
-                                        cluster, "ClusterComputeResource",
-                                        "host")
+        host_ret = session._call_method(vutil, "get_object_property",
+                                        cluster, "host")
         if not host_ret or not host_ret.ManagedObjectReference:
             msg = _('No host available on cluster')
             raise exception.NoValidHost(reason=msg)
@@ -1148,10 +1333,9 @@ def get_vmdk_volume_disk(hardware_devices, path=None):
 def get_res_pool_ref(session, cluster):
     """Get the resource pool."""
     # Get the root resource pool of the cluster
-    res_pool_ref = session._call_method(vim_util,
-                                        "get_dynamic_property",
+    res_pool_ref = session._call_method(vutil,
+                                        "get_object_property",
                                         cluster,
-                                        "ClusterComputeResource",
                                         "resourcePool")
     return res_pool_ref
 
@@ -1161,96 +1345,24 @@ def get_all_cluster_mors(session):
     try:
         results = session._call_method(vim_util, "get_objects",
                                         "ClusterComputeResource", ["name"])
-        _cancel_retrieve_if_necessary(session, results)
-        return results.objects
-
-    except Exception as excep:
-        LOG.warning(_LW("Failed to get cluster references %s"), excep)
-
-
-def get_all_res_pool_mors(session):
-    """Get all the resource pools in the vCenter."""
-    try:
-        results = session._call_method(vim_util, "get_objects",
-                                             "ResourcePool")
-
-        _cancel_retrieve_if_necessary(session, results)
-        return results.objects
-    except Exception as excep:
-        LOG.warning(_LW("Failed to get resource pool references " "%s"), excep)
-
-
-def get_dynamic_property_mor(session, mor_ref, attribute):
-    """Get the value of an attribute for a given managed object."""
-    return session._call_method(vim_util, "get_dynamic_property",
-                                mor_ref, mor_ref._type, attribute)
-
-
-def find_entity_mor(entity_list, entity_name):
-    """Returns managed object ref for given cluster or resource pool name."""
-    return [mor for mor in entity_list if (hasattr(mor, 'propSet') and
-                                           mor.propSet[0].val == entity_name)]
-
-
-def get_all_cluster_refs_by_name(session, path_list):
-    """Get reference to the Cluster, ResourcePool with the path specified.
-
-    The path is the display name. This can be the full path as well.
-    The input will have the list of clusters and resource pool names
-    """
-    cls = get_all_cluster_mors(session)
-    if not cls:
-        return {}
-    res = get_all_res_pool_mors(session)
-    if not res:
-        return {}
-    path_list = [path.strip() for path in path_list]
-    list_obj = []
-    for entity_path in path_list:
-        # entity_path could be unique cluster and/or resource-pool name
-        res_mor = find_entity_mor(res, entity_path)
-        cls_mor = find_entity_mor(cls, entity_path)
-        cls_mor.extend(res_mor)
-        for mor in cls_mor:
-            list_obj.append((mor.obj, mor.propSet[0].val))
-    return get_dict_mor(session, list_obj)
-
-
-def get_dict_mor(session, list_obj):
-    """The input is a list of objects in the form
-    (manage_object,display_name)
-    The managed object will be in the form
-    { value = "domain-1002", _type = "ClusterComputeResource" }
-
-    Output data format:
-    | dict_mors = {
-    |              'respool-1001': { 'cluster_mor': clusterMor,
-    |                                'res_pool_mor': resourcePoolMor,
-    |                                'name': display_name },
-    |              'domain-1002': { 'cluster_mor': clusterMor,
-    |                                'res_pool_mor': resourcePoolMor,
-    |                                'name': display_name },
-    |            }
-
-    """
-    dict_mors = {}
-    for obj_ref, path in list_obj:
-        if obj_ref._type == "ResourcePool":
-            # Get owner cluster-ref mor
-            cluster_ref = get_dynamic_property_mor(session, obj_ref, "owner")
-            dict_mors[obj_ref.value] = {'cluster_mor': cluster_ref,
-                                        'res_pool_mor': obj_ref,
-                                        'name': path,
-                                        }
+        session._call_method(vutil, 'cancel_retrieval',
+                             results)
+        if results.objects is None:
+            return []
         else:
-            # Get default resource pool of the cluster
-            res_pool_ref = get_dynamic_property_mor(session,
-                                                    obj_ref, "resourcePool")
-            dict_mors[obj_ref.value] = {'cluster_mor': obj_ref,
-                                        'res_pool_mor': res_pool_ref,
-                                        'name': path,
-                                        }
-    return dict_mors
+            return results.objects
+
+    except Exception as excep:
+        LOG.warning("Failed to get cluster references %s", excep)
+
+
+def get_cluster_ref_by_name(session, cluster_name):
+    """Get reference to the vCenter cluster with the specified name."""
+    all_clusters = get_all_cluster_mors(session)
+    for cluster in all_clusters:
+        if (hasattr(cluster, 'propSet') and
+                    cluster.propSet[0].val == cluster_name):
+            return cluster.obj
 
 
 def get_vmdk_adapter_type(adapter_type):
@@ -1288,10 +1400,10 @@ def create_vm(session, instance, vm_folder, config_spec, res_pool_ref):
         # Consequently, a value which we don't recognise may in fact be valid.
         with excutils.save_and_reraise_exception():
             if config_spec.guestId not in constants.VALID_OS_TYPES:
-                LOG.warning(_LW('vmware_ostype from image is not recognised: '
-                                '\'%(ostype)s\'. An invalid os type may be '
-                                'one cause of this instance creation failure'),
-                         {'ostype': config_spec.guestId})
+                LOG.warning('vmware_ostype from image is not recognised: '
+                            '\'%(ostype)s\'. An invalid os type may be '
+                            'one cause of this instance creation failure',
+                            {'ostype': config_spec.guestId})
     LOG.debug("Created VM on the ESX host", instance=instance)
     return task_info.result
 
@@ -1305,9 +1417,9 @@ def destroy_vm(session, instance, vm_ref=None):
         destroy_task = session._call_method(session.vim, "Destroy_Task",
                                             vm_ref)
         session._wait_for_task(destroy_task)
-        LOG.info(_LI("Destroyed the VM"), instance=instance)
+        LOG.info("Destroyed the VM", instance=instance)
     except Exception:
-        LOG.exception(_LE('Destroy VM failed'), instance=instance)
+        LOG.exception(_('Destroy VM failed'), instance=instance)
 
 
 def create_virtual_disk(session, dc_ref, adapter_type, disk_type,
@@ -1344,15 +1456,17 @@ def create_virtual_disk(session, dc_ref, adapter_type, disk_type,
 
 
 def copy_virtual_disk(session, dc_ref, source, dest):
-    """Copy a sparse virtual disk to a thin virtual disk. This is also
-       done to generate the meta-data file whose specifics
-       depend on the size of the disk, thin/thick provisioning and the
-       storage adapter type.
+    """Copy a sparse virtual disk to a thin virtual disk.
+
+    This is also done to generate the meta-data file whose specifics
+    depend on the size of the disk, thin/thick provisioning and the
+    storage adapter type.
 
     :param session: - session for connection
     :param dc_ref: - data center reference object
     :param source: - source datastore path
     :param dest: - destination datastore path
+    :returns: None
     """
     LOG.debug("Copying Virtual Disk %(source)s to %(dest)s",
               {'source': source, 'dest': dest})
@@ -1394,30 +1508,10 @@ def power_on_instance(session, instance, vm_ref=None):
         LOG.debug("VM already powered on", instance=instance)
 
 
-def get_values_from_object_properties(session, props):
-    """Get the specific values from a object list.
-
-    The object values will be returned as a dictionary.
-    """
-    dictionary = {}
-    while props:
-        for elem in props.objects:
-            propdict = propset_dict(elem.propSet)
-            dictionary.update(propdict)
-        token = _get_token(props)
-        if not token:
-            break
-
-        props = session._call_method(vim_util,
-                                     "continue_to_get_objects",
-                                     token)
-    return dictionary
-
-
 def _get_vm_port_indices(session, vm_ref):
-    extra_config = session._call_method(vim_util,
-                                        'get_dynamic_property',
-                                        vm_ref, 'VirtualMachine',
+    extra_config = session._call_method(vutil,
+                                        'get_object_property',
+                                        vm_ref,
                                         'config.extraConfig')
     ports = []
     if extra_config is not None:
@@ -1445,9 +1539,9 @@ def get_attach_port_index(session, vm_ref):
 
 
 def get_vm_detach_port_index(session, vm_ref, iface_id):
-    extra_config = session._call_method(vim_util,
-                                        'get_dynamic_property',
-                                        vm_ref, 'VirtualMachine',
+    extra_config = session._call_method(vutil,
+                                        'get_object_property',
+                                        vm_ref,
                                         'config.extraConfig')
     if extra_config is not None:
         options = extra_config.OptionValue
@@ -1521,9 +1615,10 @@ def detach_devices_from_vm(session, vm_ref, devices):
 
 def get_ephemerals(session, vm_ref):
     devices = []
-    hardware_devices = session._call_method(vim_util,
-            "get_dynamic_property", vm_ref, "VirtualMachine",
-            "config.hardware.device")
+    hardware_devices = session._call_method(vutil,
+                                            "get_object_property",
+                                            vm_ref,
+                                            "config.hardware.device")
 
     if hardware_devices.__class__.__name__ == "ArrayOfVirtualDevice":
         hardware_devices = hardware_devices.VirtualDevice
@@ -1535,3 +1630,79 @@ def get_ephemerals(session, vm_ref):
                 if 'ephemeral' in device.backing.fileName:
                     devices.append(device)
     return devices
+
+
+def get_swap(session, vm_ref):
+    hardware_devices = session._call_method(vutil, "get_object_property",
+                                            vm_ref, "config.hardware.device")
+
+    if hardware_devices.__class__.__name__ == "ArrayOfVirtualDevice":
+        hardware_devices = hardware_devices.VirtualDevice
+
+    for device in hardware_devices:
+        if (device.__class__.__name__ == "VirtualDisk" and
+                device.backing.__class__.__name__ ==
+                    "VirtualDiskFlatVer2BackingInfo" and
+                'swap' in device.backing.fileName):
+            return device
+
+
+def _get_folder(session, parent_folder_ref, name):
+    # Get list of child entities for the parent folder
+    prop_val = session._call_method(vutil, 'get_object_property',
+                                    parent_folder_ref,
+                                    'childEntity')
+    if prop_val:
+        child_entities = prop_val.ManagedObjectReference
+
+        # Return if the child folder with input name is already present
+        for child_entity in child_entities:
+            if child_entity._type != 'Folder':
+                continue
+            child_entity_name = vim_util.get_entity_name(session, child_entity)
+            if child_entity_name == name:
+                return child_entity
+
+
+def create_folder(session, parent_folder_ref, name):
+    """Creates a folder in vCenter
+
+    A folder of 'name' will be created under the parent folder.
+    The moref of the folder is returned.
+    """
+
+    LOG.debug("Creating folder: %(name)s. Parent ref: %(parent)s.",
+              {'name': name, 'parent': parent_folder_ref.value})
+    try:
+        folder = session._call_method(session.vim, "CreateFolder",
+                                      parent_folder_ref, name=name)
+        LOG.info("Created folder: %(name)s in parent %(parent)s.",
+                 {'name': name, 'parent': parent_folder_ref.value})
+    except vexc.DuplicateName as e:
+        LOG.debug("Folder already exists: %(name)s. Parent ref: %(parent)s.",
+                  {'name': name, 'parent': parent_folder_ref.value})
+        val = e.details['object']
+        folder = vutil.get_moref(val, 'Folder')
+    return folder
+
+
+def folder_ref_cache_update(path, folder_ref):
+    _FOLDER_PATH_REF_MAPPING[path] = folder_ref
+
+
+def folder_ref_cache_get(path):
+    return _FOLDER_PATH_REF_MAPPING.get(path)
+
+
+def _get_vm_name(display_name, id):
+    if display_name:
+        return '%s (%s)' % (display_name[:41], id[:36])
+    else:
+        return id[:36]
+
+
+def rename_vm(session, vm_ref, instance):
+    vm_name = _get_vm_name(instance.display_name, instance.uuid)
+    rename_task = session._call_method(session.vim, "Rename_Task", vm_ref,
+                                       newName=vm_name)
+    session._wait_for_task(rename_task)

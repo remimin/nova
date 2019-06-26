@@ -13,34 +13,21 @@
 #    under the License.
 
 import netaddr
-from oslo_config import cfg
+from oslo_utils import versionutils
 
-from nova import db
+import nova.conf
+from nova.db import api as db
 from nova import exception
 from nova.i18n import _
 from nova import objects
 from nova.objects import base as obj_base
 from nova.objects import fields
-from nova import utils
 
-network_opts = [
-    cfg.BoolOpt('share_dhcp_address',
-                default=False,
-                help='DEPRECATED: THIS VALUE SHOULD BE SET WHEN CREATING THE '
-                     'NETWORK. If True in multi_host mode, all compute hosts '
-                     'share the same dhcp address. The same IP address used '
-                     'for DHCP will be added on each nova-network node which '
-                     'is only visible to the vms on the same host.'),
-    cfg.IntOpt('network_device_mtu',
-               help='DEPRECATED: THIS VALUE SHOULD BE SET WHEN CREATING THE '
-                    'NETWORK. MTU setting for network interface.'),
-]
-
-CONF = cfg.CONF
-CONF.register_opts(network_opts)
+CONF = nova.conf.CONF
 
 
 # TODO(berrange): Remove NovaObjectDictCompat
+@obj_base.NovaObjectRegistry.register
 class Network(obj_base.NovaPersistentObject, obj_base.NovaObject,
               obj_base.NovaObjectDictCompat):
     # Version 1.0: Initial version
@@ -101,7 +88,7 @@ class Network(obj_base.NovaPersistentObject, obj_base.NovaObject,
                                'or integral prefix') % netmask)
 
     def obj_make_compatible(self, primitive, target_version):
-        target_version = utils.convert_version_to_tuple(target_version)
+        target_version = versionutils.convert_version_to_tuple(target_version)
         if target_version < (1, 2):
             if 'mtu' in primitive:
                 del primitive['mtu']
@@ -118,8 +105,6 @@ class Network(obj_base.NovaPersistentObject, obj_base.NovaObject,
             db_value = db_network[field]
             if field is 'netmask_v6' and db_value is not None:
                 db_value = network._convert_legacy_ipv6_netmask(db_value)
-            if field is 'mtu' and db_value is None:
-                db_value = CONF.network_device_mtu
             if field is 'dhcp_server' and db_value is None:
                 db_value = db_network['gateway']
             if field is 'share_address' and CONF.share_dhcp_address:
@@ -206,6 +191,7 @@ class Network(obj_base.NovaPersistentObject, obj_base.NovaObject,
             self._from_db_object(context, self, db_network)
 
 
+@obj_base.NovaObjectRegistry.register
 class NetworkList(obj_base.ObjectListBase, obj_base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: Added get_by_project()
@@ -214,11 +200,6 @@ class NetworkList(obj_base.ObjectListBase, obj_base.NovaObject):
 
     fields = {
         'objects': fields.ListOfObjectsField('Network'),
-        }
-    child_versions = {
-        '1.0': '1.0',
-        '1.1': '1.1',
-        '1.2': '1.2',
         }
 
     @obj_base.remotable_classmethod

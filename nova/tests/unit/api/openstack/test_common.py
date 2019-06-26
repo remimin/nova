@@ -29,7 +29,7 @@ from nova.compute import task_states
 from nova.compute import vm_states
 from nova import exception
 from nova import test
-from nova.tests.unit import utils
+from nova.tests.unit.api.openstack import fakes
 
 
 NS = "{http://docs.openstack.org/compute/api/v1.1}"
@@ -61,7 +61,7 @@ class LimiterTest(test.NoDBTestCase):
     def test_limiter_offset_medium(self):
         # Test offset key works with a medium sized number.
         req = webob.Request.blank('/?offset=10')
-        self.assertEqual(common.limited(self.tiny, req), [])
+        self.assertEqual(0, len(common.limited(self.tiny, req)))
         self.assertEqual(common.limited(self.small, req), self.small[10:])
         self.assertEqual(common.limited(self.medium, req), self.medium[10:])
         self.assertEqual(common.limited(self.large, req), self.large[10:1010])
@@ -69,9 +69,9 @@ class LimiterTest(test.NoDBTestCase):
     def test_limiter_offset_over_max(self):
         # Test offset key works with a number over 1000 (max_limit).
         req = webob.Request.blank('/?offset=1001')
-        self.assertEqual(common.limited(self.tiny, req), [])
-        self.assertEqual(common.limited(self.small, req), [])
-        self.assertEqual(common.limited(self.medium, req), [])
+        self.assertEqual(0, len(common.limited(self.tiny, req)))
+        self.assertEqual(0, len(common.limited(self.small, req)))
+        self.assertEqual(0, len(common.limited(self.medium, req)))
         self.assertEqual(
             common.limited(self.large, req), self.large[1001:2001])
 
@@ -129,22 +129,24 @@ class LimiterTest(test.NoDBTestCase):
         req = webob.Request.blank('/?offset=3&limit=1500')
         self.assertEqual(common.limited(items, req), items[3:1003])
         req = webob.Request.blank('/?offset=3000&limit=10')
-        self.assertEqual(common.limited(items, req), [])
+        self.assertEqual(0, len(common.limited(items, req)))
 
     def test_limiter_custom_max_limit(self):
         # Test a max_limit other than 1000.
-        items = range(2000)
+        max_limit = 2000
+        self.flags(max_limit=max_limit, group='api')
+        items = range(max_limit)
         req = webob.Request.blank('/?offset=1&limit=3')
         self.assertEqual(
-            common.limited(items, req, max_limit=2000), items[1:4])
+            common.limited(items, req), items[1:4])
         req = webob.Request.blank('/?offset=3&limit=0')
         self.assertEqual(
-            common.limited(items, req, max_limit=2000), items[3:])
+            common.limited(items, req), items[3:])
         req = webob.Request.blank('/?offset=3&limit=2500')
         self.assertEqual(
-            common.limited(items, req, max_limit=2000), items[3:])
+            common.limited(items, req), items[3:])
         req = webob.Request.blank('/?offset=3000&limit=10')
-        self.assertEqual(common.limited(items, req, max_limit=2000), [])
+        self.assertEqual(0, len(common.limited(items, req)))
 
     def test_limiter_negative_limit(self):
         # Test a negative limit.
@@ -168,7 +170,7 @@ class SortParamUtilsTest(test.NoDBTestCase):
         self.assertEqual(['desc'], sort_dirs)
 
     def test_get_sort_params_override_defaults(self):
-        '''Verifies that the defaults can be overriden.'''
+        '''Verifies that the defaults can be overridden.'''
         sort_keys, sort_dirs = common.get_sort_params({}, default_key='key1',
                                                       default_dir='dir1')
         self.assertEqual(['key1'], sort_keys)
@@ -285,52 +287,40 @@ class PaginationParamsTest(test.NoDBTestCase):
 
 class MiscFunctionsTest(test.TestCase):
 
-    def test_remove_major_version_from_href(self):
-        fixture = 'http://www.testsite.com/v1/images'
-        expected = 'http://www.testsite.com/images'
-        actual = common.remove_version_from_href(fixture)
-        self.assertEqual(actual, expected)
-
-    def test_remove_version_from_href(self):
-        fixture = 'http://www.testsite.com/v1.1/images'
-        expected = 'http://www.testsite.com/images'
-        actual = common.remove_version_from_href(fixture)
-        self.assertEqual(actual, expected)
-
-    def test_remove_version_from_href_2(self):
-        fixture = 'http://www.testsite.com/v1.1/'
-        expected = 'http://www.testsite.com/'
-        actual = common.remove_version_from_href(fixture)
-        self.assertEqual(actual, expected)
-
-    def test_remove_version_from_href_3(self):
-        fixture = 'http://www.testsite.com/v10.10'
+    def test_remove_trailing_version_from_href(self):
+        fixture = 'http://www.testsite.com/v1.1'
         expected = 'http://www.testsite.com'
-        actual = common.remove_version_from_href(fixture)
+        actual = common.remove_trailing_version_from_href(fixture)
         self.assertEqual(actual, expected)
 
-    def test_remove_version_from_href_4(self):
+    def test_remove_trailing_version_from_href_2(self):
+        fixture = 'http://www.testsite.com/compute/v1.1'
+        expected = 'http://www.testsite.com/compute'
+        actual = common.remove_trailing_version_from_href(fixture)
+        self.assertEqual(actual, expected)
+
+    def test_remove_trailing_version_from_href_3(self):
         fixture = 'http://www.testsite.com/v1.1/images/v10.5'
-        expected = 'http://www.testsite.com/images/v10.5'
-        actual = common.remove_version_from_href(fixture)
+        expected = 'http://www.testsite.com/v1.1/images'
+        actual = common.remove_trailing_version_from_href(fixture)
         self.assertEqual(actual, expected)
 
-    def test_remove_version_from_href_bad_request(self):
-        fixture = 'http://www.testsite.com/1.1/images'
+    def test_remove_trailing_version_from_href_bad_request(self):
+        fixture = 'http://www.testsite.com/v1.1/images'
         self.assertRaises(ValueError,
-                          common.remove_version_from_href,
+                          common.remove_trailing_version_from_href,
                           fixture)
 
-    def test_remove_version_from_href_bad_request_2(self):
-        fixture = 'http://www.testsite.com/v/images'
+    def test_remove_trailing_version_from_href_bad_request_2(self):
+        fixture = 'http://www.testsite.com/images/v'
         self.assertRaises(ValueError,
-                          common.remove_version_from_href,
+                          common.remove_trailing_version_from_href,
                           fixture)
 
-    def test_remove_version_from_href_bad_request_3(self):
+    def test_remove_trailing_version_from_href_bad_request_3(self):
         fixture = 'http://www.testsite.com/v1.1images'
         self.assertRaises(ValueError,
-                          common.remove_version_from_href,
+                          common.remove_trailing_version_from_href,
                           fixture)
 
     def test_get_id_from_href_with_int_url(self):
@@ -382,41 +372,6 @@ class MiscFunctionsTest(test.TestCase):
                 "fake_attr fake_state")
         else:
             self.fail("webob.exc.HTTPConflict was not raised")
-
-    def test_check_img_metadata_properties_quota_valid_metadata(self):
-        ctxt = utils.get_test_admin_context()
-        metadata1 = {"key": "value"}
-        actual = common.check_img_metadata_properties_quota(ctxt, metadata1)
-        self.assertIsNone(actual)
-
-        metadata2 = {"key": "v" * 260}
-        actual = common.check_img_metadata_properties_quota(ctxt, metadata2)
-        self.assertIsNone(actual)
-
-        metadata3 = {"key": ""}
-        actual = common.check_img_metadata_properties_quota(ctxt, metadata3)
-        self.assertIsNone(actual)
-
-    def test_check_img_metadata_properties_quota_inv_metadata(self):
-        ctxt = utils.get_test_admin_context()
-        metadata1 = {"a" * 260: "value"}
-        self.assertRaises(webob.exc.HTTPBadRequest,
-                common.check_img_metadata_properties_quota, ctxt, metadata1)
-
-        metadata2 = {"": "value"}
-        self.assertRaises(webob.exc.HTTPBadRequest,
-                common.check_img_metadata_properties_quota, ctxt, metadata2)
-
-        metadata3 = "invalid metadata"
-        self.assertRaises(webob.exc.HTTPBadRequest,
-                common.check_img_metadata_properties_quota, ctxt, metadata3)
-
-        metadata4 = None
-        self.assertIsNone(common.check_img_metadata_properties_quota(ctxt,
-                                                        metadata4))
-        metadata5 = {}
-        self.assertIsNone(common.check_img_metadata_properties_quota(ctxt,
-                                                        metadata5))
 
     def test_status_from_state(self):
         for vm_state in (vm_states.ACTIVE, vm_states.STOPPED):
@@ -474,6 +429,26 @@ class MiscFunctionsTest(test.TestCase):
                      task_states.RESIZE_PREP])
         self.assertEqual(expected, actual)
 
+    def test_is_all_tenants_true(self):
+        for value in ('', '1', 'true', 'True'):
+            search_opts = {'all_tenants': value}
+            self.assertTrue(common.is_all_tenants(search_opts))
+            self.assertIn('all_tenants', search_opts)
+
+    def test_is_all_tenants_false(self):
+        for value in ('0', 'false', 'False'):
+            search_opts = {'all_tenants': value}
+            self.assertFalse(common.is_all_tenants(search_opts))
+            self.assertIn('all_tenants', search_opts)
+
+    def test_is_all_tenants_missing(self):
+        self.assertFalse(common.is_all_tenants({}))
+
+    def test_is_all_tenants_invalid(self):
+        search_opts = {'all_tenants': 'wonk'}
+        self.assertRaises(exception.InvalidInput, common.is_all_tenants,
+                          search_opts)
+
 
 class TestCollectionLinks(test.NoDBTestCase):
     """Tests the _get_collection_links method."""
@@ -519,7 +494,7 @@ class TestCollectionLinks(test.NoDBTestCase):
         req = mock.MagicMock()
         params = mock.PropertyMock(return_value=dict())
         type(req).params = params
-        self.flags(osapi_max_limit=1)
+        self.flags(max_limit=1, group='api')
 
         builder = common.ViewBuilder()
         results = builder._get_collection_links(req, items,
@@ -539,7 +514,7 @@ class TestCollectionLinks(test.NoDBTestCase):
         # Given limit is greater than default max, only return default max
         params = mock.PropertyMock(return_value=dict(limit=2))
         type(req).params = params
-        self.flags(osapi_max_limit=1)
+        self.flags(max_limit=1, group='api')
 
         builder = common.ViewBuilder()
         results = builder._get_collection_links(req, items,
@@ -568,3 +543,85 @@ class LinkPrefixTest(test.NoDBTestCase):
                 "http://new.prefix.com:20455/new_extra_prefix")
         self.assertEqual("http://new.prefix.com:20455/new_extra_prefix/v1",
                          result)
+
+
+class UrlJoinTest(test.NoDBTestCase):
+    def test_url_join(self):
+        pieces = ["one", "two", "three"]
+        joined = common.url_join(*pieces)
+        self.assertEqual("one/two/three", joined)
+
+    def test_url_join_extra_slashes(self):
+        pieces = ["one/", "/two//", "/three/"]
+        joined = common.url_join(*pieces)
+        self.assertEqual("one/two/three", joined)
+
+    def test_url_join_trailing_slash(self):
+        pieces = ["one", "two", "three", ""]
+        joined = common.url_join(*pieces)
+        self.assertEqual("one/two/three/", joined)
+
+    def test_url_join_empty_list(self):
+        pieces = []
+        joined = common.url_join(*pieces)
+        self.assertEqual("", joined)
+
+    def test_url_join_single_empty_string(self):
+        pieces = [""]
+        joined = common.url_join(*pieces)
+        self.assertEqual("", joined)
+
+    def test_url_join_single_slash(self):
+        pieces = ["/"]
+        joined = common.url_join(*pieces)
+        self.assertEqual("", joined)
+
+
+class ViewBuilderLinkTest(test.NoDBTestCase):
+    project_id = "fake"
+    api_version = "2.1"
+
+    def setUp(self):
+        super(ViewBuilderLinkTest, self).setUp()
+        self.request = self.req("/%s" % self.project_id)
+        self.vb = common.ViewBuilder()
+
+    def req(self, url, use_admin_context=False):
+        return fakes.HTTPRequest.blank(url,
+                use_admin_context=use_admin_context, version=self.api_version)
+
+    def test_get_project_id(self):
+        proj_id = self.vb._get_project_id(self.request)
+        self.assertEqual(self.project_id, proj_id)
+
+    def test_get_project_id_with_none_project_id(self):
+        self.request.environ["nova.context"].project_id = None
+        proj_id = self.vb._get_project_id(self.request)
+        self.assertEqual('', proj_id)
+
+    def test_get_next_link(self):
+        identifier = "identifier"
+        collection = "collection"
+        next_link = self.vb._get_next_link(self.request, identifier,
+                                           collection)
+        expected = "/".join((self.request.url,
+                             "%s?marker=%s" % (collection, identifier)))
+        self.assertEqual(expected, next_link)
+
+    def test_get_href_link(self):
+        identifier = "identifier"
+        collection = "collection"
+        href_link = self.vb._get_href_link(self.request, identifier,
+                                           collection)
+        expected = "/".join((self.request.url, collection, identifier))
+        self.assertEqual(expected, href_link)
+
+    def test_get_bookmark_link(self):
+        identifier = "identifier"
+        collection = "collection"
+        bookmark_link = self.vb._get_bookmark_link(self.request, identifier,
+                                                   collection)
+        bmk_url = common.remove_trailing_version_from_href(
+                self.request.application_url)
+        expected = "/".join((bmk_url, self.project_id, collection, identifier))
+        self.assertEqual(expected, bookmark_link)

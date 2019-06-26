@@ -15,20 +15,20 @@
 
 """Client side of the conductor RPC API."""
 
-from oslo_config import cfg
 import oslo_messaging as messaging
 from oslo_serialization import jsonutils
+from oslo_versionedobjects import base as ovo_base
 
+import nova.conf
 from nova.objects import base as objects_base
+from nova import profiler
 from nova import rpc
 
-CONF = cfg.CONF
-
-rpcapi_cap_opt = cfg.StrOpt('conductor',
-        help='Set a version cap for messages sent to conductor services')
-CONF.register_opt(rpcapi_cap_opt, 'upgrade_levels')
+CONF = nova.conf.CONF
+RPC_TOPIC = 'conductor'
 
 
+@profiler.trace_cls("rpc")
 class ConductorAPI(object):
     """Client side of the conductor RPC API
 
@@ -159,6 +159,43 @@ class ConductorAPI(object):
     * 2.1  - Make notify_usage_exists() take an instance object
     * Remove bw_usage_update()
     * Remove notify_usage_exists()
+
+    ... Kilo supports message version 2.1.  So, any changes to
+    existing methods in 2.x after that point should be done such
+    that they can handle the version_cap being set to 2.1.
+
+    * Remove get_ec2_ids()
+    * Remove service_get_all_by()
+    * Remove service_create()
+    * Remove service_destroy()
+    * Remove service_update()
+    * Remove migration_get_in_progress_by_host_and_node()
+    * Remove aggregate_metadata_get_by_host()
+    * Remove block_device_mapping_update_or_create()
+    * Remove block_device_mapping_get_all_by_instance()
+    * Remove instance_get_all_by_host()
+    * Remove compute_node_update()
+    * Remove compute_node_delete()
+    * Remove security_groups_trigger_handler()
+    * Remove task_log_get()
+    * Remove task_log_begin_task()
+    * Remove task_log_end_task()
+    * Remove security_groups_trigger_members_refresh()
+    * Remove vol_usage_update()
+    * Remove instance_update()
+
+    * 2.2 - Add object_backport_versions()
+    * 2.3 - Add object_class_action_versions()
+    * Remove compute_node_create()
+    * Remove object_backport()
+
+    * 3.0  - Drop backwards compatibility
+
+    ... Liberty, Mitaka, Newton, and Ocata support message version 3.0.  So,
+    any changes to existing methods in 3.x after that point should be done such
+    that they can handle the version_cap being set to 3.0.
+
+    * Remove provider_fw_rule_get_all()
     """
 
     VERSION_ALIASES = {
@@ -166,11 +203,16 @@ class ConductorAPI(object):
         'havana': '1.58',
         'icehouse': '2.0',
         'juno': '2.0',
+        'kilo': '2.1',
+        'liberty': '3.0',
+        'mitaka': '3.0',
+        'newton': '3.0',
+        'ocata': '3.0',
     }
 
     def __init__(self):
         super(ConductorAPI, self).__init__()
-        target = messaging.Target(topic=CONF.conductor.topic, version='2.0')
+        target = messaging.Target(topic=RPC_TOPIC, version='3.0')
         version_cap = self.VERSION_ALIASES.get(CONF.upgrade_levels.conductor,
                                                CONF.upgrade_levels.conductor)
         serializer = objects_base.NovaObjectSerializer()
@@ -178,167 +220,38 @@ class ConductorAPI(object):
                                      version_cap=version_cap,
                                      serializer=serializer)
 
-    def instance_update(self, context, instance_uuid, updates,
-                        service=None):
-        updates_p = jsonutils.to_primitive(updates)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'instance_update',
-                          instance_uuid=instance_uuid,
-                          updates=updates_p,
-                          service=service)
-
-    def migration_get_in_progress_by_host_and_node(self, context,
-                                                   host, node):
-        cctxt = self.client.prepare()
-        return cctxt.call(context,
-                          'migration_get_in_progress_by_host_and_node',
-                          host=host, node=node)
-
-    def aggregate_metadata_get_by_host(self, context, host, key):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'aggregate_metadata_get_by_host',
-                          host=host,
-                          key=key)
-
-    def provider_fw_rule_get_all(self, context):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'provider_fw_rule_get_all')
-
-    def block_device_mapping_update_or_create(self, context, values,
-                                              create=None):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'block_device_mapping_update_or_create',
-                          values=values, create=create)
-
-    def block_device_mapping_get_all_by_instance(self, context, instance,
-                                                 legacy=True):
-        instance_p = jsonutils.to_primitive(instance)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'block_device_mapping_get_all_by_instance',
-                          instance=instance_p, legacy=legacy)
-
-    def vol_usage_update(self, context, vol_id, rd_req, rd_bytes, wr_req,
-                         wr_bytes, instance, last_refreshed=None,
-                         update_totals=False):
-        instance_p = jsonutils.to_primitive(instance)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'vol_usage_update',
-                          vol_id=vol_id, rd_req=rd_req,
-                          rd_bytes=rd_bytes, wr_req=wr_req,
-                          wr_bytes=wr_bytes,
-                          instance=instance_p, last_refreshed=last_refreshed,
-                          update_totals=update_totals)
-
-    def service_get_all_by(self, context, topic=None, host=None, binary=None):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'service_get_all_by',
-                          topic=topic, host=host, binary=binary)
-
-    def instance_get_all_by_host(self, context, host, node=None,
-                                 columns_to_join=None):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'instance_get_all_by_host',
-                          host=host, node=node,
-                          columns_to_join=columns_to_join)
-
-    def service_create(self, context, values):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'service_create', values=values)
-
-    def service_destroy(self, context, service_id):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'service_destroy', service_id=service_id)
-
-    def compute_node_create(self, context, values):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'compute_node_create', values=values)
-
-    def compute_node_update(self, context, node, values):
-        node_p = jsonutils.to_primitive(node)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'compute_node_update',
-                          node=node_p, values=values)
-
-    def compute_node_delete(self, context, node):
-        node_p = jsonutils.to_primitive(node)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'compute_node_delete', node=node_p)
-
-    def service_update(self, context, service, values):
-        service_p = jsonutils.to_primitive(service)
-
-        # (NOTE:jichenjc)If we're calling this periodically, it makes no
-        # sense for the RPC timeout to be more than the service
-        # report interval. Select 5 here is only find a reaonable long
-        # interval as threshold.
-        timeout = CONF.report_interval
-        if timeout and timeout > 5:
-            timeout -= 1
-
-        if timeout:
-            cctxt = self.client.prepare(timeout=timeout)
-        else:
-            cctxt = self.client.prepare()
-
-        return cctxt.call(context, 'service_update',
-                          service=service_p, values=values)
-
-    def task_log_get(self, context, task_name, begin, end, host, state=None):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'task_log_get',
-                          task_name=task_name, begin=begin, end=end,
-                          host=host, state=state)
-
-    def task_log_begin_task(self, context, task_name, begin, end, host,
-                            task_items=None, message=None):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'task_log_begin_task',
-                          task_name=task_name,
-                          begin=begin, end=end, host=host,
-                          task_items=task_items, message=message)
-
-    def task_log_end_task(self, context, task_name, begin, end, host, errors,
-                          message=None):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'task_log_end_task',
-                          task_name=task_name, begin=begin, end=end,
-                          host=host, errors=errors, message=message)
-
-    def security_groups_trigger_handler(self, context, event, args):
-        args_p = jsonutils.to_primitive(args)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'security_groups_trigger_handler',
-                          event=event, args=args_p)
-
-    def security_groups_trigger_members_refresh(self, context, group_ids):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'security_groups_trigger_members_refresh',
-                          group_ids=group_ids)
-
-    def get_ec2_ids(self, context, instance):
-        instance_p = jsonutils.to_primitive(instance)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'get_ec2_ids',
-                          instance=instance_p)
-
+    # TODO(hanlind): This method can be removed once oslo.versionedobjects
+    # has been converted to use version_manifests in remotable_classmethod
+    # operations, which will use the new class action handler.
     def object_class_action(self, context, objname, objmethod, objver,
                             args, kwargs):
+        versions = ovo_base.obj_tree_get_versions(objname)
+        return self.object_class_action_versions(context,
+                                                 objname,
+                                                 objmethod,
+                                                 versions,
+                                                 args, kwargs)
+
+    def object_class_action_versions(self, context, objname, objmethod,
+                                     object_versions, args, kwargs):
         cctxt = self.client.prepare()
-        return cctxt.call(context, 'object_class_action',
+        return cctxt.call(context, 'object_class_action_versions',
                           objname=objname, objmethod=objmethod,
-                          objver=objver, args=args, kwargs=kwargs)
+                          object_versions=object_versions,
+                          args=args, kwargs=kwargs)
 
     def object_action(self, context, objinst, objmethod, args, kwargs):
         cctxt = self.client.prepare()
         return cctxt.call(context, 'object_action', objinst=objinst,
                           objmethod=objmethod, args=args, kwargs=kwargs)
 
-    def object_backport(self, context, objinst, target_version):
+    def object_backport_versions(self, context, objinst, object_versions):
         cctxt = self.client.prepare()
-        return cctxt.call(context, 'object_backport', objinst=objinst,
-                          target_version=target_version)
+        return cctxt.call(context, 'object_backport_versions', objinst=objinst,
+                          object_versions=object_versions)
 
 
+@profiler.trace_cls("rpc")
 class ComputeTaskAPI(object):
     """Client side of the conductor 'compute' namespaced RPC API
 
@@ -349,34 +262,68 @@ class ComputeTaskAPI(object):
     1.2 - Added build_instances
     1.3 - Added unshelve_instance
     1.4 - Added reservations to migrate_server.
-    1.5 - Added the leagacy_bdm parameter to build_instances
+    1.5 - Added the legacy_bdm parameter to build_instances
     1.6 - Made migrate_server use instance objects
     1.7 - Do not send block_device_mapping and legacy_bdm to build_instances
     1.8 - Add rebuild_instance
     1.9 - Converted requested_networks to NetworkRequestList object
     1.10 - Made migrate_server() and build_instances() send flavor objects
     1.11 - Added clean_shutdown to migrate_server()
-
+    1.12 - Added request_spec to rebuild_instance()
+    1.13 - Added request_spec to migrate_server()
+    1.14 - Added request_spec to unshelve_instance()
+    1.15 - Added live_migrate_instance
+    1.16 - Added schedule_and_build_instances
+    1.17 - Added tags to schedule_and_build_instances()
+    1.18 - Added request_spec to build_instances().
+    1.19 - build_instances() now gets a 'host_lists' parameter that represents
+           potential alternate hosts for retries within a cell for each
+           instance.
+    1.20 - migrate_server() now gets a 'host_list' parameter that represents
+           potential alternate hosts for retries within a cell.
     """
 
     def __init__(self):
         super(ComputeTaskAPI, self).__init__()
-        target = messaging.Target(topic=CONF.conductor.topic,
+        target = messaging.Target(topic=RPC_TOPIC,
                                   namespace='compute_task',
                                   version='1.0')
         serializer = objects_base.NovaObjectSerializer()
         self.client = rpc.get_client(target, serializer=serializer)
 
+    def live_migrate_instance(self, context, instance, scheduler_hint,
+                              block_migration, disk_over_commit, request_spec):
+        kw = {'instance': instance, 'scheduler_hint': scheduler_hint,
+              'block_migration': block_migration,
+              'disk_over_commit': disk_over_commit,
+              'request_spec': request_spec,
+              }
+        version = '1.15'
+        cctxt = self.client.prepare(version=version)
+        cctxt.cast(context, 'live_migrate_instance', **kw)
+
+    # TODO(melwitt): Remove the reservations parameter in version 2.0 of the
+    # RPC API.
     def migrate_server(self, context, instance, scheduler_hint, live, rebuild,
                   flavor, block_migration, disk_over_commit,
-                  reservations=None, clean_shutdown=True):
+                  reservations=None, clean_shutdown=True, request_spec=None,
+                  host_list=None):
         kw = {'instance': instance, 'scheduler_hint': scheduler_hint,
               'live': live, 'rebuild': rebuild, 'flavor': flavor,
               'block_migration': block_migration,
               'disk_over_commit': disk_over_commit,
               'reservations': reservations,
-              'clean_shutdown': clean_shutdown}
-        version = '1.11'
+              'clean_shutdown': clean_shutdown,
+              'request_spec': request_spec,
+              'host_list': host_list,
+              }
+        version = '1.20'
+        if not self.client.can_send_version(version):
+            del kw['host_list']
+            version = '1.13'
+        if not self.client.can_send_version(version):
+            del kw['request_spec']
+            version = '1.11'
         if not self.client.can_send_version(version):
             del kw['clean_shutdown']
             version = '1.10'
@@ -392,48 +339,98 @@ class ComputeTaskAPI(object):
 
     def build_instances(self, context, instances, image, filter_properties,
             admin_password, injected_files, requested_networks,
-            security_groups, block_device_mapping, legacy_bdm=True):
+            security_groups, block_device_mapping, legacy_bdm=True,
+            request_spec=None, host_lists=None):
         image_p = jsonutils.to_primitive(image)
-        version = '1.10'
+        kwargs = {"instances": instances, "image": image_p,
+                  "filter_properties": filter_properties,
+                  "admin_password": admin_password,
+                  "injected_files": injected_files,
+                  "requested_networks": requested_networks,
+                  "security_groups": security_groups,
+                  "request_spec": request_spec,
+                  "host_lists": host_lists}
+        version = '1.19'
+        if not self.client.can_send_version(version):
+            version = '1.18'
+            kwargs.pop("host_lists")
+        if not self.client.can_send_version(version):
+            version = '1.10'
+            kwargs.pop("request_spec")
         if not self.client.can_send_version(version):
             version = '1.9'
             if 'instance_type' in filter_properties:
                 flavor = filter_properties['instance_type']
                 flavor_p = objects_base.obj_to_primitive(flavor)
-                filter_properties = dict(filter_properties,
-                                         instance_type=flavor_p)
-        kw = {'instances': instances, 'image': image_p,
-               'filter_properties': filter_properties,
-               'admin_password': admin_password,
-               'injected_files': injected_files,
-               'requested_networks': requested_networks,
-               'security_groups': security_groups}
+                kwargs["filter_properties"] = dict(filter_properties,
+                                                   instance_type=flavor_p)
         if not self.client.can_send_version(version):
             version = '1.8'
-            kw['requested_networks'] = kw['requested_networks'].as_tuples()
+            nets = kwargs['requested_networks'].as_tuples()
+            kwargs['requested_networks'] = nets
         if not self.client.can_send_version('1.7'):
             version = '1.5'
             bdm_p = objects_base.obj_to_primitive(block_device_mapping)
-            kw.update({'block_device_mapping': bdm_p,
-                       'legacy_bdm': legacy_bdm})
+            kwargs.update({'block_device_mapping': bdm_p,
+                           'legacy_bdm': legacy_bdm})
 
         cctxt = self.client.prepare(version=version)
-        cctxt.cast(context, 'build_instances', **kw)
+        cctxt.cast(context, 'build_instances', **kwargs)
 
-    def unshelve_instance(self, context, instance):
-        cctxt = self.client.prepare(version='1.3')
-        cctxt.cast(context, 'unshelve_instance', instance=instance)
+    def schedule_and_build_instances(self, context, build_requests,
+                                     request_specs,
+                                     image, admin_password, injected_files,
+                                     requested_networks,
+                                     block_device_mapping,
+                                     tags=None):
+        version = '1.17'
+        kw = {'build_requests': build_requests,
+              'request_specs': request_specs,
+              'image': jsonutils.to_primitive(image),
+              'admin_password': admin_password,
+              'injected_files': injected_files,
+              'requested_networks': requested_networks,
+              'block_device_mapping': block_device_mapping,
+              'tags': tags}
+
+        if not self.client.can_send_version(version):
+            version = '1.16'
+            del kw['tags']
+
+        cctxt = self.client.prepare(version=version)
+        cctxt.cast(context, 'schedule_and_build_instances', **kw)
+
+    def unshelve_instance(self, context, instance, request_spec=None):
+        version = '1.14'
+        kw = {'instance': instance,
+              'request_spec': request_spec
+              }
+        if not self.client.can_send_version(version):
+            version = '1.3'
+            del kw['request_spec']
+        cctxt = self.client.prepare(version=version)
+        cctxt.cast(context, 'unshelve_instance', **kw)
 
     def rebuild_instance(self, ctxt, instance, new_pass, injected_files,
             image_ref, orig_image_ref, orig_sys_metadata, bdms,
             recreate=False, on_shared_storage=False, host=None,
-            preserve_ephemeral=False, kwargs=None):
-        cctxt = self.client.prepare(version='1.8')
-        cctxt.cast(ctxt, 'rebuild_instance',
-                   instance=instance, new_pass=new_pass,
-                   injected_files=injected_files, image_ref=image_ref,
-                   orig_image_ref=orig_image_ref,
-                   orig_sys_metadata=orig_sys_metadata, bdms=bdms,
-                   recreate=recreate, on_shared_storage=on_shared_storage,
-                   preserve_ephemeral=preserve_ephemeral,
-                   host=host)
+            preserve_ephemeral=False, request_spec=None):
+        version = '1.12'
+        kw = {'instance': instance,
+              'new_pass': new_pass,
+              'injected_files': injected_files,
+              'image_ref': image_ref,
+              'orig_image_ref': orig_image_ref,
+              'orig_sys_metadata': orig_sys_metadata,
+              'bdms': bdms,
+              'recreate': recreate,
+              'on_shared_storage': on_shared_storage,
+              'preserve_ephemeral': preserve_ephemeral,
+              'host': host,
+              'request_spec': request_spec,
+              }
+        if not self.client.can_send_version(version):
+            version = '1.8'
+            del kw['request_spec']
+        cctxt = self.client.prepare(version=version)
+        cctxt.cast(ctxt, 'rebuild_instance', **kw)

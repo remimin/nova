@@ -14,22 +14,30 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import oslo_config.cfg
 from oslo_utils import importutils
 
-_network_opts = [
-    oslo_config.cfg.StrOpt('network_api_class',
-                           default='nova.network.api.API',
-                           help='The full class name of the '
-                                'network API class to use'),
-]
+import nova.conf
 
-oslo_config.cfg.CONF.register_opts(_network_opts)
+NOVA_NET_API = 'nova.network.api.API'
+NEUTRON_NET_API = 'nova.network.neutronv2.api.API'
 
 
-def API(skip_policy_check=False):
-    network_api_class = oslo_config.cfg.CONF.network_api_class
-    if 'quantumv2' in network_api_class:
-        network_api_class = network_api_class.replace('quantumv2', 'neutronv2')
+CONF = nova.conf.CONF
+
+
+def is_neutron():
+    """Does this configuration mean we're neutron.
+
+    This logic exists as a separate config option
+    """
+    return CONF.use_neutron
+
+
+def API():
+    if is_neutron():
+        network_api_class = NEUTRON_NET_API
+    else:
+        network_api_class = NOVA_NET_API
+
     cls = importutils.import_class(network_api_class)
-    return cls(skip_policy_check=skip_policy_check)
+    return cls()

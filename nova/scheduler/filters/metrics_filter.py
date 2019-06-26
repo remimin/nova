@@ -13,18 +13,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo_config import cfg
 from oslo_log import log as logging
 
+import nova.conf
 from nova.scheduler import filters
 from nova.scheduler import utils
 
 LOG = logging.getLogger(__name__)
 
-CONF = cfg.CONF
-CONF.import_opt('weight_setting',
-                'nova.scheduler.weights.metrics',
-                group='metrics')
+CONF = nova.conf.CONF
 
 
 class MetricsFilter(filters.BaseHostFilter):
@@ -35,19 +32,23 @@ class MetricsFilter(filters.BaseHostFilter):
     these hosts.
     """
 
+    RUN_ON_REBUILD = False
+
     def __init__(self):
         super(MetricsFilter, self).__init__()
         opts = utils.parse_options(CONF.metrics.weight_setting,
                                    sep='=',
                                    converter=float,
                                    name="metrics.weight_setting")
-        self.keys = [x[0] for x in opts]
+        self.keys = set([x[0] for x in opts])
 
-    def host_passes(self, host_state, filter_properties):
-        unavail = [i for i in self.keys if i not in host_state.metrics]
-        if unavail:
+    def host_passes(self, host_state, spec_obj):
+        metrics_on_host = set(m.name for m in host_state.metrics)
+        if not self.keys.issubset(metrics_on_host):
+            unavail = metrics_on_host - self.keys
             LOG.debug("%(host_state)s does not have the following "
-                        "metrics: %(metrics)s",
+                      "metrics: %(metrics)s",
                       {'host_state': host_state,
                        'metrics': ', '.join(unavail)})
-        return len(unavail) == 0
+            return False
+        return True

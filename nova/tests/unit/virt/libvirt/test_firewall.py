@@ -14,15 +14,15 @@
 #    under the License.
 
 import re
-import uuid
 from xml.dom import minidom
 
+from eventlet import greenthread
 from lxml import etree
 import mock
-from mox3 import mox
 from oslo_concurrency.fixture import lockutils as lock_fixture
+from oslo_utils.fixture import uuidsentinel as uuids
+from oslo_utils import uuidutils
 
-from nova.compute import utils as compute_utils
 from nova import exception
 from nova.network import linux_net
 from nova import objects
@@ -32,7 +32,6 @@ from nova.tests.unit.virt.libvirt import fakelibvirt
 from nova.virt.libvirt import firewall
 from nova.virt.libvirt import host
 from nova.virt import netutils
-from nova.virt import virtapi
 
 _fake_network_info = fake_network.fake_get_instance_nw_info
 _fake_stub_out_get_nw_info = fake_network.stub_out_nw_api_get_instance_nw_info
@@ -66,7 +65,7 @@ class NWFilterFakes(object):
         name = tree.get('name')
         u = tree.find('uuid')
         if u is None:
-            u = uuid.uuid4().hex
+            u = uuidutils.generate_uuid(dashed=False)
         else:
             u = u.text
         if name not in self.filters:
@@ -80,11 +79,6 @@ class NWFilterFakes(object):
         return True
 
 
-class FakeVirtAPI(virtapi.VirtAPI):
-    def provider_fw_rule_get_all(self, context):
-        return []
-
-
 class IptablesFirewallTestCase(test.NoDBTestCase):
     def setUp(self):
         super(IptablesFirewallTestCase, self).setUp()
@@ -92,7 +86,6 @@ class IptablesFirewallTestCase(test.NoDBTestCase):
         self.useFixture(fakelibvirt.FakeLibvirtFixture())
 
         self.fw = firewall.IptablesFirewallDriver(
-            FakeVirtAPI(),
             host=host.Host("qemu:///system"))
 
     in_rules = [
@@ -156,11 +149,10 @@ class IptablesFirewallTestCase(test.NoDBTestCase):
         inst.info_cache.deleted = False
         return inst
 
+    @mock.patch.object(linux_net.iptables_manager, "execute")
     @mock.patch.object(objects.InstanceList, "get_by_security_group_id")
-    @mock.patch.object(objects.SecurityGroupRuleList,
-                       "get_by_security_group_id")
-    @mock.patch.object(objects.SecurityGroupList, "get_by_instance")
-    def test_static_filters(self, mock_secgroup, mock_secrule, mock_instlist):
+    @mock.patch.object(objects.SecurityGroupRuleList, "get_by_instance")
+    def test_static_filters(self, mock_secrule, mock_instlist, fake_execute):
         UUID = "2674993b-6adb-4733-abd9-a7c10cc1f146"
         SRC_UUID = "0e0a76b2-7c52-4bc0-9a60-d83017e42c1a"
         instance_ref = self._create_instance_ref(UUID)
@@ -178,40 +170,40 @@ class IptablesFirewallTestCase(test.NoDBTestCase):
                                              name='testsourcegroup',
                                              description='src group')
 
-        r1 = objects.SecurityGroupRule(parent_group_id=secgroup['id'],
+        r1 = objects.SecurityGroupRule(parent_group_id=secgroup.id,
                                        protocol='icmp',
                                        from_port=-1,
                                        to_port=-1,
                                        cidr='192.168.11.0/24',
                                        grantee_group=None)
 
-        r2 = objects.SecurityGroupRule(parent_group_id=secgroup['id'],
+        r2 = objects.SecurityGroupRule(parent_group_id=secgroup.id,
                                        protocol='icmp',
                                        from_port=8,
                                        to_port=-1,
                                        cidr='192.168.11.0/24',
                                        grantee_group=None)
 
-        r3 = objects.SecurityGroupRule(parent_group_id=secgroup['id'],
+        r3 = objects.SecurityGroupRule(parent_group_id=secgroup.id,
                                        protocol='tcp',
                                        from_port=80,
                                        to_port=81,
                                        cidr='192.168.10.0/24',
                                        grantee_group=None)
 
-        r4 = objects.SecurityGroupRule(parent_group_id=secgroup['id'],
+        r4 = objects.SecurityGroupRule(parent_group_id=secgroup.id,
                                        protocol='tcp',
                                        from_port=80,
                                        to_port=81,
                                        cidr=None,
                                        grantee_group=src_secgroup,
-                                       group_id=src_secgroup['id'])
+                                       group_id=src_secgroup.id)
 
-        r5 = objects.SecurityGroupRule(parent_group_id=secgroup['id'],
+        r5 = objects.SecurityGroupRule(parent_group_id=secgroup.id,
                                        protocol=None,
                                        cidr=None,
                                        grantee_group=src_secgroup,
-                                       group_id=src_secgroup['id'])
+                                       group_id=src_secgroup.id)
 
         secgroup_list = objects.SecurityGroupList()
         secgroup_list.objects.append(secgroup)
@@ -220,26 +212,11 @@ class IptablesFirewallTestCase(test.NoDBTestCase):
         instance_ref.security_groups = secgroup_list
         src_instance_ref.security_groups = src_secgroup_list
 
-        def _fake_secgroup(ctxt, instance):
-            if instance.uuid == UUID:
-                return instance_ref.security_groups
-            else:
-                return src_instance_ref.security_groups
-
-        mock_secgroup.side_effect = _fake_secgroup
-
-        def _fake_secrule(ctxt, id):
-            if id == secgroup.id:
-                rules = objects.SecurityGroupRuleList()
-                rules.objects.extend([r1, r2, r3, r4, r5])
-                return rules
-            else:
-                return []
-
-        mock_secrule.side_effect = _fake_secrule
+        mock_secrule.return_value = objects.SecurityGroupRuleList(
+            objects=[r1, r2, r3, r4, r5])
 
         def _fake_instlist(ctxt, id):
-            if id == src_secgroup['id']:
+            if id == src_secgroup.id:
                 insts = objects.InstanceList()
                 insts.objects.append(src_instance_ref)
                 return insts
@@ -251,7 +228,9 @@ class IptablesFirewallTestCase(test.NoDBTestCase):
         mock_instlist.side_effect = _fake_instlist
 
         def fake_iptables_execute(*cmd, **kwargs):
-            process_input = kwargs.get('process_input', None)
+            process_input = kwargs.get('process_input')
+            if process_input is not None and isinstance(process_input, bytes):
+                process_input = process_input.decode('utf-8')
             if cmd == ('ip6tables-save', '-c'):
                 return '\n'.join(self.in6_filter_rules), None
             if cmd == ('iptables-save', '-c'):
@@ -267,18 +246,17 @@ class IptablesFirewallTestCase(test.NoDBTestCase):
                     self.out6_rules = lines
                 return '', ''
 
-        network_model = _fake_network_info(self.stubs, 1)
+        network_model = _fake_network_info(self, 1)
 
-        linux_net.iptables_manager.execute = fake_iptables_execute
+        fake_execute.side_effect = fake_iptables_execute
 
-        self.stubs.Set(compute_utils, 'get_nw_info_for_instance',
-                       lambda instance: network_model)
+        self.stub_out('nova.objects.Instance.get_network_info',
+                      lambda instance: network_model)
 
         self.fw.prepare_instance_filter(instance_ref, network_model)
         self.fw.apply_instance_filter(instance_ref, network_model)
 
-        in_rules = filter(lambda l: not l.startswith('#'),
-                          self.in_rules)
+        in_rules = [l for l in self.in_rules if not l.startswith('#')]
         for rule in in_rules:
             if 'nova' not in rule:
                 self.assertIn(rule, self.out_rules,
@@ -304,48 +282,48 @@ class IptablesFirewallTestCase(test.NoDBTestCase):
 
         regex = re.compile('\[0\:0\] -A .* -j ACCEPT -p icmp '
                            '-s 192.168.11.0/24')
-        self.assertTrue(len(filter(regex.match, self.out_rules)) > 0,
-                        "ICMP acceptance rule wasn't added")
+        match_rules = [rule for rule in self.out_rules if regex.match(rule)]
+        self.assertGreater(len(match_rules), 0,
+                           "ICMP acceptance rule wasn't added")
 
         regex = re.compile('\[0\:0\] -A .* -j ACCEPT -p icmp -m icmp '
                            '--icmp-type 8 -s 192.168.11.0/24')
-        self.assertTrue(len(filter(regex.match, self.out_rules)) > 0,
-                        "ICMP Echo Request acceptance rule wasn't added")
+        match_rules = [rule for rule in self.out_rules if regex.match(rule)]
+        self.assertGreater(len(match_rules), 0,
+                           "ICMP Echo Request acceptance rule wasn't added")
 
         for ip in network_model.fixed_ips():
             if ip['version'] != 4:
                 continue
             regex = re.compile('\[0\:0\] -A .* -j ACCEPT -p tcp -m multiport '
                                '--dports 80:81 -s %s' % ip['address'])
-            self.assertTrue(len(filter(regex.match, self.out_rules)) > 0,
-                            "TCP port 80/81 acceptance rule wasn't added")
+            match_rules = [rule for rule in self.out_rules
+                           if regex.match(rule)]
+            self.assertGreater(len(match_rules), 0,
+                               "TCP port 80/81 acceptance rule wasn't added")
             regex = re.compile('\[0\:0\] -A .* -j ACCEPT -s '
                                '%s' % ip['address'])
-            self.assertTrue(len(filter(regex.match, self.out_rules)) > 0,
-                            "Protocol/port-less acceptance rule wasn't added")
+            match_rules = [rule for rule in self.out_rules
+                           if regex.match(rule)]
+            self.assertGreater(len(match_rules), 0,
+                               "Protocol/port-less acceptance rule"
+                               " wasn't added")
 
         regex = re.compile('\[0\:0\] -A .* -j ACCEPT -p tcp '
                            '-m multiport --dports 80:81 -s 192.168.10.0/24')
-        self.assertTrue(len(filter(regex.match, self.out_rules)) > 0,
-                        "TCP port 80/81 acceptance rule wasn't added")
+        match_rules = [rule for rule in self.out_rules if regex.match(rule)]
+        self.assertGreater(len(match_rules), 0,
+                           "TCP port 80/81 acceptance rule wasn't added")
 
-    def test_filters_for_instance_with_ip_v6(self):
-        self.flags(use_ipv6=True)
-        network_info = _fake_network_info(self.stubs, 1)
+    def test_filters_for_instance(self):
+        network_info = _fake_network_info(self, 1)
         rulesv4, rulesv6 = self.fw._filters_for_instance("fake", network_info)
         self.assertEqual(len(rulesv4), 2)
         self.assertEqual(len(rulesv6), 1)
 
-    def test_filters_for_instance_without_ip_v6(self):
-        self.flags(use_ipv6=False)
-        network_info = _fake_network_info(self.stubs, 1)
-        rulesv4, rulesv6 = self.fw._filters_for_instance("fake", network_info)
-        self.assertEqual(len(rulesv4), 2)
-        self.assertEqual(len(rulesv6), 0)
-
-    @mock.patch.object(objects.SecurityGroupList, "get_by_instance")
-    def test_multinic_iptables(self, mock_secgroup):
-        mock_secgroup.return_value = objects.SecurityGroupList()
+    @mock.patch.object(objects.SecurityGroupRuleList, "get_by_instance")
+    def test_multinic_iptables(self, mock_secrule):
+        mock_secrule.return_value = objects.SecurityGroupRuleList()
 
         ipv4_rules_per_addr = 1
         ipv4_addr_per_network = 2
@@ -353,7 +331,8 @@ class IptablesFirewallTestCase(test.NoDBTestCase):
         ipv6_addr_per_network = 1
         networks_count = 5
         instance_ref = self._create_instance_ref()
-        network_info = _fake_network_info(self.stubs, networks_count,
+        instance_ref.security_groups = objects.SecurityGroupList()
+        network_info = _fake_network_info(self, networks_count,
                                 ipv4_addr_per_network)
         network_info[0]['network']['subnets'][0]['meta']['dhcp_server'] = \
             '1.1.1.1'
@@ -373,35 +352,35 @@ class IptablesFirewallTestCase(test.NoDBTestCase):
         self.assertEqual(ipv6_network_rules,
                   ipv6_rules_per_addr * ipv6_addr_per_network * networks_count)
 
-    def test_do_refresh_security_group_rules(self):
+    @mock.patch.object(firewall.IptablesFirewallDriver, 'instance_rules')
+    @mock.patch.object(firewall.IptablesFirewallDriver,
+                       'add_filters_for_instance')
+    @mock.patch.object(linux_net.IptablesTable, 'has_chain')
+    def test_do_refresh_security_group_rules(self, mock_has_chain,
+             mock_add_filters, mock_instance_rules):
         instance_ref = self._create_instance_ref()
-        self.mox.StubOutWithMock(self.fw,
-                                 'instance_rules')
-        self.mox.StubOutWithMock(self.fw,
-                                 'add_filters_for_instance',
-                                 use_mock_anything=True)
-        self.mox.StubOutWithMock(self.fw.iptables.ipv4['filter'],
-                                 'has_chain')
 
-        self.fw.instance_rules(instance_ref,
-                               mox.IgnoreArg()).AndReturn((None, None))
-        self.fw.add_filters_for_instance(instance_ref, mox.IgnoreArg(),
-                                         mox.IgnoreArg(), mox.IgnoreArg())
-        self.fw.instance_rules(instance_ref,
-                               mox.IgnoreArg()).AndReturn((None, None))
-        self.fw.iptables.ipv4['filter'].has_chain(mox.IgnoreArg()
-                                                  ).AndReturn(True)
-        self.fw.add_filters_for_instance(instance_ref, mox.IgnoreArg(),
-                                         mox.IgnoreArg(), mox.IgnoreArg())
-        self.mox.ReplayAll()
+        mock_instance_rules.return_value = (None, None)
+        mock_has_chain.return_value = True
 
-        self.fw.prepare_instance_filter(instance_ref, mox.IgnoreArg())
+        self.fw.prepare_instance_filter(instance_ref, mock.ANY)
         self.fw.instance_info[instance_ref['id']] = (instance_ref, None)
         self.fw.do_refresh_security_group_rules("fake")
 
+        expected_rules_calls = [mock.call(instance_ref, None),
+                                  mock.call(instance_ref, None)]
+        expected_filter_calls = [mock.call(instance_ref, mock.ANY, mock.ANY,
+                                mock.ANY),
+                                mock.call(instance_ref, mock.ANY, mock.ANY,
+                                mock.ANY)]
+        self.assertEqual(mock_instance_rules.mock_calls,
+                         expected_rules_calls)
+        self.assertEqual(mock_add_filters.mock_calls, expected_filter_calls)
+        mock_has_chain.assert_called_once_with(mock.ANY)
+
     def test_do_refresh_security_group_rules_instance_gone(self):
-        instance1 = objects.Instance(None, id=1, uuid='fake-uuid1')
-        instance2 = objects.Instance(None, id=2, uuid='fake-uuid2')
+        instance1 = objects.Instance(None, id=1, uuid=uuids.instance_1)
+        instance2 = objects.Instance(None, id=2, uuid=uuids.instance_2)
         self.fw.instance_info = {1: (instance1, 'netinfo1'),
                                  2: (instance2, 'netinfo2')}
         mock_filter = mock.MagicMock()
@@ -422,11 +401,8 @@ class IptablesFirewallTestCase(test.NoDBTestCase):
     @mock.patch.object(fakelibvirt.virConnect, "nwfilterLookupByName")
     @mock.patch.object(fakelibvirt.virConnect, "nwfilterDefineXML")
     @mock.patch.object(objects.InstanceList, "get_by_security_group_id")
-    @mock.patch.object(objects.SecurityGroupRuleList,
-                       "get_by_security_group_id")
-    @mock.patch.object(objects.SecurityGroupList, "get_by_instance")
+    @mock.patch.object(objects.SecurityGroupRuleList, "get_by_instance")
     def test_unfilter_instance_undefines_nwfilter(self,
-                                                  mock_secgroup,
                                                   mock_secrule,
                                                   mock_instlist,
                                                   mock_define,
@@ -435,10 +411,11 @@ class IptablesFirewallTestCase(test.NoDBTestCase):
         mock_lookup.side_effect = fakefilter.nwfilterLookupByName
         mock_define.side_effect = fakefilter.filterDefineXMLMock
         instance_ref = self._create_instance_ref()
+        instance_ref.security_groups = objects.SecurityGroupList()
 
-        mock_secgroup.return_value = objects.SecurityGroupList()
+        mock_secrule.return_value = objects.SecurityGroupRuleList()
 
-        network_info = _fake_network_info(self.stubs, 1)
+        network_info = _fake_network_info(self, 1)
         self.fw.setup_basic_filtering(instance_ref, network_info)
         self.fw.prepare_instance_filter(instance_ref, network_info)
         self.fw.apply_instance_filter(instance_ref, network_info)
@@ -448,82 +425,15 @@ class IptablesFirewallTestCase(test.NoDBTestCase):
         # should undefine just the instance filter
         self.assertEqual(original_filter_count - len(fakefilter.filters), 1)
 
-    @mock.patch.object(FakeVirtAPI, "provider_fw_rule_get_all")
-    @mock.patch.object(objects.SecurityGroupList, "get_by_instance")
-    def test_provider_firewall_rules(self, mock_secgroup, mock_fwrules):
-        mock_secgroup.return_value = objects.SecurityGroupList()
 
-        # setup basic instance data
-        instance_ref = self._create_instance_ref()
-        # FRAGILE: peeks at how the firewall names chains
-        chain_name = 'inst-%s' % instance_ref['id']
-
-        # create a firewall via setup_basic_filtering like libvirt_conn.spawn
-        # should have a chain with 0 rules
-        network_info = _fake_network_info(self.stubs, 1)
-        self.fw.setup_basic_filtering(instance_ref, network_info)
-        self.assertIn('provider', self.fw.iptables.ipv4['filter'].chains)
-        rules = [rule for rule in self.fw.iptables.ipv4['filter'].rules
-                      if rule.chain == 'provider']
-        self.assertEqual(0, len(rules))
-
-        # add a rule angd send the update message, check for 1 rule
-        mock_fwrules.return_value = [{'protocol': 'tcp',
-                                      'cidr': '10.99.99.99/32',
-                                      'from_port': 1,
-                                      'to_port': 65535}]
-        self.fw.refresh_provider_fw_rules()
-        rules = [rule for rule in self.fw.iptables.ipv4['filter'].rules
-                      if rule.chain == 'provider']
-        self.assertEqual(1, len(rules))
-
-        # Add another, refresh, and make sure number of rules goes to two
-        mock_fwrules.return_value = [{'protocol': 'tcp',
-                                      'cidr': '10.99.99.99/32',
-                                      'from_port': 1,
-                                      'to_port': 65535},
-                                     {'protocol': 'udp',
-                                      'cidr': '10.99.99.99/32',
-                                      'from_port': 1,
-                                      'to_port': 65535}]
-        self.fw.refresh_provider_fw_rules()
-        rules = [rule for rule in self.fw.iptables.ipv4['filter'].rules
-                      if rule.chain == 'provider']
-        self.assertEqual(2, len(rules))
-
-        # create the instance filter and make sure it has a jump rule
-        self.fw.prepare_instance_filter(instance_ref, network_info)
-        self.fw.apply_instance_filter(instance_ref, network_info)
-        inst_rules = [rule for rule in self.fw.iptables.ipv4['filter'].rules
-                           if rule.chain == chain_name]
-        jump_rules = [rule for rule in inst_rules if '-j' in rule.rule]
-        provjump_rules = []
-        # IptablesTable doesn't make rules unique internally
-        for rule in jump_rules:
-            if 'provider' in rule.rule and rule not in provjump_rules:
-                provjump_rules.append(rule)
-        self.assertEqual(1, len(provjump_rules))
-
-        # remove a rule from the db, cast to compute to refresh rule
-        mock_fwrules.return_value = [{'protocol': 'udp',
-                                      'cidr': '10.99.99.99/32',
-                                      'from_port': 1,
-                                      'to_port': 65535}]
-        self.fw.refresh_provider_fw_rules()
-        rules = [rule for rule in self.fw.iptables.ipv4['filter'].rules
-                      if rule.chain == 'provider']
-        self.assertEqual(1, len(rules))
-
-
+@mock.patch.object(firewall, 'libvirt', fakelibvirt)
 class NWFilterTestCase(test.NoDBTestCase):
     def setUp(self):
         super(NWFilterTestCase, self).setUp()
 
         self.useFixture(fakelibvirt.FakeLibvirtFixture())
 
-        self.fw = firewall.NWFilterFirewall(
-            FakeVirtAPI(),
-            host=host.Host("qemu:///system"))
+        self.fw = firewall.NWFilterFirewall(host=host.Host("qemu:///system"))
 
     def _create_security_group(self, instance_ref):
         secgroup = objects.SecurityGroup(id=1,
@@ -602,7 +512,7 @@ class NWFilterTestCase(test.NoDBTestCase):
                                  self.recursive_depends[instance_filter],
                                  "Instance filter includes %s" % required_not)
 
-        network_info = _fake_network_info(self.stubs, 1)
+        network_info = _fake_network_info(self, 1)
         # since there is one (network_info) there is one vif
         # pass this vif's mac to _ensure_all_called()
         # to set the instance_filter properly
@@ -630,11 +540,71 @@ class NWFilterTestCase(test.NoDBTestCase):
         instance_ref = self._create_instance()
         self._create_security_group(instance_ref)
 
-        network_info = _fake_network_info(self.stubs, 1)
+        network_info = _fake_network_info(self, 1)
         self.fw.setup_basic_filtering(instance_ref, network_info)
         original_filter_count = len(fakefilter.filters)
         self.fw.unfilter_instance(instance_ref, network_info)
         self.assertEqual(original_filter_count - len(fakefilter.filters), 1)
+
+    @mock.patch.object(fakelibvirt.virConnect, "nwfilterLookupByName")
+    @mock.patch.object(greenthread, 'sleep')
+    def test_unfilter_instance_retry_and_error(self, mock_sleep, mock_lookup):
+        # Tests that we try to undefine the network filter when it's in use
+        # until we hit a timeout. We try two times and sleep once in between.
+        self.flags(live_migration_retry_count=2)
+        in_use = fakelibvirt.libvirtError('nwfilter is in use')
+        in_use.err = (fakelibvirt.VIR_ERR_OPERATION_INVALID,)
+        mock_undefine = mock.Mock(side_effect=in_use)
+        fakefilter = mock.MagicMock(undefine=mock_undefine)
+        mock_lookup.return_value = fakefilter
+
+        instance_ref = self._create_instance()
+        network_info = _fake_network_info(self, 1)
+
+        self.assertRaises(fakelibvirt.libvirtError, self.fw.unfilter_instance,
+                          instance_ref, network_info)
+        self.assertEqual(2, mock_lookup.call_count)
+        self.assertEqual(2, mock_undefine.call_count)
+        mock_sleep.assert_called_once_with(1)
+
+    @mock.patch.object(fakelibvirt.virConnect, "nwfilterLookupByName")
+    @mock.patch.object(greenthread, 'sleep')
+    def test_unfilter_instance_retry_not_found(self, mock_sleep, mock_lookup):
+        # Tests that we exit if the nw filter is not found.
+        in_use = fakelibvirt.libvirtError('nwfilter is in use')
+        in_use.err = (fakelibvirt.VIR_ERR_OPERATION_INVALID,)
+        not_found = fakelibvirt.libvirtError('no nwfilter with matching name')
+        not_found.err = (fakelibvirt.VIR_ERR_NO_NWFILTER,)
+        mock_undefine = mock.Mock(side_effect=(in_use, not_found))
+        fakefilter = mock.MagicMock(undefine=mock_undefine)
+        mock_lookup.return_value = fakefilter
+
+        instance_ref = self._create_instance()
+        network_info = _fake_network_info(self, 1)
+
+        self.fw.unfilter_instance(instance_ref, network_info)
+        self.assertEqual(2, mock_lookup.call_count)
+        self.assertEqual(2, mock_undefine.call_count)
+        mock_sleep.assert_called_once_with(1)
+
+    @mock.patch.object(fakelibvirt.virConnect, "nwfilterLookupByName")
+    @mock.patch.object(greenthread, 'sleep')
+    def test_unfilter_instance_retry_and_pass(self, mock_sleep, mock_lookup):
+        # Tests that we retry on in-use error but pass if undefine() works
+        # while looping.
+        in_use = fakelibvirt.libvirtError('nwfilter is in use')
+        in_use.err = (fakelibvirt.VIR_ERR_OPERATION_INVALID,)
+        mock_undefine = mock.Mock(side_effect=(in_use, None))
+        fakefilter = mock.MagicMock(undefine=mock_undefine)
+        mock_lookup.return_value = fakefilter
+
+        instance_ref = self._create_instance()
+        network_info = _fake_network_info(self, 1)
+
+        self.fw.unfilter_instance(instance_ref, network_info)
+        self.assertEqual(2, mock_lookup.call_count)
+        self.assertEqual(2, mock_undefine.call_count)
+        mock_sleep.assert_called_once_with(1)
 
     def test_redefining_nwfilters(self):
         fakefilter = NWFilterFakes()
@@ -644,7 +614,7 @@ class NWFilterTestCase(test.NoDBTestCase):
         instance_ref = self._create_instance()
         self._create_security_group(instance_ref)
 
-        network_info = _fake_network_info(self.stubs, 1)
+        network_info = _fake_network_info(self, 1)
         self.fw.setup_basic_filtering(instance_ref, network_info)
         self.fw.setup_basic_filtering(instance_ref, network_info)
 
@@ -660,7 +630,7 @@ class NWFilterTestCase(test.NoDBTestCase):
         instance_ref = self._create_instance()
         self._create_security_group(instance_ref)
 
-        network_info = _fake_network_info(self.stubs, 1)
+        network_info = _fake_network_info(self, 1)
         self.fw.setup_basic_filtering(instance_ref, network_info)
 
         vif = network_info[0]
@@ -715,7 +685,7 @@ class NWFilterTestCase(test.NoDBTestCase):
         instance_ref = self._create_instance()
         self._create_security_group(instance_ref)
 
-        network_info = _fake_network_info(self.stubs, 2)
+        network_info = _fake_network_info(self, 2)
         network_info[0]['network']['subnets'][0]['meta']['dhcp_server'] = \
             '1.1.1.1'
 
@@ -743,3 +713,40 @@ class NWFilterTestCase(test.NoDBTestCase):
         self.assertEqual(2, debug.call_count)
         self.assertEqual(u"Cannot find UUID for filter '%(name)s': '%(e)s'",
                          debug.call_args_list[0][0][0])
+
+    def test_define_filter_already_exists(self):
+        """Tests that we ignore a libvirt error when the nw filter already
+        exists for a given name.
+        """
+        error = fakelibvirt.libvirtError('already exists')
+        error.err = (fakelibvirt.VIR_ERR_OPERATION_FAILED, None,
+                     "filter 'nova-no-nd-reflection' already exists with uuid "
+                     "e740c5ec-c715-4f73-9874-630cc73d4ac2",)
+        with mock.patch.object(self.fw._conn, 'nwfilterDefineXML',
+                               side_effect=error) as define:
+            self.fw._define_filter(mock.sentinel.xml)
+        define.assert_called_once_with(mock.sentinel.xml)
+
+    def test_define_filter_fails_wrong_message(self):
+        """Tests that we reraise the libvirt error for an operational failure
+        if the error message is something unexpected.
+        """
+        error = fakelibvirt.libvirtError('already exists')
+        error.err = (fakelibvirt.VIR_ERR_OPERATION_FAILED, None, 'oops',)
+        with mock.patch.object(self.fw._conn, 'nwfilterDefineXML',
+                               side_effect=error) as define:
+            self.assertRaises(fakelibvirt.libvirtError,
+                              self.fw._define_filter, mock.sentinel.xml)
+        define.assert_called_once_with(mock.sentinel.xml)
+
+    def test_define_filter_fails_wrong_code(self):
+        """Tests that we reraise the libvirt error for an operational failure
+        if the error code is something unexpected.
+        """
+        error = fakelibvirt.libvirtError('already exists')
+        error.err = (fakelibvirt.VIR_ERR_OPERATION_TIMEOUT, None, 'timeout',)
+        with mock.patch.object(self.fw._conn, 'nwfilterDefineXML',
+                               side_effect=error) as define:
+            self.assertRaises(fakelibvirt.libvirtError,
+                              self.fw._define_filter, mock.sentinel.xml)
+        define.assert_called_once_with(mock.sentinel.xml)

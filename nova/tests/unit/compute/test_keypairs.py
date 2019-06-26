@@ -14,12 +14,13 @@
 #    under the License.
 """Tests for keypair API."""
 
+import mock
+from oslo_concurrency import processutils
 from oslo_config import cfg
 import six
 
 from nova.compute import api as compute_api
 from nova import context
-from nova import db
 from nova import exception
 from nova.objects import keypair as keypair_obj
 from nova import quota
@@ -27,9 +28,9 @@ from nova.tests.unit.compute import test_compute
 from nova.tests.unit import fake_crypto
 from nova.tests.unit import fake_notifier
 from nova.tests.unit.objects import test_keypair
+from nova.tests.unit import utils as test_utils
 
 CONF = cfg.CONF
-QUOTAS = quota.QUOTAS
 
 
 class KeypairAPITestCase(test_compute.BaseTestCase):
@@ -53,7 +54,7 @@ class KeypairAPITestCase(test_compute.BaseTestCase):
 
     def _keypair_db_call_stubs(self):
 
-        def db_key_pair_get_all_by_user(context, user_id):
+        def db_key_pair_get_all_by_user(context, user_id, limit, marker):
             return [dict(test_keypair.fake_keypair,
                          name=self.existing_key_name,
                          public_key=self.pub_key,
@@ -75,14 +76,11 @@ class KeypairAPITestCase(test_compute.BaseTestCase):
             else:
                 raise exception.KeypairNotFound(user_id=user_id, name=name)
 
-        self.stubs.Set(db, "key_pair_get_all_by_user",
+        self.stub_out("nova.db.api.key_pair_get_all_by_user",
                        db_key_pair_get_all_by_user)
-        self.stubs.Set(db, "key_pair_create",
-                       db_key_pair_create)
-        self.stubs.Set(db, "key_pair_destroy",
-                       db_key_pair_destroy)
-        self.stubs.Set(db, "key_pair_get",
-                       db_key_pair_get)
+        self.stub_out("nova.db.api.key_pair_create", db_key_pair_create)
+        self.stub_out("nova.db.api.key_pair_destroy", db_key_pair_destroy)
+        self.stub_out("nova.db.api.key_pair_get", db_key_pair_get)
 
     def _check_notifications(self, action='create', key_name='foo'):
         self.assertEqual(2, len(fake_notifier.NOTIFICATIONS))
@@ -145,19 +143,18 @@ class CreateImportSharedTestMixIn(object):
         def db_key_pair_create_duplicate(context, keypair):
             raise exception.KeyPairExists(key_name=keypair.get('name', ''))
 
-        self.stubs.Set(db, "key_pair_create", db_key_pair_create_duplicate)
+        self.stub_out("nova.db.api.key_pair_create",
+                      db_key_pair_create_duplicate)
 
         msg = ("Key pair '%(key_name)s' already exists." %
                {'key_name': self.existing_key_name})
         self.assertKeypairRaises(exception.KeyPairExists, msg,
                                  self.existing_key_name)
 
-    def test_quota_limit(self):
-        def fake_quotas_count(self, context, resource, *args, **kwargs):
-            return CONF.quota_key_pairs
-
-        self.stubs.Set(QUOTAS, "count", fake_quotas_count)
-
+    @mock.patch.object(quota.QUOTAS, 'count_as_dict',
+                       return_value={'user': {
+                                         'key_pairs': CONF.quota.key_pairs}})
+    def test_quota_limit(self, mock_count_as_dict):
         msg = "Maximum number of key pairs exceeded"
         self.assertKeypairRaises(exception.KeypairLimitExceeded, msg, 'foo')
 
@@ -165,11 +162,17 @@ class CreateImportSharedTestMixIn(object):
 class CreateKeypairTestCase(KeypairAPITestCase, CreateImportSharedTestMixIn):
     func_name = 'create_key_pair'
 
-    def _check_success(self):
+    @mock.patch('nova.compute.utils.notify_about_keypair_action')
+    def _check_success(self, mock_notify):
         keypair, private_key = self.keypair_api.create_key_pair(
             self.ctxt, self.ctxt.user_id, 'foo', key_type=self.keypair_type)
         self.assertEqual('foo', keypair['name'])
         self.assertEqual(self.keypair_type, keypair['type'])
+        mock_notify.assert_has_calls([
+            mock.call(context=self.ctxt, keypair=keypair,
+                      action='create', phase='start'),
+            mock.call(context=self.ctxt, keypair=keypair,
+                      action='create', phase='end')])
         self._check_notifications()
 
     def test_success_ssh(self):
@@ -179,11 +182,22 @@ class CreateKeypairTestCase(KeypairAPITestCase, CreateImportSharedTestMixIn):
         self.keypair_type = keypair_obj.KEYPAIR_TYPE_X509
         self._check_success()
 
+    def test_x509_subject_too_long(self):
+        # X509 keypairs will fail if the Subject they're created with
+        # is longer than 64 characters. The previous unit tests could not
+        # detect the issue because the ctxt.user_id was too short.
+        # This unit tests is added to prove this issue.
+        self.keypair_type = keypair_obj.KEYPAIR_TYPE_X509
+        self.ctxt.user_id = 'a' * 65
+        self.assertRaises(processutils.ProcessExecutionError,
+                          self._check_success)
+
 
 class ImportKeypairTestCase(KeypairAPITestCase, CreateImportSharedTestMixIn):
     func_name = 'import_key_pair'
 
-    def _check_success(self):
+    @mock.patch('nova.compute.utils.notify_about_keypair_action')
+    def _check_success(self, mock_notify):
         keypair = self.keypair_api.import_key_pair(self.ctxt,
                                                    self.ctxt.user_id,
                                                    'foo',
@@ -195,6 +209,11 @@ class ImportKeypairTestCase(KeypairAPITestCase, CreateImportSharedTestMixIn):
         self.assertEqual(self.fingerprint, keypair['fingerprint'])
         self.assertEqual(self.pub_key, keypair['public_key'])
         self.assertEqual(self.keypair_type, keypair['type'])
+        mock_notify.assert_has_calls([
+            mock.call(context=self.ctxt, keypair=keypair,
+                      action='import', phase='start'),
+            mock.call(context=self.ctxt, keypair=keypair,
+                      action='import', phase='end')])
         self._check_notifications(action='import')
 
     def test_success_ssh(self):
@@ -232,14 +251,23 @@ class GetKeypairsTestCase(KeypairAPITestCase):
 
 
 class DeleteKeypairTestCase(KeypairAPITestCase):
-    def test_success(self):
-        self.keypair_api.get_key_pair(self.ctxt, self.ctxt.user_id,
-                                      self.existing_key_name)
+    @mock.patch('nova.compute.utils.notify_about_keypair_action')
+    def test_success(self, mock_notify):
         self.keypair_api.delete_key_pair(self.ctxt, self.ctxt.user_id,
                 self.existing_key_name)
         self.assertRaises(exception.KeypairNotFound,
                 self.keypair_api.get_key_pair, self.ctxt, self.ctxt.user_id,
                 self.existing_key_name)
 
+        match_by_name = test_utils.CustomMockCallMatcher(
+            lambda keypair: keypair['name'] == self.existing_key_name)
+
+        mock_notify.assert_has_calls([
+            mock.call(context=self.ctxt,
+                      keypair=match_by_name,
+                      action='delete', phase='start'),
+            mock.call(context=self.ctxt,
+                      keypair=match_by_name,
+                      action='delete', phase='end')])
         self._check_notifications(action='delete',
                 key_name=self.existing_key_name)

@@ -14,16 +14,16 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo_config import cfg
+from oslo_middleware import request_id
 import webob.dec
 import webob.exc
 
 from nova.api.openstack import wsgi
+from nova.api import wsgi as base_wsgi
+import nova.conf
 from nova import context
-from nova import wsgi as base_wsgi
 
-CONF = cfg.CONF
-CONF.import_opt('use_forwarded_for', 'nova.api.auth')
+CONF = nova.conf.CONF
 
 
 class NoAuthMiddlewareBase(base_wsgi.Middleware):
@@ -51,13 +51,13 @@ class NoAuthMiddlewareBase(base_wsgi.Middleware):
         user_id, _sep, project_id = token.partition(':')
         project_id = project_id or user_id
         remote_address = getattr(req, 'remote_address', '127.0.0.1')
-        if CONF.use_forwarded_for:
+        if CONF.api.use_forwarded_for:
             remote_address = req.headers.get('X-Forwarded-For', remote_address)
         is_admin = always_admin or (user_id == 'admin')
-        ctx = context.RequestContext(user_id,
-                                     project_id,
-                                     is_admin=is_admin,
-                                     remote_address=remote_address)
+        ctx = context.RequestContext(
+            user_id, project_id, is_admin=is_admin,
+            remote_address=remote_address,
+            request_id=req.environ.get(request_id.ENV_REQUEST_ID))
 
         req.environ['nova.context'] = ctx
         return self.application
@@ -66,10 +66,7 @@ class NoAuthMiddlewareBase(base_wsgi.Middleware):
 class NoAuthMiddleware(NoAuthMiddlewareBase):
     """Return a fake token if one isn't specified.
 
-    noauth2 is a variation on noauth that only provides admin privs if
-    'admin' is provided as the user id. We will deprecate the
-    NoAuthMiddlewareOld for future removal so we don't need to
-    maintain both code paths.
+    noauth2 provides admin privs if 'admin' is provided as the user id.
 
     """
     @webob.dec.wsgify(RequestClass=wsgi.Request)
@@ -77,22 +74,14 @@ class NoAuthMiddleware(NoAuthMiddlewareBase):
         return self.base_call(req, True, always_admin=False)
 
 
-# TODO(sdague): remove in Liberty
-class NoAuthMiddlewareOld(NoAuthMiddlewareBase):
+class NoAuthMiddlewareV2_18(NoAuthMiddlewareBase):
     """Return a fake token if one isn't specified.
 
-    This is the Deprecated version of noauth, and should be removed in
-    the Liberty cycle.
+    This provides a version of the middleware which does not add
+    project_id into server management urls.
 
     """
-    @webob.dec.wsgify(RequestClass=wsgi.Request)
-    def __call__(self, req):
-        return self.base_call(req, True)
-
-
-class NoAuthMiddlewareV3(NoAuthMiddlewareBase):
-    """Return a fake token if one isn't specified."""
 
     @webob.dec.wsgify(RequestClass=wsgi.Request)
     def __call__(self, req):
-        return self.base_call(req, False)
+        return self.base_call(req, False, always_admin=False)

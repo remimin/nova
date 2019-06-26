@@ -18,18 +18,18 @@
 
 import copy
 import datetime
-import uuid
 
-from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_utils import uuidutils
 
-from nova.compute import arch
+import nova.conf
 from nova import exception
-import nova.image.glance
+from nova.objects import fields as obj_fields
+from nova.tests import fixtures as nova_fixtures
 
-CONF = cfg.CONF
-CONF.import_opt('null_kernel', 'nova.compute.api')
+CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
+AUTO_DISK_CONFIG_ENABLED_IMAGE_UUID = '70a599e0-31e7-49b7-b260-868f441e862b'
 
 
 class _FakeImageService(object):
@@ -52,9 +52,15 @@ class _FakeImageService(object):
                  'container_format': 'raw',
                  'disk_format': 'raw',
                  'size': '25165824',
-                 'properties': {'kernel_id': CONF.null_kernel,
-                                'ramdisk_id': CONF.null_kernel,
-                                'architecture': arch.X86_64}}
+                 'min_ram': 0,
+                 'min_disk': 0,
+                 'protected': False,
+                 'visibility': 'public',
+                 'tags': ['tag1', 'tag2'],
+                 'properties': {
+                    'kernel_id': 'nokernel',
+                    'ramdisk_id': 'nokernel',
+                    'architecture': obj_fields.Architecture.X86_64}}
 
         image2 = {'id': 'a2459075-d96c-40d5-893e-577ff92e721c',
                  'name': 'fakeimage123456',
@@ -67,8 +73,13 @@ class _FakeImageService(object):
                  'container_format': 'ami',
                  'disk_format': 'ami',
                  'size': '58145823',
-                 'properties': {'kernel_id': CONF.null_kernel,
-                                'ramdisk_id': CONF.null_kernel}}
+                 'min_ram': 0,
+                 'min_disk': 0,
+                 'protected': False,
+                 'visibility': 'public',
+                 'tags': [],
+                 'properties': {'kernel_id': 'nokernel',
+                                'ramdisk_id': 'nokernel'}}
 
         image3 = {'id': '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6',
                  'name': 'fakeimage123456',
@@ -78,11 +89,18 @@ class _FakeImageService(object):
                  'deleted': False,
                  'status': 'active',
                  'is_public': True,
-                 'container_format': None,
-                 'disk_format': None,
+                 'container_format': 'bare',
+                 'disk_format': 'raw',
                  'size': '83594576',
-                 'properties': {'kernel_id': CONF.null_kernel,
-                                'ramdisk_id': CONF.null_kernel}}
+                 'min_ram': 0,
+                 'min_disk': 0,
+                 'protected': False,
+                 'visibility': 'public',
+                 'tags': ['tag3', 'tag4'],
+                 'properties': {
+                     'kernel_id': 'nokernel',
+                     'ramdisk_id': 'nokernel',
+                     'architecture': obj_fields.Architecture.X86_64}}
 
         image4 = {'id': 'cedef40a-ed67-4d10-800e-17455edce175',
                  'name': 'fakeimage123456',
@@ -95,8 +113,13 @@ class _FakeImageService(object):
                  'container_format': 'ami',
                  'disk_format': 'ami',
                  'size': '84035174',
-                 'properties': {'kernel_id': CONF.null_kernel,
-                                'ramdisk_id': CONF.null_kernel}}
+                 'min_ram': 0,
+                 'min_disk': 0,
+                 'protected': False,
+                 'visibility': 'public',
+                 'tags': [],
+                 'properties': {'kernel_id': 'nokernel',
+                                'ramdisk_id': 'nokernel'}}
 
         image5 = {'id': 'c905cedb-7281-47e4-8a62-f26bc5fc4c77',
                  'name': 'fakeimage123456',
@@ -109,6 +132,11 @@ class _FakeImageService(object):
                  'container_format': 'ami',
                  'disk_format': 'ami',
                  'size': '26360814',
+                 'min_ram': 0,
+                 'min_disk': 0,
+                 'protected': False,
+                 'visibility': 'public',
+                 'tags': [],
                  'properties': {'kernel_id':
                                     '155d900f-4e14-4e4c-a73d-069cbf4541e6',
                                 'ramdisk_id': None}}
@@ -124,12 +152,18 @@ class _FakeImageService(object):
                  'container_format': 'ova',
                  'disk_format': 'vhd',
                  'size': '49163826',
-                 'properties': {'kernel_id': CONF.null_kernel,
-                                'ramdisk_id': CONF.null_kernel,
-                                'architecture': arch.X86_64,
-                                'auto_disk_config': 'False'}}
+                 'min_ram': 0,
+                 'min_disk': 0,
+                 'protected': False,
+                 'visibility': 'public',
+                 'tags': [],
+                 'properties': {
+                    'kernel_id': 'nokernel',
+                    'ramdisk_id': 'nokernel',
+                    'architecture': obj_fields.Architecture.X86_64,
+                    'auto_disk_config': 'False'}}
 
-        image7 = {'id': '70a599e0-31e7-49b7-b260-868f441e862b',
+        image7 = {'id': AUTO_DISK_CONFIG_ENABLED_IMAGE_UUID,
                  'name': 'fakeimage7',
                  'created_at': timestamp,
                  'updated_at': timestamp,
@@ -140,10 +174,16 @@ class _FakeImageService(object):
                  'container_format': 'ova',
                  'disk_format': 'vhd',
                  'size': '74185822',
-                 'properties': {'kernel_id': CONF.null_kernel,
-                                'ramdisk_id': CONF.null_kernel,
-                                'architecture': arch.X86_64,
-                                'auto_disk_config': 'True'}}
+                 'min_ram': 0,
+                 'min_disk': 0,
+                 'protected': False,
+                 'visibility': 'public',
+                 'tags': [],
+                 'properties': {
+                    'kernel_id': 'nokernel',
+                    'ramdisk_id': 'nokernel',
+                    'architecture': obj_fields.Architecture.X86_64,
+                    'auto_disk_config': 'True'}}
 
         self.create(None, image1)
         self.create(None, image2)
@@ -158,15 +198,16 @@ class _FakeImageService(object):
     # TODO(bcwaldon): implement optional kwargs such as limit, sort_dir
     def detail(self, context, **kwargs):
         """Return list of detailed image information."""
-        return copy.deepcopy(self.images.values())
+        return copy.deepcopy(list(self.images.values()))
 
-    def download(self, context, image_id, dst_path=None, data=None):
+    def download(self, context, image_id, data=None, dst_path=None,
+                 trusted_certs=None):
         self.show(context, image_id)
         if data:
-            data.write(self._imagedata.get(image_id, ''))
+            data.write(self._imagedata.get(image_id, b''))
         elif dst_path:
             with open(dst_path, 'wb') as data:
-                data.write(self._imagedata.get(image_id, ''))
+                data.write(self._imagedata.get(image_id, b''))
 
     def show(self, context, image_id, include_locations=False,
              show_deleted=True):
@@ -188,11 +229,30 @@ class _FakeImageService(object):
         :raises: Duplicate if the image already exist.
 
         """
-        image_id = str(metadata.get('id', uuid.uuid4()))
+        image_id = str(metadata.get('id', uuidutils.generate_uuid()))
         metadata['id'] = image_id
         if image_id in self.images:
             raise exception.CouldNotUploadImage(image_id=image_id)
-        self.images[image_id] = copy.deepcopy(metadata)
+        image_meta = copy.deepcopy(metadata)
+        # Glance sets the size value when an image is created, so we
+        # need to do that here to fake things out if it's not provided
+        # by the caller. This is needed to avoid a KeyError in the
+        # image-size API.
+        if 'size' not in image_meta:
+            image_meta['size'] = None
+        # Similarly, Glance provides the status on the image once it's created
+        # and this is checked in the compute API when booting a server from
+        # this image, so we just fake it out to be 'active' even though this
+        # is mostly a lie on a newly created image.
+        if 'status' not in metadata:
+            image_meta['status'] = 'active'
+        # The owner of the image is by default the request context project_id.
+        if context and 'owner' not in image_meta.get('properties', {}):
+            # Note that normally "owner" is a top-level field in an image
+            # resource in glance but we have to fake this out for the images
+            # proxy API by throwing it into the generic "properties" dict.
+            image_meta.get('properties', {})['owner'] = context.project_id
+        self.images[image_id] = image_meta
         if data:
             self._imagedata[image_id] = data.read()
         return self.images[image_id]
@@ -232,6 +292,7 @@ class _FakeImageService(object):
             return 'fake_location'
         return None
 
+
 _fakeImageService = _FakeImageService()
 
 
@@ -245,13 +306,20 @@ def FakeImageService_reset():
 
 
 def get_valid_image_id():
-    return _fakeImageService.images.keys()[0]
+    return AUTO_DISK_CONFIG_ENABLED_IMAGE_UUID
 
 
-def stub_out_image_service(stubs):
+def stub_out_image_service(test):
+    """Stubs out the image service for the test with the FakeImageService
+
+    :param test: instance of nova.test.TestCase
+    :returns: The stubbed out FakeImageService object
+    """
     image_service = FakeImageService()
-    stubs.Set(nova.image.glance, 'get_remote_image_service',
-              lambda x, y: (image_service, y))
-    stubs.Set(nova.image.glance, 'get_default_image_service',
-              lambda: image_service)
+    test.stub_out('nova.image.glance.get_remote_image_service',
+                  lambda x, y: (image_service, y))
+    test.stub_out('nova.image.glance.get_default_image_service',
+                  lambda: image_service)
+    test.useFixture(nova_fixtures.ConfPatcher(
+        group="glance", api_servers=['http://localhost:9292']))
     return image_service

@@ -21,127 +21,32 @@ import calendar
 import inspect
 import os
 import re
+import signal
 import time
 
 import netaddr
+import netifaces
 from oslo_concurrency import processutils
-from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import excutils
+from oslo_utils import fileutils
 from oslo_utils import importutils
 from oslo_utils import timeutils
 import six
 
+import nova.conf
 from nova import exception
-from nova.i18n import _, _LE, _LW
+from nova.i18n import _
 from nova import objects
-from nova.openstack.common import fileutils
-from nova import paths
 from nova.pci import utils as pci_utils
+import nova.privsep.linux_net
 from nova import utils
 
 LOG = logging.getLogger(__name__)
 
 
-linux_net_opts = [
-    cfg.MultiStrOpt('dhcpbridge_flagfile',
-                    default=['/etc/nova/nova-dhcpbridge.conf'],
-                    help='Location of flagfiles for dhcpbridge'),
-    cfg.StrOpt('networks_path',
-               default=paths.state_path_def('networks'),
-               help='Location to keep network config files'),
-    cfg.StrOpt('public_interface',
-               default='eth0',
-               help='Interface for public IP addresses'),
-    cfg.StrOpt('dhcpbridge',
-               default=paths.bindir_def('nova-dhcpbridge'),
-               help='Location of nova-dhcpbridge'),
-    cfg.StrOpt('routing_source_ip',
-               default='$my_ip',
-               help='Public IP of network host'),
-    cfg.IntOpt('dhcp_lease_time',
-               default=86400,
-               help='Lifetime of a DHCP lease in seconds'),
-    cfg.MultiStrOpt('dns_server',
-                    default=[],
-                    help='If set, uses specific DNS server for dnsmasq. Can'
-                         ' be specified multiple times.'),
-    cfg.BoolOpt('use_network_dns_servers',
-                default=False,
-                help='If set, uses the dns1 and dns2 from the network ref.'
-                     ' as dns servers.'),
-    cfg.ListOpt('dmz_cidr',
-               default=[],
-               help='A list of dmz ranges that should be accepted'),
-    cfg.MultiStrOpt('force_snat_range',
-               default=[],
-               help='Traffic to this range will always be snatted to the '
-                    'fallback ip, even if it would normally be bridged out '
-                    'of the node. Can be specified multiple times.'),
-    cfg.StrOpt('dnsmasq_config_file',
-               default='',
-               help='Override the default dnsmasq settings with this file'),
-    cfg.StrOpt('linuxnet_interface_driver',
-               default='nova.network.linux_net.LinuxBridgeInterfaceDriver',
-               help='Driver used to create ethernet devices.'),
-    cfg.StrOpt('linuxnet_ovs_integration_bridge',
-               default='br-int',
-               help='Name of Open vSwitch bridge used with linuxnet'),
-    cfg.BoolOpt('send_arp_for_ha',
-                default=False,
-                help='Send gratuitous ARPs for HA setup'),
-    cfg.IntOpt('send_arp_for_ha_count',
-               default=3,
-               help='Send this many gratuitous ARPs for HA setup'),
-    cfg.BoolOpt('use_single_default_gateway',
-                default=False,
-                help='Use single default gateway. Only first nic of vm will '
-                     'get default gateway from dhcp server'),
-    cfg.MultiStrOpt('forward_bridge_interface',
-                    default=['all'],
-                    help='An interface that bridges can forward to. If this '
-                         'is set to all then all traffic will be forwarded. '
-                         'Can be specified multiple times.'),
-    cfg.StrOpt('metadata_host',
-               default='$my_ip',
-               help='The IP address for the metadata API server'),
-    cfg.IntOpt('metadata_port',
-               default=8775,
-               help='The port for the metadata API port'),
-    cfg.StrOpt('iptables_top_regex',
-               default='',
-               help='Regular expression to match the iptables rule that '
-                    'should always be on the top.'),
-    cfg.StrOpt('iptables_bottom_regex',
-               default='',
-               help='Regular expression to match the iptables rule that '
-                    'should always be on the bottom.'),
-    cfg.StrOpt('iptables_drop_action',
-               default='DROP',
-               help='The table that iptables to jump to when a packet is '
-                    'to be dropped.'),
-    cfg.IntOpt('ovs_vsctl_timeout',
-               default=120,
-               help='Amount of time, in seconds, that ovs_vsctl should wait '
-                    'for a response from the database. 0 is to wait forever.'),
-    cfg.BoolOpt('fake_network',
-                default=False,
-                help='If passed, use fake network devices and addresses'),
-    cfg.IntOpt('ebtables_exec_attempts',
-               default=3,
-               help='Number of times to retry ebtables commands on failure.'),
-    cfg.FloatOpt('ebtables_retry_interval',
-                 default=1.0,
-                 help='Number of seconds to wait between ebtables retries.'),
-    ]
-
-CONF = cfg.CONF
-CONF.register_opts(linux_net_opts)
-CONF.import_opt('host', 'nova.netconf')
-CONF.import_opt('use_ipv6', 'nova.netconf')
-CONF.import_opt('my_ip', 'nova.netconf')
-CONF.import_opt('network_device_mtu', 'nova.objects.network')
+CONF = nova.conf.CONF
 
 
 # NOTE(vish): Iptables supports chain names of up to 28 characters,  and we
@@ -151,6 +56,7 @@ CONF.import_opt('network_device_mtu', 'nova.objects.network')
 def get_binary_name():
     """Grab the name of the binary we're running in."""
     return os.path.basename(inspect.stack()[-1][1])[:16]
+
 
 binary_name = get_binary_name()
 
@@ -237,8 +143,8 @@ class IptablesTable(object):
             chain_set = self.unwrapped_chains
 
         if name not in chain_set:
-            LOG.warning(_LW('Attempted to remove chain %s which does not '
-                            'exist'), name)
+            LOG.warning('Attempted to remove chain %s which does not exist',
+                        name)
             return
         self.dirty = True
 
@@ -248,8 +154,8 @@ class IptablesTable(object):
             self.remove_chains.add(name)
         chain_set.remove(name)
         if not wrap:
-            self.remove_rules += filter(lambda r: r.chain == name, self.rules)
-        self.rules = filter(lambda r: r.chain != name, self.rules)
+            self.remove_rules += [r for r in self.rules if r.chain == name]
+        self.rules = [r for r in self.rules if r.chain != name]
 
         if wrap:
             jump_snippet = '-j %s-%s' % (binary_name, name)
@@ -257,9 +163,9 @@ class IptablesTable(object):
             jump_snippet = '-j %s' % (name,)
 
         if not wrap:
-            self.remove_rules += filter(lambda r: jump_snippet in r.rule,
-                                        self.rules)
-        self.rules = filter(lambda r: jump_snippet not in r.rule, self.rules)
+            self.remove_rules += [r for r in self.rules
+                                  if jump_snippet in r.rule]
+        self.rules = [r for r in self.rules if jump_snippet not in r.rule]
 
     def add_rule(self, chain, rule, wrap=True, top=False):
         """Add a rule to the table.
@@ -306,8 +212,8 @@ class IptablesTable(object):
                 self.remove_rules.append(IptablesRule(chain, rule, wrap, top))
             self.dirty = True
         except ValueError:
-            LOG.warning(_LW('Tried to remove rule that was not there:'
-                            ' %(chain)r %(rule)r %(wrap)r %(top)r'),
+            LOG.warning('Tried to remove rule that was not there:'
+                        ' %(chain)r %(rule)r %(wrap)r %(top)r',
                         {'chain': chain, 'rule': rule,
                          'top': top, 'wrap': wrap})
 
@@ -316,7 +222,7 @@ class IptablesTable(object):
         if isinstance(regex, six.string_types):
             regex = re.compile(regex)
         num_rules = len(self.rules)
-        self.rules = filter(lambda r: not regex.match(str(r)), self.rules)
+        self.rules = [r for r in self.rules if not regex.match(str(r))]
         removed = num_rules - len(self.rules)
         if removed > 0:
             self.dirty = True
@@ -394,7 +300,7 @@ class IptablesManager(object):
             elif ip_version == 6:
                 tables = self.ipv6
 
-            for table, chains in builtin_chains[ip_version].iteritems():
+            for table, chains in builtin_chains[ip_version].items():
                 for chain in chains:
                     tables[table].add_chain(chain)
                     tables[table].add_rule(chain, '-j $%s' % (chain,),
@@ -426,11 +332,11 @@ class IptablesManager(object):
         self.apply()
 
     def dirty(self):
-        for table in self.ipv4.itervalues():
+        for table in six.itervalues(self.ipv4):
             if table.dirty:
                 return True
         if CONF.use_ipv6:
-            for table in self.ipv6.itervalues():
+            for table in six.itervalues(self.ipv6):
                 if table.dirty:
                     return True
         return False
@@ -461,13 +367,13 @@ class IptablesManager(object):
                                                 run_as_root=True,
                                                 attempts=5)
             all_lines = all_tables.split('\n')
-            for table_name, table in tables.iteritems():
+            for table_name, table in tables.items():
                 start, end = self._find_table(all_lines, table_name)
                 all_lines[start:end] = self._modify_rules(
                         all_lines[start:end], table, table_name)
                 table.dirty = False
             self.execute('%s-restore' % (cmd,), '-c', run_as_root=True,
-                         process_input='\n'.join(all_lines),
+                         process_input=six.b('\n'.join(all_lines)),
                          attempts=5)
         LOG.debug("IPTablesManager.apply completed with success")
 
@@ -483,9 +389,20 @@ class IptablesManager(object):
         end = lines[start:].index('COMMIT') + start + 2
         return (start, end)
 
+    @staticmethod
+    def create_rules_from_regexp(criterion, new_filter):
+        if not criterion:
+            return [], new_filter
+        regex = re.compile(criterion)
+        temp_filter = [line for line in new_filter if regex.search(line)]
+        for rule_str in temp_filter:
+            new_filter = [s for s in new_filter
+                          if s.strip() != rule_str.strip()]
+        return temp_filter, new_filter
+
     def _modify_rules(self, current_lines, table, table_name):
         unwrapped_chains = table.unwrapped_chains
-        chains = table.chains
+        chains = sorted(table.chains)
         remove_chains = table.remove_chains
         rules = table.rules
         remove_rules = table.remove_rules
@@ -497,27 +414,13 @@ class IptablesManager(object):
             current_lines = fake_table
 
         # Remove any trace of our rules
-        new_filter = filter(lambda line: binary_name not in line,
-                            current_lines)
+        new_filter = [line for line in current_lines
+                      if binary_name not in line]
 
-        top_rules = []
-        bottom_rules = []
-
-        if CONF.iptables_top_regex:
-            regex = re.compile(CONF.iptables_top_regex)
-            temp_filter = filter(lambda line: regex.search(line), new_filter)
-            for rule_str in temp_filter:
-                new_filter = filter(lambda s: s.strip() != rule_str.strip(),
-                                    new_filter)
-            top_rules = temp_filter
-
-        if CONF.iptables_bottom_regex:
-            regex = re.compile(CONF.iptables_bottom_regex)
-            temp_filter = filter(lambda line: regex.search(line), new_filter)
-            for rule_str in temp_filter:
-                new_filter = filter(lambda s: s.strip() != rule_str.strip(),
-                    new_filter)
-            bottom_rules = temp_filter
+        top_rules, new_filter = self.create_rules_from_regexp(
+            CONF.iptables_top_regex, new_filter)
+        bottom_rules, new_filter = self.create_rules_from_regexp(
+            CONF.iptables_bottom_regex, new_filter)
 
         seen_chains = False
         rules_index = 0
@@ -549,16 +452,15 @@ class IptablesManager(object):
                 # ignore [packet:byte] counts at beginning of line
                 if rule_str.startswith('['):
                     rule_str = rule_str.split(']', 1)[1]
-                dup_filter = filter(lambda s: rule_str.strip() in s.strip(),
-                                    new_filter)
+                dup_filter = [s for s in new_filter
+                              if rule_str.strip() in s.strip()]
 
-                new_filter = filter(lambda s:
-                                    rule_str.strip() not in s.strip(),
-                                    new_filter)
+                new_filter = [s for s in new_filter
+                              if rule_str.strip() not in s.strip()]
                 # if no duplicates, use original rule
                 if dup_filter:
                     # grab the last entry, if there is one
-                    dup = dup_filter[-1]
+                    dup = list(dup_filter)[-1]
                     rule_str = str(dup)
                 else:
                     rule_str = str(rule)
@@ -570,6 +472,7 @@ class IptablesManager(object):
 
         our_rules += bot_rules
 
+        new_filter = list(new_filter)
         new_filter[rules_index:rules_index] = our_rules
 
         new_filter[rules_index:rules_index] = [':%s - [0:0]' % (name,)
@@ -625,9 +528,11 @@ class IptablesManager(object):
         # We filter duplicates, letting the *last* occurrence take
         # precedence.  We also filter out anything in the "remove"
         # lists.
+        new_filter = list(new_filter)
         new_filter.reverse()
         new_filter = filter(_weed_out_duplicates, new_filter)
         new_filter = filter(_weed_out_removes, new_filter)
+        new_filter = list(new_filter)
         new_filter.reverse()
 
         # flush lists, just in case we didn't find something
@@ -679,8 +584,8 @@ def metadata_forward():
 
 
 def _iptables_dest(ip):
-    if ((netaddr.IPAddress(ip).version == 4 and ip == '127.0.0.1')
-        or ip == '::1'):
+    if ((netaddr.IPAddress(ip).version == 4 and ip == '127.0.0.1') or
+            ip == '::1'):
         return '-m addrtype --dst-type LOCAL'
     else:
         return '-d %s' % ip
@@ -751,38 +656,18 @@ def init_host(ip_range, is_external=False):
     iptables_manager.apply()
 
 
-def send_arp_for_ip(ip, device, count):
-    out, err = _execute('arping', '-U', ip,
-                        '-A', '-I', device,
-                        '-c', str(count),
-                        run_as_root=True, check_exit_code=False)
-
-    if err:
-        LOG.debug('arping error for ip %s', ip)
-
-
 def bind_floating_ip(floating_ip, device):
-    """Bind ip to public interface."""
-    _execute('ip', 'addr', 'add', str(floating_ip) + '/32',
-             'dev', device,
-             run_as_root=True, check_exit_code=[0, 2, 254])
-
+    """Bind IP to public interface."""
+    nova.privsep.linux_net.bind_ip(device, floating_ip)
     if CONF.send_arp_for_ha and CONF.send_arp_for_ha_count > 0:
-        send_arp_for_ip(floating_ip, device, CONF.send_arp_for_ha_count)
-
-
-def unbind_floating_ip(floating_ip, device):
-    """Unbind a public ip from public interface."""
-    _execute('ip', 'addr', 'del', str(floating_ip) + '/32',
-             'dev', device,
-             run_as_root=True, check_exit_code=[0, 2, 254])
+        nova.privsep.linux_net.send_arp_for_ip(
+            floating_ip, device, CONF.send_arp_for_ha_count)
 
 
 def ensure_metadata_ip():
-    """Sets up local metadata ip."""
-    _execute('ip', 'addr', 'add', '169.254.169.254/32',
-             'scope', 'link', 'dev', 'lo',
-             run_as_root=True, check_exit_code=[0, 2, 254])
+    """Sets up local metadata IP."""
+    nova.privsep.linux_net.bind_ip('lo', '169.254.169.254',
+                                   scope_is_link=True)
 
 
 def ensure_vpn_forward(public_ip, port, private_ip):
@@ -803,13 +688,13 @@ def ensure_vpn_forward(public_ip, port, private_ip):
 
 
 def ensure_floating_forward(floating_ip, fixed_ip, device, network):
-    """Ensure floating ip forwarding rule."""
+    """Ensure floating IP forwarding rule."""
     # NOTE(vish): Make sure we never have duplicate rules for the same ip
     regex = '.*\s+%s(/32|\s+|$)' % floating_ip
     num_rules = iptables_manager.ipv4['nat'].remove_rules_regex(regex)
     if num_rules:
-        msg = _LW('Removed %(num)d duplicate rules for floating ip %(float)s')
-        LOG.warn(msg, {'num': num_rules, 'float': floating_ip})
+        LOG.warning('Removed %(num)d duplicate rules for floating IP '
+                    '%(float)s', {'num': num_rules, 'float': floating_ip})
     for chain, rule in floating_forward_rules(floating_ip, fixed_ip, device):
         iptables_manager.ipv4['nat'].add_rule(chain, rule)
     iptables_manager.apply()
@@ -818,7 +703,7 @@ def ensure_floating_forward(floating_ip, fixed_ip, device, network):
 
 
 def remove_floating_forward(floating_ip, fixed_ip, device, network):
-    """Remove forwarding for floating ip."""
+    """Remove forwarding for floating IP."""
     for chain, rule in floating_forward_rules(floating_ip, fixed_ip, device):
         iptables_manager.ipv4['nat'].remove_rule(chain, rule)
     iptables_manager.apply()
@@ -851,14 +736,6 @@ def floating_forward_rules(floating_ip, fixed_ip, device):
     return rules
 
 
-def clean_conntrack(fixed_ip):
-    try:
-        _execute('conntrack', '-D', '-r', fixed_ip, run_as_root=True,
-                 check_exit_code=[0, 1])
-    except processutils.ProcessExecutionError:
-        LOG.exception(_LE('Error deleting conntrack entries for %s'), fixed_ip)
-
-
 def _enable_ipv4_forwarding():
     sysctl_key = 'net.ipv4.ip_forward'
     stdout, stderr = _execute('sysctl', '-n', sysctl_key)
@@ -883,8 +760,7 @@ def initialize_gateway_device(dev, network_ref):
     full_ip = '%s/%s' % (network_ref['dhcp_server'], prefix)
     new_ip_params = [[full_ip, 'brd', network_ref['broadcast']]]
     old_ip_params = []
-    out, err = _execute('ip', 'addr', 'show', 'dev', dev,
-                        'scope', 'global')
+    out, err = nova.privsep.linux_net.lookup_ip(dev)
     for line in out.split('\n'):
         fields = line.split()
         if fields and fields[0] == 'inet':
@@ -897,32 +773,30 @@ def initialize_gateway_device(dev, network_ref):
                 new_ip_params.append(ip_params)
     if not old_ip_params or old_ip_params[0][0] != full_ip:
         old_routes = []
-        result = _execute('ip', 'route', 'show', 'dev', dev)
+        result = nova.privsep.linux_net.routes_show(dev)
         if result:
             out, err = result
             for line in out.split('\n'):
                 fields = line.split()
                 if fields and 'via' in fields:
                     old_routes.append(fields)
-                    _execute('ip', 'route', 'del', fields[0],
-                             'dev', dev, run_as_root=True)
+                    nova.privsep.linux_net.route_delete(dev, fields[0])
         for ip_params in old_ip_params:
-            _execute(*_ip_bridge_cmd('del', ip_params, dev),
-                     run_as_root=True, check_exit_code=[0, 2, 254])
+            nova.privsep.linux_net.address_command_deprecated(
+                dev, 'del', ip_params)
         for ip_params in new_ip_params:
-            _execute(*_ip_bridge_cmd('add', ip_params, dev),
-                     run_as_root=True, check_exit_code=[0, 2, 254])
+            nova.privsep.linux_net.address_command_deprecated(
+                dev, 'add', ip_params)
 
         for fields in old_routes:
-            _execute('ip', 'route', 'add', *fields,
-                     run_as_root=True)
+            # TODO(mikal): this is horrible and should be re-written
+            nova.privsep.linux_net.route_add_deprecated(fields)
         if CONF.send_arp_for_ha and CONF.send_arp_for_ha_count > 0:
-            send_arp_for_ip(network_ref['dhcp_server'], dev,
-                            CONF.send_arp_for_ha_count)
+            nova.privsep.linux_net.send_arp_for_ip(
+                network_ref['dhcp_server'], dev,
+                CONF.send_arp_for_ha_count)
     if CONF.use_ipv6:
-        _execute('ip', '-f', 'inet6', 'addr',
-                 'change', network_ref['cidr_v6'],
-                 'dev', dev, run_as_root=True)
+        nova.privsep.linux_net.change_ip(dev, network_ref['cidr_v6'])
 
 
 def get_dhcp_leases(context, network_ref):
@@ -1029,10 +903,9 @@ def get_dhcp_opts(context, network_ref, fixedips):
 
 
 def release_dhcp(dev, address, mac_address):
-    if device_exists(dev):
+    if nova.privsep.linux_net.device_exists(dev):
         try:
-            utils.execute('dhcp_release', dev, address, mac_address,
-                          run_as_root=True)
+            nova.privsep.linux_net.dhcp_release(dev, address, mac_address)
         except processutils.ProcessExecutionError:
             raise exception.NetworkDhcpReleaseFailed(address=address,
                                                      mac_address=mac_address)
@@ -1062,18 +935,13 @@ def update_dns(context, dev, network_ref):
     restart_dhcp(context, dev, network_ref, fixedips)
 
 
-def update_dhcp_hostfile_with_text(dev, hosts_text):
-    conffile = _dhcp_file(dev, 'conf')
-    write_to_file(conffile, hosts_text)
-
-
 def kill_dhcp(dev):
     pid = _dnsmasq_pid_for(dev)
     if pid:
         # Check that the process exists and looks like a dnsmasq process
         conffile = _dhcp_file(dev, 'conf')
         if is_pid_cmdline_correct(pid, conffile.split('/')[-1]):
-            _execute('kill', '-9', pid, run_as_root=True)
+            nova.privsep.utils.kill(pid, signal.SIGKILL)
         else:
             LOG.debug('Pid %d is stale, skip killing dnsmasq', pid)
     _remove_dnsmasq_accept_rules(dev)
@@ -1108,11 +976,11 @@ def restart_dhcp(context, dev, network_ref, fixedips):
     if pid:
         if is_pid_cmdline_correct(pid, conffile.split('/')[-1]):
             try:
-                _execute('kill', '-HUP', pid, run_as_root=True)
+                nova.privsep.utils.kill(pid, signal.SIGHUP)
                 _add_dnsmasq_accept_rules(dev)
                 return
             except Exception as exc:
-                LOG.error(_LE('kill -HUP dnsmasq threw %s'), exc)
+                LOG.error('kill -HUP dnsmasq threw %s', exc)
         else:
             LOG.debug('Pid %d is stale, relaunching dnsmasq', pid)
 
@@ -1140,8 +1008,8 @@ def restart_dhcp(context, dev, network_ref, fixedips):
 
     # dnsmasq currently gives an error for an empty domain,
     # rather than ignoring.  So only specify it if defined.
-    if CONF.dhcp_domain:
-        cmd.append('--domain=%s' % CONF.dhcp_domain)
+    if CONF.api.dhcp_domain:
+        cmd.append('--domain=%s' % CONF.api.dhcp_domain)
 
     dns_servers = CONF.dns_server
     if CONF.use_network_dns_servers:
@@ -1188,9 +1056,9 @@ interface %s
     if pid:
         if is_pid_cmdline_correct(pid, conffile):
             try:
-                _execute('kill', pid, run_as_root=True)
+                nova.privsep.utils.kill(pid, signal.SIGTERM)
             except Exception as exc:
-                LOG.error(_LE('killing radvd threw %s'), exc)
+                LOG.error('killing radvd threw %s', exc)
         else:
             LOG.debug('Pid %d is stale, relaunching radvd', pid)
 
@@ -1222,27 +1090,27 @@ def _host_dhcp(fixedip):
     #            to truncate the hostname to only 63 characters.
     hostname = fixedip.instance.hostname
     if len(hostname) > 63:
-        LOG.warning(_LW('hostname %s too long, truncating.') % (hostname))
+        LOG.warning('hostname %s too long, truncating.', hostname)
         hostname = fixedip.instance.hostname[:2] + '-' +\
                    fixedip.instance.hostname[-60:]
     if CONF.use_single_default_gateway:
         net = _host_dhcp_network(fixedip.virtual_interface_id)
         return '%s,%s.%s,%s,net:%s' % (fixedip.virtual_interface.address,
                                hostname,
-                               CONF.dhcp_domain,
+                               CONF.api.dhcp_domain,
                                fixedip.address,
                                net)
     else:
         return '%s,%s.%s,%s' % (fixedip.virtual_interface.address,
                                hostname,
-                               CONF.dhcp_domain,
+                               CONF.api.dhcp_domain,
                                fixedip.address)
 
 
 def _host_dns(fixedip):
     return '%s\t%s.%s' % (fixedip.address,
                           fixedip.instance.hostname,
-                          CONF.dhcp_domain)
+                          CONF.api.dhcp_domain)
 
 
 def _host_dhcp_opts(vif_id=None, gateway=None):
@@ -1264,11 +1132,6 @@ def _execute(*cmd, **kwargs):
         return 'fake', 0
     else:
         return utils.execute(*cmd, **kwargs)
-
-
-def device_exists(device):
-    """Check if ethernet device exists."""
-    return os.path.exists('/sys/class/net/%s' % device)
 
 
 def _dhcp_file(dev, kind):
@@ -1320,120 +1183,38 @@ def _ra_pid_for(dev):
             return int(f.read())
 
 
-def _ip_bridge_cmd(action, params, device):
-    """Build commands to add/del ips to bridges/devices."""
-    cmd = ['ip', 'addr', action]
-    cmd.extend(params)
-    cmd.extend(['dev', device])
-    return cmd
-
-
-def _set_device_mtu(dev, mtu=None):
-    """Set the device MTU."""
-
-    if not mtu:
-        mtu = CONF.network_device_mtu
-    if mtu:
-        utils.execute('ip', 'link', 'set', dev, 'mtu',
-                      mtu, run_as_root=True,
-                      check_exit_code=[0, 2, 254])
-
-
-def _create_veth_pair(dev1_name, dev2_name):
-    """Create a pair of veth devices with the specified names,
-    deleting any previous devices with those names.
-    """
-    for dev in [dev1_name, dev2_name]:
-        delete_net_dev(dev)
-
-    utils.execute('ip', 'link', 'add', dev1_name, 'type', 'veth', 'peer',
-                  'name', dev2_name, run_as_root=True)
-    for dev in [dev1_name, dev2_name]:
-        utils.execute('ip', 'link', 'set', dev, 'up', run_as_root=True)
-        utils.execute('ip', 'link', 'set', dev, 'promisc', 'on',
-                      run_as_root=True)
-        _set_device_mtu(dev)
-
-
 def _ovs_vsctl(args):
     full_args = ['ovs-vsctl', '--timeout=%s' % CONF.ovs_vsctl_timeout] + args
     try:
         return utils.execute(*full_args, run_as_root=True)
     except Exception as e:
-        LOG.error(_LE("Unable to execute %(cmd)s. Exception: %(exception)s"),
+        LOG.error("Unable to execute %(cmd)s. Exception: %(exception)s",
                   {'cmd': full_args, 'exception': e})
-        raise exception.AgentError(method=full_args)
+        raise exception.OvsConfigurationFailure(inner_exception=e)
 
 
-def create_ovs_vif_port(bridge, dev, iface_id, mac, instance_id):
-    _ovs_vsctl(['--', '--if-exists', 'del-port', dev, '--',
-                'add-port', bridge, dev,
-                '--', 'set', 'Interface', dev,
-                'external-ids:iface-id=%s' % iface_id,
-                'external-ids:iface-status=active',
-                'external-ids:attached-mac=%s' % mac,
-                'external-ids:vm-uuid=%s' % instance_id])
-    _set_device_mtu(dev)
+def create_fp_dev(dev, sockpath, sockmode):
+    if not nova.privsep.linux_net.device_exists(dev):
+        utils.execute('fp-vdev', 'add', dev, '--sockpath', sockpath,
+                      '--sockmode', sockmode, run_as_root=True)
+        nova.privsep.linux_net.set_device_mtu(dev)
+        nova.privsep.linux_net.set_device_enabled(dev)
 
 
-def delete_ovs_vif_port(bridge, dev):
-    _ovs_vsctl(['--', '--if-exists', 'del-port', bridge, dev])
-    delete_net_dev(dev)
-
-
-def ovs_set_vhostuser_port_type(dev):
-    _ovs_vsctl(['--', 'set', 'Interface', dev, 'type=dpdkvhostuser'])
-
-
-def create_ivs_vif_port(dev, iface_id, mac, instance_id):
-    utils.execute('ivs-ctl', 'add-port',
-                   dev, run_as_root=True)
-
-
-def delete_ivs_vif_port(dev):
-    utils.execute('ivs-ctl', 'del-port', dev,
-                  run_as_root=True)
-    utils.execute('ip', 'link', 'delete', dev,
-                  run_as_root=True)
-
-
-def create_tap_dev(dev, mac_address=None):
-    if not device_exists(dev):
-        try:
-            # First, try with 'ip'
-            utils.execute('ip', 'tuntap', 'add', dev, 'mode', 'tap',
-                          run_as_root=True, check_exit_code=[0, 2, 254])
-        except processutils.ProcessExecutionError:
-            # Second option: tunctl
-            utils.execute('tunctl', '-b', '-t', dev, run_as_root=True)
-        if mac_address:
-            utils.execute('ip', 'link', 'set', dev, 'address', mac_address,
-                          run_as_root=True, check_exit_code=[0, 2, 254])
-        utils.execute('ip', 'link', 'set', dev, 'up', run_as_root=True,
-                      check_exit_code=[0, 2, 254])
-
-
-def delete_net_dev(dev):
-    """Delete a network device only if it exists."""
-    if device_exists(dev):
-        try:
-            utils.execute('ip', 'link', 'delete', dev, run_as_root=True,
-                          check_exit_code=[0, 2, 254])
-            LOG.debug("Net device removed: '%s'", dev)
-        except processutils.ProcessExecutionError:
-            with excutils.save_and_reraise_exception():
-                LOG.error(_LE("Failed removing net device: '%s'"), dev)
+def delete_fp_dev(dev):
+    if nova.privsep.linux_net.device_exists(dev):
+        utils.execute('fp-vdev', 'del', dev, run_as_root=True)
 
 
 def delete_bridge_dev(dev):
     """Delete a network bridge."""
-    if device_exists(dev):
+    if nova.privsep.linux_net.device_exists(dev):
         try:
-            utils.execute('ip', 'link', 'set', dev, 'down', run_as_root=True)
-            utils.execute('brctl', 'delbr', dev, run_as_root=True)
+            nova.privsep.linux_net.set_device_disabled(dev)
+            nova.privsep.linux_net.delete_bridge(dev)
         except processutils.ProcessExecutionError:
             with excutils.save_and_reraise_exception():
-                LOG.error(_LE("Failed removing bridge device: '%s'"), dev)
+                LOG.error("Failed removing bridge device: '%s'", dev)
 
 
 # Similar to compute virt layers, the Linux network node
@@ -1549,10 +1330,12 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
 
     @staticmethod
     @utils.synchronized('lock_vlan', external=True)
-    def ensure_vlan(vlan_num, bridge_interface, mac_address=None, mtu=None):
+    def ensure_vlan(vlan_num, bridge_interface, mac_address=None, mtu=None,
+                    interface=None):
         """Create a vlan unless it already exists."""
-        interface = 'vlan%s' % vlan_num
-        if not device_exists(interface):
+        if interface is None:
+            interface = 'vlan%s' % vlan_num
+        if not nova.privsep.linux_net.device_exists(interface):
             LOG.debug('Starting VLAN interface %s', interface)
             _execute('ip', 'link', 'add', 'link', bridge_interface,
                      'name', interface, 'type', 'vlan',
@@ -1561,14 +1344,12 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
             # (danwent) the bridge will inherit this address, so we want to
             # make sure it is the value set from the NetworkManager
             if mac_address:
-                _execute('ip', 'link', 'set', interface, 'address',
-                         mac_address, run_as_root=True,
-                         check_exit_code=[0, 2, 254])
-            _execute('ip', 'link', 'set', interface, 'up', run_as_root=True,
-                     check_exit_code=[0, 2, 254])
+                nova.privsep.linux_net.set_device_macaddr(
+                    interface, mac_address)
+            nova.privsep.linux_net.set_device_enabled(interface)
         # NOTE(vish): set mtu every time to ensure that changes to mtu get
-        #             propogated
-        _set_device_mtu(interface, mtu)
+        #             propagated
+        nova.privsep.linux_net.set_device_mtu(interface, mtu)
         return interface
 
     @staticmethod
@@ -1576,7 +1357,7 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
     def remove_vlan(vlan_num):
         """Delete a vlan."""
         vlan_interface = 'vlan%s' % vlan_num
-        delete_net_dev(vlan_interface)
+        nova.privsep.linux_net.delete_net_dev(vlan_interface)
 
     @staticmethod
     @utils.synchronized('lock_bridge', external=True)
@@ -1593,21 +1374,22 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
         using net_attrs['broadcast'] and net_attrs['cidr'].  It will also add
         the ip_v6 address specified in net_attrs['cidr_v6'] if use_ipv6 is set.
 
-        The code will attempt to move any ips that already exist on the
+        The code will attempt to move any IPs that already exist on the
         interface onto the bridge and reset the default gateway if necessary.
 
         """
-        if not device_exists(bridge):
+        if not nova.privsep.linux_net.device_exists(bridge):
             LOG.debug('Starting Bridge %s', bridge)
-            _execute('brctl', 'addbr', bridge, run_as_root=True)
+            out, err = nova.privsep.linux_net.add_bridge(bridge)
+            if (err and err != "device %s already exists; can't create "
+                               "bridge with the same name\n" % (bridge)):
+                msg = _('Failed to add bridge: %s') % err
+                raise exception.NovaException(msg)
+
             _execute('brctl', 'setfd', bridge, 0, run_as_root=True)
             # _execute('brctl setageing %s 10' % bridge, run_as_root=True)
             _execute('brctl', 'stp', bridge, 'off', run_as_root=True)
-            # (danwent) bridge device MAC address can't be set directly.
-            # instead it inherits the MAC address of the first device on the
-            # bridge, which will either be the vlan interface, or a
-            # physical NIC.
-            _execute('ip', 'link', 'set', bridge, 'up', run_as_root=True)
+            nova.privsep.linux_net.set_device_enabled(bridge)
 
         if interface:
             LOG.debug('Adding interface %(interface)s to bridge %(bridge)s',
@@ -1619,23 +1401,32 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
                 msg = _('Failed to add interface: %s') % err
                 raise exception.NovaException(msg)
 
-            out, err = _execute('ip', 'link', 'set', interface, 'up',
-                                check_exit_code=False, run_as_root=True)
+            # NOTE(apmelton): Linux bridge's default behavior is to use the
+            # lowest mac of all plugged interfaces. This isn't a problem when
+            # it is first created and the only interface is the bridged
+            # interface. But, as instance interfaces are plugged, there is a
+            # chance for the mac to change. So, set it here so that it won't
+            # change in the future.
+            if not CONF.fake_network:
+                interface_addrs = netifaces.ifaddresses(interface)
+                interface_mac = interface_addrs[netifaces.AF_LINK][0]['addr']
+                nova.privsep.linux_net.set_device_macaddr(
+                    bridge, interface_mac)
+
+            nova.privsep.linux_net.set_device_enabled(interface)
 
             # NOTE(vish): This will break if there is already an ip on the
             #             interface, so we move any ips to the bridge
             # NOTE(danms): We also need to copy routes to the bridge so as
             #              not to break existing connectivity on the interface
             old_routes = []
-            out, err = _execute('ip', 'route', 'show', 'dev', interface)
+            out, err = nova.privsep.linux_net.routes_show(interface)
             for line in out.split('\n'):
                 fields = line.split()
                 if fields and 'via' in fields:
                     old_routes.append(fields)
-                    _execute('ip', 'route', 'del', *fields,
-                             run_as_root=True)
-            out, err = _execute('ip', 'addr', 'show', 'dev', interface,
-                                'scope', 'global')
+                    nova.privsep.linux_net.route_delete_deprecated(fields)
+            out, err = nova.privsep.linux_net.lookup_ip(interface)
             for line in out.split('\n'):
                 fields = line.split()
                 if fields and fields[0] == 'inet':
@@ -1643,13 +1434,12 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
                         params = fields[1:-2]
                     else:
                         params = fields[1:-1]
-                    _execute(*_ip_bridge_cmd('del', params, fields[-1]),
-                             run_as_root=True, check_exit_code=[0, 2, 254])
-                    _execute(*_ip_bridge_cmd('add', params, bridge),
-                             run_as_root=True, check_exit_code=[0, 2, 254])
+                    nova.privsep.linux_net.address_command_deprecated(
+                        fields[-1], 'del', params)
+                    nova.privsep.linux_net.address_command_deprecated(
+                        bridge, 'add', params)
             for fields in old_routes:
-                _execute('ip', 'route', 'add', *fields,
-                         run_as_root=True)
+                nova.privsep.linux_net.route_add_deprecated(fields)
 
         if filtering:
             # Don't forward traffic unless we were told to be a gateway
@@ -1669,7 +1459,7 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
     @utils.synchronized('lock_bridge', external=True)
     def remove_bridge(bridge, gateway=True, filtering=True):
         """Delete a bridge."""
-        if not device_exists(bridge):
+        if not nova.privsep.linux_net.device_exists(bridge):
             return
         else:
             if filtering:
@@ -1692,16 +1482,18 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
             delete_bridge_dev(bridge)
 
 
-# NOTE(cfb): This is a temporary fix to LP #1316621. We really want to call
-#            ebtables with --concurrent. In order to do that though we need
-#            libvirt to support this. Additionally since ebtables --concurrent
-#            will hang indefinitely waiting on the lock we need to teach
-#            oslo_concurrency.processutils how to timeout a long running
-#            process first. Once those are complete we can replace all of this
-#            with calls to ebtables --concurrent and a reasonable timeout.
-def _exec_ebtables(*cmd, **kwargs):
-    check_exit_code = kwargs.pop('check_exit_code', True)
-
+# NOTE(cfb): Fix for LP #1316621, #1501366.
+#            We call ebtables with --concurrent which causes ebtables to
+#            use a lock file to deal with concurrent calls. Since we can't
+#            be sure the libvirt also uses --concurrent we retry in a loop
+#            to be sure.
+#
+#            ebtables doesn't implement a timeout and doesn't gracefully
+#            handle cleaning up a lock file if someone sends a SIGKILL to
+#            ebtables while its holding a lock. As a result we want to add
+#            a timeout to the ebtables calls but we first need to teach
+#            oslo_concurrency how to do that.
+def _exec_ebtables(table, rule, insert_rule=True, check_exit_code=True):
     # List of error strings to re-try.
     retry_strings = (
         'Multiple ebtables programs',
@@ -1709,8 +1501,6 @@ def _exec_ebtables(*cmd, **kwargs):
 
     # We always try at least once
     attempts = CONF.ebtables_exec_attempts
-    if attempts <= 0:
-        attempts = 1
     count = 1
     while count <= attempts:
         # Updated our counters if needed
@@ -1721,23 +1511,30 @@ def _exec_ebtables(*cmd, **kwargs):
         #            other error (like a rule doesn't exist) so we have to
         #            to parse stderr.
         try:
-            _execute(*cmd, check_exit_code=[0], **kwargs)
+            cmd = ['ebtables', '--concurrent', '-t', table]
+            if insert_rule:
+                cmd.append('-I')
+            else:
+                cmd.append('-D')
+            cmd.extend(rule)
+
+            _execute(*cmd, check_exit_code=[0], run_as_root=True)
         except processutils.ProcessExecutionError as exc:
             # See if we can retry the error.
             if any(error in exc.stderr for error in retry_strings):
                 if count > attempts and check_exit_code:
-                    LOG.warning(_LW('%s failed. Not Retrying.'), ' '.join(cmd))
+                    LOG.warning('%s failed. Not Retrying.', ' '.join(cmd))
                     raise
                 else:
                     # We need to sleep a bit before retrying
-                    LOG.warning(_LW("%(cmd)s failed. Sleeping %(time)s "
-                                    "seconds before retry."),
+                    LOG.warning("%(cmd)s failed. Sleeping %(time)s "
+                                "seconds before retry.",
                                 {'cmd': ' '.join(cmd), 'time': sleep})
                     time.sleep(sleep)
             else:
                 # Not eligible for retry
                 if check_exit_code:
-                    LOG.warning(_LW('%s failed. Not Retrying.'), ' '.join(cmd))
+                    LOG.warning('%s failed. Not Retrying.', ' '.join(cmd))
                     raise
                 else:
                     return
@@ -1749,17 +1546,16 @@ def _exec_ebtables(*cmd, **kwargs):
 @utils.synchronized('ebtables', external=True)
 def ensure_ebtables_rules(rules, table='filter'):
     for rule in rules:
-        cmd = ['ebtables', '-t', table, '-D'] + rule.split()
-        _exec_ebtables(*cmd, check_exit_code=False, run_as_root=True)
-        cmd[3] = '-I'
-        _exec_ebtables(*cmd, run_as_root=True)
+        _exec_ebtables(table, rule.split(), insert_rule=False,
+                       check_exit_code=False)
+        _exec_ebtables(table, rule.split())
 
 
 @utils.synchronized('ebtables', external=True)
 def remove_ebtables_rules(rules, table='filter'):
     for rule in rules:
-        cmd = ['ebtables', '-t', table, '-D'] + rule.split()
-        _exec_ebtables(*cmd, check_exit_code=False, run_as_root=True)
+        _exec_ebtables(table, rule.split(), insert_rule=False,
+                       check_exit_code=False)
 
 
 def isolate_dhcp_address(interface, address):
@@ -1821,7 +1617,7 @@ class LinuxOVSInterfaceDriver(LinuxNetInterfaceDriver):
 
     def plug(self, network, mac_address, gateway=True):
         dev = self.get_dev(network)
-        if not device_exists(dev):
+        if not nova.privsep.linux_net.device_exists(dev):
             bridge = CONF.linuxnet_ovs_integration_bridge
             _ovs_vsctl(['--', '--may-exist', 'add-port', bridge, dev,
                         '--', 'set', 'Interface', dev, 'type=internal',
@@ -1831,10 +1627,10 @@ class LinuxOVSInterfaceDriver(LinuxNetInterfaceDriver):
                         'external-ids:iface-status=active',
                         '--', 'set', 'Interface', dev,
                         'external-ids:attached-mac=%s' % mac_address])
-            _execute('ip', 'link', 'set', dev, 'address', mac_address,
-                     run_as_root=True)
-            _set_device_mtu(dev, network.get('mtu'))
-            _execute('ip', 'link', 'set', dev, 'up', run_as_root=True)
+            nova.privsep.linux_net.set_device_macaddr(
+                dev, mac_address)
+            nova.privsep.linux_net.set_device_mtu(dev, network.get('mtu'))
+            nova.privsep.linux_net.set_device_enabled(dev)
             if not gateway:
                 # If we weren't instructed to act as a gateway then add the
                 # appropriate flows to block all non-dhcp traffic.
@@ -1868,89 +1664,21 @@ class LinuxOVSInterfaceDriver(LinuxNetInterfaceDriver):
         return dev
 
 
-# plugs interfaces using Linux Bridge when using NeutronManager
-class NeutronLinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
-
-    BRIDGE_NAME_PREFIX = 'brq'
-    GATEWAY_INTERFACE_PREFIX = 'gw-'
-
-    def plug(self, network, mac_address, gateway=True):
-        dev = self.get_dev(network)
-        bridge = self.get_bridge(network)
-        if not gateway:
-            # If we weren't instructed to act as a gateway then add the
-            # appropriate flows to block all non-dhcp traffic.
-            # .. and make sure iptbles won't forward it as well.
-            iptables_manager.ipv4['filter'].add_rule('FORWARD',
-                    ('--in-interface %s -j %s'
-                     % (bridge, CONF.iptables_drop_action)))
-            iptables_manager.ipv4['filter'].add_rule('FORWARD',
-                    ('--out-interface %s -j %s'
-                     % (bridge, CONF.iptables_drop_action)))
-            return bridge
-        else:
-            for rule in get_gateway_rules(bridge):
-                iptables_manager.ipv4['filter'].add_rule(*rule)
-
-        create_tap_dev(dev, mac_address)
-
-        if not device_exists(bridge):
-            LOG.debug("Starting bridge %s ", bridge)
-            utils.execute('brctl', 'addbr', bridge, run_as_root=True)
-            utils.execute('brctl', 'setfd', bridge, str(0), run_as_root=True)
-            utils.execute('brctl', 'stp', bridge, 'off', run_as_root=True)
-            utils.execute('ip', 'link', 'set', bridge, 'address', mac_address,
-                          run_as_root=True, check_exit_code=[0, 2, 254])
-            utils.execute('ip', 'link', 'set', bridge, 'up', run_as_root=True,
-                          check_exit_code=[0, 2, 254])
-            LOG.debug("Done starting bridge %s", bridge)
-
-            full_ip = '%s/%s' % (network['dhcp_server'],
-                                 network['cidr'].rpartition('/')[2])
-            utils.execute('ip', 'address', 'add', full_ip, 'dev', bridge,
-                          run_as_root=True, check_exit_code=[0, 2, 254])
-
-        return dev
-
-    def unplug(self, network):
-        dev = self.get_dev(network)
-        if not device_exists(dev):
-            return None
-        else:
-            delete_net_dev(dev)
-            return dev
-
-    def get_dev(self, network):
-        dev = self.GATEWAY_INTERFACE_PREFIX + str(network['uuid'][0:11])
-        return dev
-
-    def get_bridge(self, network):
-        bridge = self.BRIDGE_NAME_PREFIX + str(network['uuid'][0:11])
-        return bridge
-
-# provide compatibility with existing configs
-QuantumLinuxBridgeInterfaceDriver = NeutronLinuxBridgeInterfaceDriver
-
 iptables_manager = IptablesManager()
 
 
-def set_vf_interface_vlan(pci_addr, mac_addr, vlan=0):
+def set_vf_trusted(pci_addr, trusted):
+    """Configures the VF to be trusted or not
+
+    :param pci_addr: PCI slot of the device
+    :param trusted: Boolean value to indicate whether to
+                    enable/disable 'trusted' capability
+    """
     pf_ifname = pci_utils.get_ifname_by_pci_address(pci_addr,
                                                     pf_interface=True)
-    vf_ifname = pci_utils.get_ifname_by_pci_address(pci_addr)
     vf_num = pci_utils.get_vf_num_by_pci_address(pci_addr)
-
-    # Set the VF's mac address and vlan
-    exit_code = [0, 2, 254]
-    port_state = 'up' if vlan > 0 else 'down'
     utils.execute('ip', 'link', 'set', pf_ifname,
                   'vf', vf_num,
-                  'mac', mac_addr,
-                  'vlan', vlan,
+                  'trust', bool(trusted) and 'on' or 'off',
                   run_as_root=True,
-                  check_exit_code=exit_code)
-    # Bring up/down the VF's interface
-    utils.execute('ip', 'link', 'set', vf_ifname,
-                  port_state,
-                  run_as_root=True,
-                  check_exit_code=exit_code)
+                  check_exit_code=[0, 2, 254])

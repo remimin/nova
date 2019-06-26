@@ -16,23 +16,20 @@
 Unit Tests for nova.compute.rpcapi
 """
 
-import contextlib
-
 import mock
-from oslo_config import cfg
 from oslo_serialization import jsonutils
+from oslo_utils.fixture import uuidsentinel as uuids
 
 from nova.compute import rpcapi as compute_rpcapi
 from nova import context
+from nova import exception
 from nova.objects import block_device as objects_block_dev
-from nova.objects import compute_node as objects_compute_node
-from nova.objects import network_request as objects_network_request
-from nova.objects import numa as objects_numa
+from nova.objects import migration as migration_obj
+from nova.objects import service as service_obj
 from nova import test
 from nova.tests.unit import fake_block_device
+from nova.tests.unit import fake_flavor
 from nova.tests.unit import fake_instance
-
-CONF = cfg.CONF
 
 
 class ComputeRpcAPITestCase(test.NoDBTestCase):
@@ -40,58 +37,107 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
     def setUp(self):
         super(ComputeRpcAPITestCase, self).setUp()
         self.context = context.get_admin_context()
+        self.fake_flavor_obj = fake_flavor.fake_flavor_obj(self.context)
+        self.fake_flavor = jsonutils.to_primitive(self.fake_flavor_obj)
         instance_attr = {'host': 'fake_host',
-                         'instance_type_id': 1}
+                         'instance_type_id': self.fake_flavor_obj['id'],
+                         'instance_type': self.fake_flavor_obj}
         self.fake_instance_obj = fake_instance.fake_instance_obj(self.context,
                                                    **instance_attr)
         self.fake_instance = jsonutils.to_primitive(self.fake_instance_obj)
-        self.fake_volume_bdm = jsonutils.to_primitive(
-                fake_block_device.FakeDbBlockDeviceDict(
+        self.fake_volume_bdm = objects_block_dev.BlockDeviceMapping(
+                **fake_block_device.FakeDbBlockDeviceDict(
                     {'source_type': 'volume', 'destination_type': 'volume',
-                     'instance_uuid': self.fake_instance['uuid'],
+                     'instance_uuid': self.fake_instance_obj.uuid,
                      'volume_id': 'fake-volume-id'}))
+        # FIXME(melwitt): Temporary while things have no mappings
+        self.patcher1 = mock.patch('nova.objects.InstanceMapping.'
+                                   'get_by_instance_uuid')
+        self.patcher2 = mock.patch('nova.objects.HostMapping.get_by_host')
+        mock_inst_mapping = self.patcher1.start()
+        mock_host_mapping = self.patcher2.start()
+        mock_inst_mapping.side_effect = exception.InstanceMappingNotFound(
+                uuid=self.fake_instance_obj.uuid)
+        mock_host_mapping.side_effect = exception.HostMappingNotFound(
+                name=self.fake_instance_obj.host)
 
-    def test_serialized_instance_has_name(self):
-        self.assertIn('name', self.fake_instance)
+    def tearDown(self):
+        super(ComputeRpcAPITestCase, self).tearDown()
+        self.patcher1.stop()
+        self.patcher2.stop()
+
+    @mock.patch('nova.objects.service.get_minimum_version_all_cells')
+    def test_auto_pin(self, mock_get_min):
+        mock_get_min.return_value = 1
+        self.flags(compute='auto', group='upgrade_levels')
+        compute_rpcapi.LAST_VERSION = None
+        rpcapi = compute_rpcapi.ComputeAPI()
+        self.assertEqual('4.4', rpcapi.router.version_cap)
+        mock_get_min.assert_called_once_with(mock.ANY, ['nova-compute'])
+
+    @mock.patch('nova.objects.service.get_minimum_version_all_cells')
+    def test_auto_pin_fails_if_too_old(self, mock_get_min):
+        mock_get_min.return_value = 1955
+        self.flags(compute='auto', group='upgrade_levels')
+        self.assertRaises(exception.ServiceTooOld,
+                          compute_rpcapi.ComputeAPI()._determine_version_cap,
+                          mock.Mock)
+
+    @mock.patch('nova.objects.service.get_minimum_version_all_cells')
+    def test_auto_pin_with_service_version_zero(self, mock_get_min):
+        mock_get_min.return_value = 0
+        self.flags(compute='auto', group='upgrade_levels')
+        compute_rpcapi.LAST_VERSION = None
+        rpcapi = compute_rpcapi.ComputeAPI()
+        history = service_obj.SERVICE_VERSION_HISTORY
+        current_version = history[service_obj.SERVICE_VERSION]['compute_rpc']
+        self.assertEqual(current_version, rpcapi.router.version_cap)
+        mock_get_min.assert_called_once_with(mock.ANY, ['nova-compute'])
+        self.assertIsNone(compute_rpcapi.LAST_VERSION)
+
+    @mock.patch('nova.objects.service.get_minimum_version_all_cells')
+    def test_auto_pin_caches(self, mock_get_min):
+        mock_get_min.return_value = 1
+        self.flags(compute='auto', group='upgrade_levels')
+        compute_rpcapi.LAST_VERSION = None
+        api = compute_rpcapi.ComputeAPI()
+        for x in range(2):
+            api._determine_version_cap(mock.Mock())
+        mock_get_min.assert_called_once_with(mock.ANY, ['nova-compute'])
+        self.assertEqual('4.4', compute_rpcapi.LAST_VERSION)
 
     def _test_compute_api(self, method, rpc_method,
-                          assert_dict=False, **kwargs):
+                          expected_args=None, **kwargs):
         ctxt = context.RequestContext('fake_user', 'fake_project')
 
         rpcapi = kwargs.pop('rpcapi_class', compute_rpcapi.ComputeAPI)()
-        self.assertIsNotNone(rpcapi.client)
-        self.assertEqual(rpcapi.client.target.topic, CONF.compute_topic)
+        self.assertIsNotNone(rpcapi.router)
+        self.assertEqual(rpcapi.router.target.topic,
+                         compute_rpcapi.RPC_TOPIC)
 
-        orig_prepare = rpcapi.client.prepare
-        expected_version = kwargs.pop('version', rpcapi.client.target.version)
-        nova_network = kwargs.pop('nova_network', False)
+        # This test wants to run the real prepare function, so must use
+        # a real client object
+        default_client = rpcapi.router.default_client
+
+        orig_prepare = default_client.prepare
+        base_version = rpcapi.router.target.version
+        expected_version = kwargs.pop('version', base_version)
+
+        prepare_extra_kwargs = {}
+        cm_timeout = kwargs.pop('call_monitor_timeout', None)
+        timeout = kwargs.pop('timeout', None)
+        if cm_timeout:
+            prepare_extra_kwargs['call_monitor_timeout'] = cm_timeout
+        if timeout:
+            prepare_extra_kwargs['timeout'] = timeout
 
         expected_kwargs = kwargs.copy()
-        if ('requested_networks' in expected_kwargs and
-               expected_version == '3.23'):
-            expected_kwargs['requested_networks'] = []
-            for requested_network in kwargs['requested_networks']:
-                if not nova_network:
-                    expected_kwargs['requested_networks'].append(
-                        (requested_network.network_id,
-                         str(requested_network.address),
-                         requested_network.port_id))
-                else:
-                    expected_kwargs['requested_networks'].append(
-                        (requested_network.network_id,
-                         str(requested_network.address)))
+        if expected_args:
+            expected_kwargs.update(expected_args)
         if 'host_param' in expected_kwargs:
             expected_kwargs['host'] = expected_kwargs.pop('host_param')
         else:
             expected_kwargs.pop('host', None)
-        if 'legacy_limits' in expected_kwargs:
-            expected_kwargs['limits'] = expected_kwargs.pop('legacy_limits')
-            kwargs.pop('legacy_limits', None)
-        expected_kwargs.pop('destination', None)
-
-        if assert_dict:
-            expected_kwargs['instance'] = jsonutils.to_primitive(
-                expected_kwargs['instance'])
 
         cast_and_call = ['confirm_resize', 'stop_instance']
         if rpc_method == 'call' and method in cast_and_call:
@@ -101,24 +147,27 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
                 kwargs['do_cast'] = False
         if 'host' in kwargs:
             host = kwargs['host']
-        elif 'destination' in kwargs:
-            host = kwargs['destination']
         elif 'instances' in kwargs:
             host = kwargs['instances'][0]['host']
+        elif 'destination' in kwargs:
+            host = expected_kwargs.pop('destination')
         else:
             host = kwargs['instance']['host']
 
-        with contextlib.nested(
-            mock.patch.object(rpcapi.client, rpc_method),
-            mock.patch.object(rpcapi.client, 'prepare'),
-            mock.patch.object(rpcapi.client, 'can_send_version'),
+        if method == 'rebuild_instance' and 'node' in expected_kwargs:
+            expected_kwargs['scheduled_node'] = expected_kwargs.pop('node')
+
+        with test.nested(
+            mock.patch.object(default_client, rpc_method),
+            mock.patch.object(default_client, 'prepare'),
+            mock.patch.object(default_client, 'can_send_version'),
         ) as (
             rpc_mock, prepare_mock, csv_mock
         ):
-            prepare_mock.return_value = rpcapi.client
-            if 'return_bdm_object' in kwargs:
-                del kwargs['return_bdm_object']
-                rpc_mock.return_value = objects_block_dev.BlockDeviceMapping()
+            prepare_mock.return_value = default_client
+            if '_return_value' in kwargs:
+                rpc_mock.return_value = kwargs.pop('_return_value')
+                del expected_kwargs['_return_value']
             elif rpc_method == 'call':
                 rpc_mock.return_value = 'foo'
             else:
@@ -130,7 +179,8 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
             self.assertEqual(retval, rpc_mock.return_value)
 
             prepare_mock.assert_called_once_with(version=expected_version,
-                                                 server=host)
+                                                 server=host,
+                                                 **prepare_extra_kwargs)
             rpc_mock.assert_called_once_with(ctxt, method, **expected_kwargs)
 
     def test_add_aggregate_host(self):
@@ -141,94 +191,62 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
     def test_add_fixed_ip_to_instance(self):
         self._test_compute_api('add_fixed_ip_to_instance', 'cast',
                 instance=self.fake_instance_obj, network_id='id',
-                version='3.12')
+                version='5.0')
 
     def test_attach_interface(self):
         self._test_compute_api('attach_interface', 'call',
                 instance=self.fake_instance_obj, network_id='id',
-                port_id='id2', version='3.17', requested_ip='192.168.1.50')
+                port_id='id2', version='5.0', requested_ip='192.168.1.50',
+                tag='foo')
 
     def test_attach_volume(self):
         self._test_compute_api('attach_volume', 'cast',
-                instance=self.fake_instance_obj, volume_id='id',
-                mountpoint='mp', bdm=self.fake_volume_bdm, version='3.16')
+                instance=self.fake_instance_obj, bdm=self.fake_volume_bdm,
+                version='5.0')
 
     def test_change_instance_metadata(self):
         self._test_compute_api('change_instance_metadata', 'cast',
-                instance=self.fake_instance_obj, diff={}, version='3.7')
-
-    @mock.patch('nova.compute.rpcapi.ComputeAPI._warn_buggy_live_migrations')
-    def test_check_can_live_migrate_destination(self, mock_warn):
-        self._test_compute_api('check_can_live_migrate_destination', 'call',
-                instance=self.fake_instance_obj,
-                destination='dest', block_migration=True,
-                disk_over_commit=True, version='3.32')
-        self.assertFalse(mock_warn.called)
-
-    @mock.patch('nova.compute.rpcapi.ComputeAPI._warn_buggy_live_migrations')
-    def test_check_can_live_migrate_destination_old_warning(self, mock_warn):
-        self.flags(compute='3.0', group='upgrade_levels')
-        self._test_compute_api('check_can_live_migrate_destination', 'call',
-                instance=self.fake_instance_obj,
-                destination='dest', block_migration=True,
-                disk_over_commit=True, version='3.0')
-        mock_warn.assert_called_once_with()
-
-    @mock.patch('nova.compute.rpcapi.ComputeAPI._warn_buggy_live_migrations')
-    def test_check_can_live_migrate_source(self, mock_warn):
-        self._test_compute_api('check_can_live_migrate_source', 'call',
-                instance=self.fake_instance_obj,
-                dest_check_data={"test": "data"}, version='3.32')
-        self.assertFalse(mock_warn.called)
-
-    @mock.patch('nova.compute.rpcapi.ComputeAPI._warn_buggy_live_migrations')
-    def test_check_can_live_migrate_source_old_warning(self, mock_warn):
-        self.flags(compute='3.0', group='upgrade_levels')
-        self._test_compute_api('check_can_live_migrate_source', 'call',
-                instance=self.fake_instance_obj,
-                dest_check_data={"test": "data"}, version='3.0')
-        mock_warn.assert_called_once_with()
+                instance=self.fake_instance_obj, diff={}, version='5.0')
 
     def test_check_instance_shared_storage(self):
         self._test_compute_api('check_instance_shared_storage', 'call',
                 instance=self.fake_instance_obj, data='foo',
-                version='3.29')
+                version='5.0')
 
     def test_confirm_resize_cast(self):
         self._test_compute_api('confirm_resize', 'cast',
                 instance=self.fake_instance_obj, migration={'id': 'foo'},
-                host='host', reservations=list('fake_res'))
+                host='host')
 
     def test_confirm_resize_call(self):
         self._test_compute_api('confirm_resize', 'call',
                 instance=self.fake_instance_obj, migration={'id': 'foo'},
-                host='host', reservations=list('fake_res'))
+                host='host')
 
     def test_detach_interface(self):
         self._test_compute_api('detach_interface', 'cast',
-                version='3.17', instance=self.fake_instance_obj,
+                version='5.0', instance=self.fake_instance_obj,
                 port_id='fake_id')
 
     def test_detach_volume(self):
         self._test_compute_api('detach_volume', 'cast',
                 instance=self.fake_instance_obj, volume_id='id',
-                version='3.25')
+                attachment_id='fake_id', version='5.0')
 
     def test_finish_resize(self):
         self._test_compute_api('finish_resize', 'cast',
                 instance=self.fake_instance_obj, migration={'id': 'foo'},
-                image='image', disk_info='disk_info', host='host',
-                reservations=list('fake_res'))
+                image='image', disk_info='disk_info', host='host')
 
     def test_finish_revert_resize(self):
         self._test_compute_api('finish_revert_resize', 'cast',
                 instance=self.fake_instance_obj, migration={'id': 'fake_id'},
-                host='host', reservations=list('fake_res'))
+                host='host')
 
     def test_get_console_output(self):
         self._test_compute_api('get_console_output', 'call',
                 instance=self.fake_instance_obj, tail_length='tl',
-                version='3.28')
+                version='5.0')
 
     def test_get_console_pool_info(self):
         self._test_compute_api('get_console_pool_info', 'call',
@@ -239,37 +257,43 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
 
     def test_get_diagnostics(self):
         self._test_compute_api('get_diagnostics', 'call',
-                instance=self.fake_instance_obj, version='3.18')
+                instance=self.fake_instance_obj, version='5.0')
 
     def test_get_instance_diagnostics(self):
+        expected_args = {'instance': self.fake_instance_obj}
         self._test_compute_api('get_instance_diagnostics', 'call',
-                assert_dict=True, instance=self.fake_instance_obj,
-                version='3.31')
+                expected_args, instance=self.fake_instance_obj,
+                version='5.0')
 
     def test_get_vnc_console(self):
         self._test_compute_api('get_vnc_console', 'call',
                 instance=self.fake_instance_obj, console_type='type',
-                version='3.2')
+                version='5.0')
 
     def test_get_spice_console(self):
         self._test_compute_api('get_spice_console', 'call',
                 instance=self.fake_instance_obj, console_type='type',
-                version='3.1')
+                version='5.0')
 
     def test_get_rdp_console(self):
         self._test_compute_api('get_rdp_console', 'call',
                 instance=self.fake_instance_obj, console_type='type',
-                version='3.10')
+                version='5.0')
 
     def test_get_serial_console(self):
         self._test_compute_api('get_serial_console', 'call',
                 instance=self.fake_instance_obj, console_type='serial',
-                version='3.34')
+                version='5.0')
+
+    def test_get_mks_console(self):
+        self._test_compute_api('get_mks_console', 'call',
+                instance=self.fake_instance_obj, console_type='webmks',
+                version='5.0')
 
     def test_validate_console_port(self):
         self._test_compute_api('validate_console_port', 'call',
                 instance=self.fake_instance_obj, port="5900",
-                console_type="novnc", version='3.3')
+                console_type="novnc", version='5.0')
 
     def test_host_maintenance_mode(self):
         self._test_compute_api('host_maintenance_mode', 'call',
@@ -287,12 +311,41 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
         self._test_compute_api('live_migration', 'cast',
                 instance=self.fake_instance_obj, dest='dest',
                 block_migration='blockity_block', host='tsoh',
-                migrate_data={}, version='3.26')
+                migration='migration',
+                migrate_data={}, version='5.0')
+
+    def test_live_migration_force_complete(self):
+        migration = migration_obj.Migration()
+        migration.id = 1
+        migration.source_compute = 'fake'
+        ctxt = context.RequestContext('fake_user', 'fake_project')
+        version = '5.0'
+        rpcapi = compute_rpcapi.ComputeAPI()
+        rpcapi.router.client = mock.Mock()
+        mock_client = mock.MagicMock()
+        rpcapi.router.client.return_value = mock_client
+        mock_client.can_send_version.return_value = True
+        mock_cctx = mock.MagicMock()
+        mock_client.prepare.return_value = mock_cctx
+        rpcapi.live_migration_force_complete(ctxt, self.fake_instance_obj,
+                                             migration)
+        mock_client.prepare.assert_called_with(server=migration.source_compute,
+                                               version=version)
+        mock_cctx.cast.assert_called_with(ctxt,
+                                          'live_migration_force_complete',
+                                          instance=self.fake_instance_obj)
+
+    def test_live_migration_abort(self):
+        self._test_compute_api('live_migration_abort', 'cast',
+                instance=self.fake_instance_obj,
+                migration_id='1', version='5.0')
 
     def test_post_live_migration_at_destination(self):
-        self._test_compute_api('post_live_migration_at_destination', 'cast',
+        self.flags(long_rpc_timeout=1234)
+        self._test_compute_api('post_live_migration_at_destination', 'call',
                 instance=self.fake_instance_obj,
-                block_migration='block_migration', host='host', version='3.14')
+                block_migration='block_migration', host='host', version='5.0',
+                timeout=1234, call_monitor_timeout=60)
 
     def test_pause_instance(self):
         self._test_compute_api('pause_instance', 'cast',
@@ -300,41 +353,46 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
 
     def test_soft_delete_instance(self):
         self._test_compute_api('soft_delete_instance', 'cast',
-                instance=self.fake_instance_obj,
-                reservations=['uuid1', 'uuid2'])
+                instance=self.fake_instance_obj)
 
     def test_swap_volume(self):
         self._test_compute_api('swap_volume', 'cast',
                 instance=self.fake_instance_obj, old_volume_id='oldid',
-                new_volume_id='newid')
+                new_volume_id='newid', new_attachment_id=uuids.attachment_id,
+                version='5.0')
 
     def test_restore_instance(self):
         self._test_compute_api('restore_instance', 'cast',
-                instance=self.fake_instance_obj, version='3.20')
+                instance=self.fake_instance_obj, version='5.0')
 
     def test_pre_live_migration(self):
+        self.flags(long_rpc_timeout=1234)
         self._test_compute_api('pre_live_migration', 'call',
                 instance=self.fake_instance_obj,
                 block_migration='block_migration', disk='disk', host='host',
-                migrate_data=None, version='3.19')
+                migrate_data=None, version='5.0',
+                call_monitor_timeout=60, timeout=1234)
+
+    def test_check_can_live_migrate_destination(self):
+        self.flags(long_rpc_timeout=1234)
+        self._test_compute_api('check_can_live_migrate_destination', 'call',
+                               instance=self.fake_instance_obj,
+                               destination='dest',
+                               block_migration=False,
+                               disk_over_commit=False,
+                               version='5.0', call_monitor_timeout=60,
+                               timeout=1234)
 
     def test_prep_resize(self):
-        self.flags(compute='3.0', group='upgrade_levels')
         self._test_compute_api('prep_resize', 'cast',
-                instance=self.fake_instance_obj, instance_type='fake_type',
+                instance=self.fake_instance_obj,
+                instance_type=self.fake_flavor_obj,
                 image='fake_image', host='host',
-                reservations=list('fake_res'),
                 request_spec='fake_spec',
                 filter_properties={'fakeprop': 'fakeval'},
-                node='node', version='3.0')
-        self.flags(compute='3.38', group='upgrade_levels')
-        self._test_compute_api('prep_resize', 'cast',
-                instance=self.fake_instance_obj, instance_type='fake_type',
-                image='fake_image', host='host',
-                reservations=list('fake_res'),
-                request_spec='fake_spec',
-                filter_properties={'fakeprop': 'fakeval'},
-                node='node', clean_shutdown=True, version='3.38')
+                migration='migration',
+                node='node', clean_shutdown=True, host_list=None,
+                version='5.1')
 
     def test_reboot_instance(self):
         self.maxDiff = None
@@ -348,27 +406,21 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
                 injected_files='None', image_ref='None', orig_image_ref='None',
                 bdms=[], instance=self.fake_instance_obj, host='new_host',
                 orig_sys_metadata=None, recreate=True, on_shared_storage=True,
-                preserve_ephemeral=True, version='3.21')
+                preserve_ephemeral=True, migration=None, node=None,
+                limits=None, request_spec=None, version='5.0')
 
     def test_reserve_block_device_name(self):
         self._test_compute_api('reserve_block_device_name', 'call',
                 instance=self.fake_instance_obj, device='device',
                 volume_id='id', disk_bus='ide', device_type='cdrom',
-                version='3.35', return_bdm_object=True)
+                tag='foo', multiattach=True, version='5.0',
+                _return_value=objects_block_dev.BlockDeviceMapping())
 
-    def refresh_provider_fw_rules(self):
-        self._test_compute_api('refresh_provider_fw_rules', 'cast',
-                host='host')
-
-    def test_refresh_security_group_rules(self):
-        self._test_compute_api('refresh_security_group_rules', 'cast',
-                rpcapi_class=compute_rpcapi.SecurityGroupAPI,
-                security_group_id='id', host='host')
-
-    def test_refresh_security_group_members(self):
-        self._test_compute_api('refresh_security_group_members', 'cast',
-                rpcapi_class=compute_rpcapi.SecurityGroupAPI,
-                security_group_id='id', host='host')
+    def test_refresh_instance_security_rules(self):
+        expected_args = {'instance': self.fake_instance_obj}
+        self._test_compute_api('refresh_instance_security_rules', 'cast',
+                expected_args, host='fake_host',
+                instance=self.fake_instance_obj, version='5.0')
 
     def test_remove_aggregate_host(self):
         self._test_compute_api('remove_aggregate_host', 'cast',
@@ -378,44 +430,28 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
     def test_remove_fixed_ip_from_instance(self):
         self._test_compute_api('remove_fixed_ip_from_instance', 'cast',
                 instance=self.fake_instance_obj, address='addr',
-                version='3.13')
+                version='5.0')
 
     def test_remove_volume_connection(self):
         self._test_compute_api('remove_volume_connection', 'call',
-                instance=self.fake_instance, volume_id='id', host='host',
-                version='3.30')
+                instance=self.fake_instance_obj, volume_id='id', host='host',
+                version='5.0')
 
     def test_rescue_instance(self):
-        self.flags(compute='3.9', group='upgrade_levels')
-        self._test_compute_api('rescue_instance', 'cast',
-            instance=self.fake_instance_obj, rescue_password='pw',
-            version='3.9')
-        self.flags(compute='3.24', group='upgrade_levels')
-        self._test_compute_api('rescue_instance', 'cast',
-            instance=self.fake_instance_obj, rescue_password='pw',
-            rescue_image_ref='fake_image_ref', version='3.24')
-        self.flags(compute='3.37', group='upgrade_levels')
         self._test_compute_api('rescue_instance', 'cast',
             instance=self.fake_instance_obj, rescue_password='pw',
             rescue_image_ref='fake_image_ref',
-            clean_shutdown=True, version='3.37')
+            clean_shutdown=True, version='5.0')
 
     def test_reset_network(self):
         self._test_compute_api('reset_network', 'cast',
                 instance=self.fake_instance_obj)
 
     def test_resize_instance(self):
-        self.flags(compute='3.0', group='upgrade_levels')
         self._test_compute_api('resize_instance', 'cast',
                 instance=self.fake_instance_obj, migration={'id': 'fake_id'},
-                image='image', instance_type={'id': 1},
-                reservations=list('fake_res'), version='3.0')
-        self.flags(compute='3.37', group='upgrade_levels')
-        self._test_compute_api('resize_instance', 'cast',
-                instance=self.fake_instance_obj, migration={'id': 'fake_id'},
-                image='image', instance_type={'id': 1},
-                reservations=list('fake_res'),
-                clean_shutdown=True, version='3.37')
+                image='image', instance_type=self.fake_flavor_obj,
+                clean_shutdown=True, version='5.0')
 
     def test_resume_instance(self):
         self._test_compute_api('resume_instance', 'cast',
@@ -424,36 +460,12 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
     def test_revert_resize(self):
         self._test_compute_api('revert_resize', 'cast',
                 instance=self.fake_instance_obj, migration={'id': 'fake_id'},
-                host='host', reservations=list('fake_res'))
-
-    @mock.patch('nova.compute.rpcapi.ComputeAPI._warn_buggy_live_migrations')
-    def test_rollback_live_migration_at_destination(self, mock_warn):
-        self._test_compute_api('rollback_live_migration_at_destination',
-                'cast', instance=self.fake_instance_obj, host='host',
-                destroy_disks=True, migrate_data=None, version='3.32')
-        self.assertFalse(mock_warn.called)
-
-    @mock.patch('nova.compute.rpcapi.ComputeAPI._warn_buggy_live_migrations')
-    def test_rollback_live_migration_at_destination_old_warning(self,
-                                                                mock_warn):
-        self.flags(compute='3.0', group='upgrade_levels')
-        self._test_compute_api('rollback_live_migration_at_destination',
-                'cast', instance=self.fake_instance_obj, host='host',
-                version='3.0')
-        mock_warn.assert_called_once_with(None)
-
-    def test_run_instance(self):
-        self._test_compute_api('run_instance', 'cast',
-                instance=self.fake_instance_obj, host='fake_host',
-                request_spec='fake_spec', filter_properties={},
-                requested_networks='networks', injected_files='files',
-                admin_password='pw', is_first_time=True, node='node',
-                legacy_bdm_in_spec=False, version='3.27')
+                host='host')
 
     def test_set_admin_password(self):
         self._test_compute_api('set_admin_password', 'call',
                 instance=self.fake_instance_obj, new_pass='pw',
-                version='3.8')
+                version='5.0')
 
     def test_set_host_enabled(self):
         self._test_compute_api('set_host_enabled', 'call',
@@ -476,22 +488,14 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
                 instance=self.fake_instance_obj)
 
     def test_stop_instance_cast(self):
-        self.flags(compute='3.0', group='upgrade_levels')
-        self._test_compute_api('stop_instance', 'cast',
-                instance=self.fake_instance_obj, version='3.0')
-        self.flags(compute='3.37', group='upgrade_levels')
         self._test_compute_api('stop_instance', 'cast',
                 instance=self.fake_instance_obj,
-                clean_shutdown=True, version='3.37')
+                clean_shutdown=True, version='5.0')
 
     def test_stop_instance_call(self):
-        self.flags(compute='3.0', group='upgrade_levels')
-        self._test_compute_api('stop_instance', 'call',
-                instance=self.fake_instance_obj, version='3.0')
-        self.flags(compute='3.37', group='upgrade_levels')
         self._test_compute_api('stop_instance', 'call',
                 instance=self.fake_instance_obj,
-                clean_shutdown=True, version='3.37')
+                clean_shutdown=True, version='5.0')
 
     def test_suspend_instance(self):
         self._test_compute_api('suspend_instance', 'cast',
@@ -500,7 +504,7 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
     def test_terminate_instance(self):
         self._test_compute_api('terminate_instance', 'cast',
                 instance=self.fake_instance_obj, bdms=[],
-                reservations=['uuid1', 'uuid2'], version='3.22')
+                version='5.0')
 
     def test_unpause_instance(self):
         self._test_compute_api('unpause_instance', 'cast',
@@ -508,49 +512,39 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
 
     def test_unrescue_instance(self):
         self._test_compute_api('unrescue_instance', 'cast',
-                instance=self.fake_instance_obj, version='3.11')
+                instance=self.fake_instance_obj, version='5.0')
 
     def test_shelve_instance(self):
-        self.flags(compute='3.0', group='upgrade_levels')
         self._test_compute_api('shelve_instance', 'cast',
                 instance=self.fake_instance_obj, image_id='image_id',
-                version='3.0')
-        self.flags(compute='3.37', group='upgrade_levels')
-        self._test_compute_api('shelve_instance', 'cast',
-                instance=self.fake_instance_obj, image_id='image_id',
-                clean_shutdown=True, version='3.37')
+                clean_shutdown=True, version='5.0')
 
     def test_shelve_offload_instance(self):
-        self.flags(compute='3.0', group='upgrade_levels')
         self._test_compute_api('shelve_offload_instance', 'cast',
                 instance=self.fake_instance_obj,
-                version='3.0')
-        self.flags(compute='3.37', group='upgrade_levels')
-        self._test_compute_api('shelve_offload_instance', 'cast',
-                instance=self.fake_instance_obj,
-                clean_shutdown=True, version='3.37')
+                clean_shutdown=True, version='5.0')
 
     def test_unshelve_instance(self):
         self._test_compute_api('unshelve_instance', 'cast',
                 instance=self.fake_instance_obj, host='host', image='image',
                 filter_properties={'fakeprop': 'fakeval'}, node='node',
-                version='3.15')
+                version='5.0')
 
     def test_volume_snapshot_create(self):
         self._test_compute_api('volume_snapshot_create', 'cast',
                 instance=self.fake_instance_obj, volume_id='fake_id',
-                create_info={}, version='3.6')
+                create_info={}, version='5.0')
 
     def test_volume_snapshot_delete(self):
         self._test_compute_api('volume_snapshot_delete', 'cast',
                 instance=self.fake_instance_obj, volume_id='fake_id',
-                snapshot_id='fake_id2', delete_info={}, version='3.6')
+                snapshot_id='fake_id2', delete_info={}, version='5.0')
 
     def test_external_instance_event(self):
         self._test_compute_api('external_instance_event', 'cast',
                                instances=[self.fake_instance_obj],
                                events=['event'],
-                               version='3.23')
+                               version='5.0')
 
     def test_build_and_run_instance(self):
         self._test_compute_api('build_and_run_instance', 'cast',
@@ -559,104 +553,62 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
                 admin_password='passwd', injected_files=None,
                 requested_networks=['network1'], security_groups=None,
                 block_device_mapping=None, node='node', limits=[],
-                version='3.40')
-
-    @mock.patch('nova.utils.is_neutron', return_value=True)
-    def test_build_and_run_instance_icehouse_compat(self, is_neutron):
-        self.flags(compute='icehouse', group='upgrade_levels')
-        self._test_compute_api('build_and_run_instance', 'cast',
-                instance=self.fake_instance_obj, host='host', image='image',
-                request_spec={'request': 'spec'}, filter_properties=[],
-                admin_password='passwd', injected_files=None,
-                requested_networks= objects_network_request.NetworkRequestList(
-                    objects=[objects_network_request.NetworkRequest(
-                        network_id="fake_network_id", address="10.0.0.1",
-                        port_id="fake_port_id")]),
-                security_groups=None,
-                block_device_mapping=None, node='node', limits={},
-                version='3.23')
-
-    @mock.patch('nova.utils.is_neutron', return_value=False)
-    def test_build_and_run_instance_icehouse_compat_nova_net(self, is_neutron):
-        self.flags(compute='icehouse', group='upgrade_levels')
-        self._test_compute_api('build_and_run_instance', 'cast',
-                instance=self.fake_instance_obj, host='host', image='image',
-                request_spec={'request': 'spec'}, filter_properties=[],
-                admin_password='passwd', injected_files=None,
-                requested_networks= objects_network_request.NetworkRequestList(
-                    objects=[objects_network_request.NetworkRequest(
-                        network_id='fake_network_id', address='10.0.0.1')]),
-                security_groups=None,
-                block_device_mapping=None, node='node', limits={},
-                version='3.23', nova_network=True)
+                host_list=None, version='5.0')
 
     def test_quiesce_instance(self):
         self._test_compute_api('quiesce_instance', 'call',
-                instance=self.fake_instance_obj, version='3.39')
+                instance=self.fake_instance_obj, version='5.0')
 
     def test_unquiesce_instance(self):
         self._test_compute_api('unquiesce_instance', 'cast',
-                instance=self.fake_instance_obj, mapping=None, version='3.39')
+                instance=self.fake_instance_obj, mapping=None, version='5.0')
 
-    @mock.patch('nova.utils.is_neutron', return_value=True)
-    def test_build_and_run_instance_juno_compat(self, is_neutron):
-        self.flags(compute='juno', group='upgrade_levels')
-        self._test_compute_api('build_and_run_instance', 'cast',
-                instance=self.fake_instance_obj, host='host', image='image',
-                request_spec={'request': 'spec'}, filter_properties=[],
-                admin_password='passwd', injected_files=None,
-                requested_networks= objects_network_request.NetworkRequestList(
-                    objects=[objects_network_request.NetworkRequest(
-                        network_id="fake_network_id", address="10.0.0.1",
-                        port_id="fake_port_id")]),
-                security_groups=None,
-                block_device_mapping=None, node='node', limits={},
-                version='3.33')
+    def test_trigger_crash_dump(self):
+        self._test_compute_api('trigger_crash_dump', 'cast',
+                instance=self.fake_instance_obj, version='5.0')
 
-    @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.utils.is_neutron', return_value=True)
-    def test_build_and_run_instance_limits_juno_compat(
-            self, is_neutron, get_by_host_and_nodename):
-        host_topology = objects_numa.NUMATopology(cells=[
-            objects_numa.NUMACell(
-                id=0, cpuset=set([1, 2]), memory=512,
-                cpu_usage=2, memory_usage=256,
-                pinned_cpus=set([1])),
-            objects_numa.NUMACell(
-                id=1, cpuset=set([3, 4]), memory=512,
-                cpu_usage=1, memory_usage=128,
-                pinned_cpus=set([]))
-        ])
-        limits = objects_numa.NUMATopologyLimits(
-            cpu_allocation_ratio=16,
-            ram_allocation_ratio=2)
-        cnode = objects_compute_node.ComputeNode(
-            numa_topology=jsonutils.dumps(
-                host_topology.obj_to_primitive()))
+    def _test_simple_call(self, method, inargs, callargs, callret,
+                               calltype='call', can_send=False):
+        rpc = compute_rpcapi.ComputeAPI()
+        mock_client = mock.Mock()
+        rpc.router.client = mock.Mock()
+        rpc.router.client.return_value = mock_client
 
-        get_by_host_and_nodename.return_value = cnode
-        legacy_limits = jsonutils.dumps(
-            limits.to_dict_legacy(host_topology))
+        @mock.patch.object(compute_rpcapi, '_compute_host')
+        def _test(mock_ch):
+            mock_client.can_send_version.return_value = can_send
+            call = getattr(mock_client.prepare.return_value, calltype)
+            call.return_value = callret
+            ctxt = context.RequestContext()
+            result = getattr(rpc, method)(ctxt, **inargs)
+            call.assert_called_once_with(ctxt, method, **callargs)
+            rpc.router.client.assert_called_with(ctxt)
+            return result
 
-        self.flags(compute='juno', group='upgrade_levels')
-        netreqs = objects_network_request.NetworkRequestList(objects=[
-            objects_network_request.NetworkRequest(
-                network_id="fake_network_id",
-                address="10.0.0.1",
-                port_id="fake_port_id")])
+        return _test()
 
-        self._test_compute_api('build_and_run_instance', 'cast',
-                               instance=self.fake_instance_obj,
-                               host='host',
-                               image='image',
-                               request_spec={'request': 'spec'},
-                               filter_properties=[],
-                               admin_password='passwd',
-                               injected_files=None,
-                               requested_networks=netreqs,
-                               security_groups=None,
-                               block_device_mapping=None,
-                               node='node',
-                               limits={'numa_topology': limits},
-                               legacy_limits={'numa_topology': legacy_limits},
-                               version='3.33')
+    @mock.patch('nova.compute.rpcapi.LOG')
+    @mock.patch('nova.objects.Service.get_minimum_version')
+    @mock.patch('nova.objects.service.get_minimum_version_all_cells')
+    def test_version_cap_no_computes_log_once(self, mock_allcells, mock_minver,
+                                              mock_log):
+        self.flags(connection=None, group='api_database')
+        self.flags(compute='auto', group='upgrade_levels')
+        mock_minver.return_value = 0
+        api = compute_rpcapi.ComputeAPI()
+        for x in range(2):
+            api._determine_version_cap(mock.Mock())
+        mock_allcells.assert_not_called()
+        mock_minver.assert_has_calls([
+            mock.call(mock.ANY, 'nova-compute'),
+            mock.call(mock.ANY, 'nova-compute')])
+
+    @mock.patch('nova.objects.Service.get_minimum_version')
+    @mock.patch('nova.objects.service.get_minimum_version_all_cells')
+    def test_version_cap_all_cells(self, mock_allcells, mock_minver):
+        self.flags(connection='sqlite:///', group='api_database')
+        self.flags(compute='auto', group='upgrade_levels')
+        mock_allcells.return_value = 0
+        compute_rpcapi.ComputeAPI()._determine_version_cap(mock.Mock())
+        mock_allcells.assert_called_once_with(mock.ANY, ['nova-compute'])
+        mock_minver.assert_not_called()

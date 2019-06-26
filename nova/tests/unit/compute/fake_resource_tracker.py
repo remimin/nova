@@ -13,21 +13,20 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import fixtures
+
+
 from nova.compute import resource_tracker
-from nova import objects
 
 
 class FakeResourceTracker(resource_tracker.ResourceTracker):
     """Version without a DB requirement."""
 
-    def _create(self, context, values):
-        self._write_ext_resources(values)
-        self.compute_node = values
-        self.compute_node['id'] = 1
+    def _update(self, context, compute_node, startup=False):
+        pass
 
-    def _update(self, context, values, prune_stats=False):
-        self._write_ext_resources(values)
-        self.compute_node.update(values)
 
-    def _get_service(self, context):
-        return objects.Service(id=1)
+class RTMockMixin(object):
+    def _mock_rt(self, **kwargs):
+        return self.useFixture(fixtures.MockPatchObject(
+            self.compute, 'rt', **kwargs)).mock

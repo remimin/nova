@@ -22,23 +22,27 @@ EVENT_NAMES = [
     # VIF plugging notifications, tag is port_id
     'network-vif-plugged',
     'network-vif-unplugged',
+    'network-vif-deleted',
 
+    # Volume was extended for this instance, tag is volume_id
+    'volume-extended',
 ]
 
 EVENT_STATUSES = ['failed', 'completed', 'in-progress']
 
 
-# TODO(berrange): Remove NovaObjectDictCompat
-class InstanceExternalEvent(obj_base.NovaObject,
-                            obj_base.NovaObjectDictCompat):
+@obj_base.NovaObjectRegistry.register
+class InstanceExternalEvent(obj_base.NovaObject):
     # Version 1.0: Initial version
     #              Supports network-changed and vif-plugged
-    VERSION = '1.0'
+    # Version 1.1: adds network-vif-deleted event
+    # Version 1.2: adds volume-extended event
+    VERSION = '1.2'
 
     fields = {
         'instance_uuid': fields.UUIDField(),
-        'name': fields.StringField(),
-        'status': fields.StringField(),
+        'name': fields.EnumField(valid_values=EVENT_NAMES),
+        'status': fields.EnumField(valid_values=EVENT_STATUSES),
         'tag': fields.StringField(nullable=True),
         'data': fields.DictOfStringsField(),
         }

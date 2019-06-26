@@ -13,6 +13,7 @@
 .project
 .pydevproject
 .ropeproject
+.stestr/
 .testrepository/
 .tox
 .idea
@@ -20,16 +21,21 @@
 AUTHORS
 Authors
 build-stamp
+tags
 build/*
 CA/
 ChangeLog
 coverage.xml
 cover/*
-covhtml
+covhtml/*
 dist/*
 doc/source/api/*
 doc/build/*
+api-guide/build/*
+api-ref/build/*
 etc/nova/nova.conf.sample
+etc/nova/policy.yaml.sample
+etc/nova/policy.yaml.merged
 instances
 keeper
 keys
@@ -39,3 +45,8 @@ nosetests.xml
 nova/tests/cover/*
 nova/vcsversion.py
 tools/conf/nova.conf*
+doc/source/_static/nova.conf.sample
+doc/source/_static/nova.policy.yaml.sample
+
+ # Files created by releasenotes build
+releasenotes/build

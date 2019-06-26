@@ -28,6 +28,6 @@ class Driver(object):
         """Check whether the given member is up."""
         raise NotImplementedError()
 
-    def get_all(self, group_id):
-        """Returns ALL members of the given group."""
+    def updated_time(self, service_ref):
+        """Get the updated time"""
         raise NotImplementedError()

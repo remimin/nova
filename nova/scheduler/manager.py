@@ -19,72 +19,174 @@
 Scheduler Service
 """
 
-from oslo_config import cfg
+import collections
+
 from oslo_log import log as logging
 import oslo_messaging as messaging
 from oslo_serialization import jsonutils
-from oslo_utils import importutils
+from oslo_service import periodic_task
+import six
+from stevedore import driver
 
+import nova.conf
 from nova import exception
 from nova import manager
 from nova import objects
-from nova.openstack.common import periodic_task
+from nova.objects import host_mapping as host_mapping_obj
 from nova import quota
+from nova.scheduler.client import report
+from nova.scheduler import request_filter
+from nova.scheduler import utils
 
 
 LOG = logging.getLogger(__name__)
 
-scheduler_driver_opts = [
-    cfg.StrOpt('scheduler_driver',
-               default='nova.scheduler.filter_scheduler.FilterScheduler',
-               help='Default driver to use for the scheduler'),
-    cfg.IntOpt('scheduler_driver_task_period',
-               default=60,
-               help='How often (in seconds) to run periodic tasks in '
-                    'the scheduler driver of your choice. '
-                    'Please note this is likely to interact with the value '
-                    'of service_down_time, but exactly how they interact '
-                    'will depend on your choice of scheduler driver.'),
-]
-CONF = cfg.CONF
-CONF.register_opts(scheduler_driver_opts)
+CONF = nova.conf.CONF
 
 QUOTAS = quota.QUOTAS
+
+HOST_MAPPING_EXISTS_WARNING = False
 
 
 class SchedulerManager(manager.Manager):
     """Chooses a host to run instances on."""
 
-    target = messaging.Target(version='4.2')
+    target = messaging.Target(version='4.5')
+
+    _sentinel = object()
 
     def __init__(self, scheduler_driver=None, *args, **kwargs):
+        self.placement_client = report.SchedulerReportClient()
         if not scheduler_driver:
-            scheduler_driver = CONF.scheduler_driver
-        self.driver = importutils.import_object(scheduler_driver)
+            scheduler_driver = CONF.scheduler.driver
+        self.driver = driver.DriverManager(
+                "nova.scheduler.driver",
+                scheduler_driver,
+                invoke_on_load=True).driver
         super(SchedulerManager, self).__init__(service_name='scheduler',
                                                *args, **kwargs)
-        self.additional_endpoints.append(_SchedulerManagerV3Proxy(self))
 
-    @periodic_task.periodic_task
-    def _expire_reservations(self, context):
-        QUOTAS.expire(context)
+    @periodic_task.periodic_task(
+        spacing=CONF.scheduler.discover_hosts_in_cells_interval,
+        run_immediately=True)
+    def _discover_hosts_in_cells(self, context):
+        global HOST_MAPPING_EXISTS_WARNING
+        try:
+            host_mappings = host_mapping_obj.discover_hosts(context)
+            if host_mappings:
+                LOG.info('Discovered %(count)i new hosts: %(hosts)s',
+                         {'count': len(host_mappings),
+                          'hosts': ','.join(['%s:%s' % (hm.cell_mapping.name,
+                                                        hm.host)
+                                             for hm in host_mappings])})
+        except exception.HostMappingExists as exp:
+            msg = ('This periodic task should only be enabled on a single '
+                   'scheduler to prevent collisions between multiple '
+                   'schedulers: %s' % six.text_type(exp))
+            if not HOST_MAPPING_EXISTS_WARNING:
+                LOG.warning(msg)
+                HOST_MAPPING_EXISTS_WARNING = True
+            else:
+                LOG.debug(msg)
 
-    @periodic_task.periodic_task(spacing=CONF.scheduler_driver_task_period,
+    @periodic_task.periodic_task(spacing=CONF.scheduler.periodic_task_interval,
                                  run_immediately=True)
     def _run_periodic_tasks(self, context):
         self.driver.run_periodic_tasks(context)
 
-    @messaging.expected_exceptions(exception.NoValidHost)
-    def select_destinations(self, context, request_spec, filter_properties):
-        """Returns destinations(s) best suited for this request_spec and
-        filter_properties.
+    def reset(self):
+        # NOTE(tssurya): This is a SIGHUP handler which will reset the cells
+        # and enabled cells caches in the host manager. So every time an
+        # existing cell is disabled or enabled or a new cell is created, a
+        # SIGHUP signal has to be sent to the scheduler for proper scheduling.
+        self.driver.host_manager.refresh_cells_caches()
 
-        The result should be a list of dicts with 'host', 'nodename' and
-        'limits' as keys.
+    @messaging.expected_exceptions(exception.NoValidHost)
+    def select_destinations(self, ctxt, request_spec=None,
+            filter_properties=None, spec_obj=_sentinel, instance_uuids=None,
+            return_objects=False, return_alternates=False):
+        """Returns destinations(s) best suited for this RequestSpec.
+
+        Starting in Queens, this method returns a list of lists of Selection
+        objects, with one list for each requested instance. Each instance's
+        list will have its first element be the Selection object representing
+        the chosen host for the instance, and if return_alternates is True,
+        zero or more alternate objects that could also satisfy the request. The
+        number of alternates is determined by the configuration option
+        `CONF.scheduler.max_attempts`.
+
+        The ability of a calling method to handle this format of returned
+        destinations is indicated by a True value in the parameter
+        `return_objects`. However, there may still be some older conductors in
+        a deployment that have not been updated to Queens, and in that case
+        return_objects will be False, and the result will be a list of dicts
+        with 'host', 'nodename' and 'limits' as keys. When return_objects is
+        False, the value of return_alternates has no effect. The reason there
+        are two kwarg parameters return_objects and return_alternates is so we
+        can differentiate between callers that understand the Selection object
+        format but *don't* want to get alternate hosts, as is the case with the
+        conductors that handle certain move operations.
         """
-        dests = self.driver.select_destinations(context, request_spec,
-            filter_properties)
-        return jsonutils.to_primitive(dests)
+        LOG.debug("Starting to schedule for instances: %s", instance_uuids)
+
+        # TODO(sbauza): Change the method signature to only accept a spec_obj
+        # argument once API v5 is provided.
+        if spec_obj is self._sentinel:
+            spec_obj = objects.RequestSpec.from_primitives(ctxt,
+                                                           request_spec,
+                                                           filter_properties)
+
+        is_rebuild = utils.request_is_rebuild(spec_obj)
+        alloc_reqs_by_rp_uuid, provider_summaries, allocation_request_version \
+            = None, None, None
+        if self.driver.USES_ALLOCATION_CANDIDATES and not is_rebuild:
+            # Only process the Placement request spec filters when Placement
+            # is used.
+            try:
+                request_filter.process_reqspec(ctxt, spec_obj)
+            except exception.RequestFilterFailed as e:
+                raise exception.NoValidHost(reason=e.message)
+
+            resources = utils.resources_from_request_spec(
+                ctxt, spec_obj, self.driver.host_manager)
+            res = self.placement_client.get_allocation_candidates(ctxt,
+                                                                  resources)
+            if res is None:
+                # We have to handle the case that we failed to connect to the
+                # Placement service and the safe_connect decorator on
+                # get_allocation_candidates returns None.
+                alloc_reqs, provider_summaries, allocation_request_version = (
+                        None, None, None)
+            else:
+                (alloc_reqs, provider_summaries,
+                            allocation_request_version) = res
+            if not alloc_reqs:
+                LOG.info("Got no allocation candidates from the Placement "
+                         "API. This could be due to insufficient resources "
+                         "or a temporary occurrence as compute nodes start "
+                         "up.")
+                raise exception.NoValidHost(reason="")
+            else:
+                # Build a dict of lists of allocation requests, keyed by
+                # provider UUID, so that when we attempt to claim resources for
+                # a host, we can grab an allocation request easily
+                alloc_reqs_by_rp_uuid = collections.defaultdict(list)
+                for ar in alloc_reqs:
+                    for rp_uuid in ar['allocations']:
+                        alloc_reqs_by_rp_uuid[rp_uuid].append(ar)
+
+        # Only return alternates if both return_objects and return_alternates
+        # are True.
+        return_alternates = return_alternates and return_objects
+        selections = self.driver.select_destinations(ctxt, spec_obj,
+                instance_uuids, alloc_reqs_by_rp_uuid, provider_summaries,
+                allocation_request_version, return_alternates)
+        # If `return_objects` is False, we need to convert the selections to
+        # the older format, which is a list of host state dicts.
+        if not return_objects:
+            selection_dicts = [sel[0].to_dict() for sel in selections]
+            return jsonutils.to_primitive(selection_dicts)
+        return selections
 
     def update_aggregates(self, ctxt, aggregates):
         """Updates HostManager internal aggregates information.
@@ -125,34 +227,3 @@ class SchedulerManager(manager.Manager):
         """
         self.driver.host_manager.sync_instance_info(context, host_name,
                                                     instance_uuids)
-
-
-class _SchedulerManagerV3Proxy(object):
-
-    target = messaging.Target(version='3.0')
-
-    def __init__(self, manager):
-        self.manager = manager
-
-    # NOTE(sbauza): Previous run_instance() and prep_resize() methods were
-    # removed from the Juno branch before Juno released, so we can safely
-    # remove them even from the V3.1 proxy as there is no Juno RPC client
-    # that can call them
-    @messaging.expected_exceptions(exception.NoValidHost)
-    def select_destinations(self, context, request_spec, filter_properties):
-        """Returns destinations(s) best suited for this request_spec and
-        filter_properties.
-
-        The result should be a list of dicts with 'host', 'nodename' and
-        'limits' as keys.
-        """
-        # TODO(melwitt): Remove this in version 4.0 of the RPC API
-        flavor = filter_properties.get('instance_type')
-        if flavor and not isinstance(flavor, objects.Flavor):
-            # Code downstream may expect extra_specs to be populated since it
-            # is receiving an object, so lookup the flavor to ensure this.
-            flavor = objects.Flavor.get_by_id(context, flavor['id'])
-            filter_properties = dict(filter_properties, instance_type=flavor)
-        dests = self.manager.select_destinations(context, request_spec,
-            filter_properties)
-        return dests

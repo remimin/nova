@@ -17,16 +17,22 @@
 Management class for host-related functions (start, reboot, etc).
 """
 
+from oslo_log import log as logging
 from oslo_utils import units
+from oslo_utils import versionutils
+from oslo_vmware import exceptions as vexc
 
-from nova.compute import arch
-from nova.compute import hv_type
-from nova.compute import vm_mode
+import nova.conf
+from nova import context
 from nova import exception
-from nova import utils
+from nova import objects
+from nova.objects import fields as obj_fields
 from nova.virt.vmwareapi import ds_util
 from nova.virt.vmwareapi import vim_util
 from nova.virt.vmwareapi import vm_util
+
+CONF = nova.conf.CONF
+LOG = logging.getLogger(__name__)
 
 
 def _get_ds_capacity_and_freespace(session, cluster=None,
@@ -40,9 +46,7 @@ def _get_ds_capacity_and_freespace(session, cluster=None,
 
 
 class VCState(object):
-    """Manages information about the VC host this compute
-    node is running on.
-    """
+    """Manages information about the vCenter cluster"""
     def __init__(self, session, host_name, cluster, datastore_regex):
         super(VCState, self).__init__()
         self._session = session
@@ -50,10 +54,15 @@ class VCState(object):
         self._cluster = cluster
         self._datastore_regex = datastore_regex
         self._stats = {}
+        self._auto_service_disabled = False
+        about_info = self._session._call_method(vim_util, "get_about_info")
+        self._hypervisor_type = about_info.name
+        self._hypervisor_version = versionutils.convert_version_to_int(
+                str(about_info.version))
         self.update_status()
 
     def get_host_stats(self, refresh=False):
-        """Return the current state of the host. If 'refresh' is
+        """Return the current state of the cluster. If 'refresh' is
         True, run the update first.
         """
         if refresh or not self._stats:
@@ -62,26 +71,49 @@ class VCState(object):
 
     def update_status(self):
         """Update the current state of the cluster."""
-        capacity, freespace = _get_ds_capacity_and_freespace(self._session,
-            self._cluster, self._datastore_regex)
-
-        # Get cpu, memory stats from the cluster
-        stats = vm_util.get_stats_from_cluster(self._session, self._cluster)
-        about_info = self._session._call_method(vim_util, "get_about_info")
         data = {}
-        data["vcpus"] = stats['vcpus']
+        try:
+            capacity, freespace = _get_ds_capacity_and_freespace(self._session,
+                self._cluster, self._datastore_regex)
+
+            # Get cpu, memory stats from the cluster
+            stats = vm_util.get_stats_from_cluster(self._session,
+                                                   self._cluster)
+        except (vexc.VimConnectionException, vexc.VimAttributeException) as ex:
+            # VimAttributeException is thrown when vpxd service is down
+            LOG.warning("Failed to connect with %(node)s. "
+                        "Error: %(error)s",
+                        {'node': self._host_name, 'error': ex})
+            self._set_host_enabled(False)
+            return data
+
+        data["vcpus"] = stats['cpu']['vcpus']
         data["disk_total"] = capacity / units.Gi
         data["disk_available"] = freespace / units.Gi
         data["disk_used"] = data["disk_total"] - data["disk_available"]
         data["host_memory_total"] = stats['mem']['total']
         data["host_memory_free"] = stats['mem']['free']
-        data["hypervisor_type"] = about_info.name
-        data["hypervisor_version"] = utils.convert_version_to_int(
-                str(about_info.version))
+        data["hypervisor_type"] = self._hypervisor_type
+        data["hypervisor_version"] = self._hypervisor_version
         data["hypervisor_hostname"] = self._host_name
         data["supported_instances"] = [
-            (arch.I686, hv_type.VMWARE, vm_mode.HVM),
-            (arch.X86_64, hv_type.VMWARE, vm_mode.HVM)]
+            (obj_fields.Architecture.I686,
+             obj_fields.HVType.VMWARE,
+             obj_fields.VMMode.HVM),
+            (obj_fields.Architecture.X86_64,
+             obj_fields.HVType.VMWARE,
+             obj_fields.VMMode.HVM)]
 
         self._stats = data
+        if self._auto_service_disabled:
+            self._set_host_enabled(True)
         return data
+
+    def _set_host_enabled(self, enabled):
+        """Sets the compute host's ability to accept new instances."""
+        ctx = context.get_admin_context()
+        service = objects.Service.get_by_compute_host(ctx, CONF.host)
+        service.disabled = not enabled
+        service.disabled_reason = 'set by vmwareapi host_state'
+        service.save()
+        self._auto_service_disabled = service.disabled

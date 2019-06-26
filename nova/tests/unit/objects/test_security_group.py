@@ -12,7 +12,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from nova import db
+import mock
+from oslo_utils.fixture import uuidsentinel as uuids
+from oslo_versionedobjects import fixture as ovo_fixture
+
+from nova.db import api as db
 from nova.objects import instance
 from nova.objects import security_group
 from nova.tests.unit.objects import test_objects
@@ -36,76 +40,96 @@ class _TestSecurityGroupObject(object):
         # NOTE(danms): Account for the difference in 'deleted'
         return dict(db_secgroup.items(), deleted=False)
 
-    def test_get(self):
-        self.mox.StubOutWithMock(db, 'security_group_get')
-        db.security_group_get(self.context, 1).AndReturn(fake_secgroup)
-        self.mox.ReplayAll()
+    @mock.patch.object(db, 'security_group_get',
+                       return_value=fake_secgroup)
+    def test_get(self, mock_get):
         secgroup = security_group.SecurityGroup.get(self.context, 1)
-        self.assertEqual(self._fix_deleted(fake_secgroup),
-                         dict(secgroup.items()))
+        ovo_fixture.compare_obj(self, secgroup,
+                                self._fix_deleted(fake_secgroup))
         self.assertEqual(secgroup.obj_what_changed(), set())
-        self.assertRemotes()
+        mock_get.assert_called_once_with(self.context, 1)
 
-    def test_get_by_name(self):
-        self.mox.StubOutWithMock(db, 'security_group_get_by_name')
-        db.security_group_get_by_name(self.context, 'fake-project',
-                                      'fake-name').AndReturn(fake_secgroup)
-        self.mox.ReplayAll()
+    @mock.patch.object(db, 'security_group_get_by_name',
+                       return_value=fake_secgroup)
+    def test_get_by_name(self, mock_get):
         secgroup = security_group.SecurityGroup.get_by_name(self.context,
                                                             'fake-project',
                                                             'fake-name')
-        self.assertEqual(self._fix_deleted(fake_secgroup),
-                         dict(secgroup.items()))
+        ovo_fixture.compare_obj(self, secgroup,
+                                self._fix_deleted(fake_secgroup))
         self.assertEqual(secgroup.obj_what_changed(), set())
-        self.assertRemotes()
+        mock_get.assert_called_once_with(self.context,
+                                         'fake-project',
+                                         'fake-name')
 
-    def test_in_use(self):
-        self.mox.StubOutWithMock(db, 'security_group_in_use')
-        db.security_group_in_use(self.context, 123).AndReturn(True)
-        self.mox.ReplayAll()
+    @mock.patch.object(db, 'security_group_in_use',
+                       return_value=True)
+    def test_in_use(self, mock_inuse):
         secgroup = security_group.SecurityGroup(context=self.context)
         secgroup.id = 123
         self.assertTrue(secgroup.in_use())
-        self.assertRemotes()
+        mock_inuse.assert_called_once_with(self.context, 123)
 
-    def test_save(self):
-        self.mox.StubOutWithMock(db, 'security_group_update')
+    @mock.patch.object(db, 'security_group_update')
+    def test_save(self, mock_update):
         updated_secgroup = dict(fake_secgroup, project_id='changed')
-        db.security_group_update(self.context, 1,
-                                 {'description': 'foobar'}).AndReturn(
-                                     updated_secgroup)
-        self.mox.ReplayAll()
+        mock_update.return_value = updated_secgroup
         secgroup = security_group.SecurityGroup._from_db_object(
             self.context, security_group.SecurityGroup(),
             fake_secgroup)
         secgroup.description = 'foobar'
         secgroup.save()
-        self.assertEqual(self._fix_deleted(updated_secgroup),
-                         dict(secgroup.items()))
+        ovo_fixture.compare_obj(self, secgroup,
+                                self._fix_deleted(updated_secgroup))
         self.assertEqual(secgroup.obj_what_changed(), set())
-        self.assertRemotes()
+        mock_update.assert_called_once_with(self.context, 1,
+                                            {'description': 'foobar'})
 
-    def test_save_no_changes(self):
-        self.mox.StubOutWithMock(db, 'security_group_update')
-        self.mox.ReplayAll()
+    @mock.patch.object(db, 'security_group_update')
+    def test_save_no_changes(self, mock_update):
         secgroup = security_group.SecurityGroup._from_db_object(
             self.context, security_group.SecurityGroup(),
             fake_secgroup)
         secgroup.save()
+        self.assertFalse(mock_update.called)
 
-    def test_refresh(self):
+    @mock.patch.object(db, 'security_group_get')
+    def test_refresh(self, mock_get):
         updated_secgroup = dict(fake_secgroup, description='changed')
-        self.mox.StubOutWithMock(db, 'security_group_get')
-        db.security_group_get(self.context, 1).AndReturn(updated_secgroup)
-        self.mox.ReplayAll()
+        mock_get.return_value = updated_secgroup
         secgroup = security_group.SecurityGroup._from_db_object(
             self.context, security_group.SecurityGroup(self.context),
             fake_secgroup)
         secgroup.refresh()
-        self.assertEqual(self._fix_deleted(updated_secgroup),
-                         dict(secgroup.items()))
+        ovo_fixture.compare_obj(self, secgroup,
+                                self._fix_deleted(updated_secgroup))
         self.assertEqual(secgroup.obj_what_changed(), set())
-        self.assertRemotes()
+        mock_get.assert_called_once_with(self.context, 1)
+
+    @mock.patch.object(db, 'security_group_update')
+    def test_with_uuid(self, mock_db_update):
+        """Tests that we can set a uuid but not save it and it's removed when
+        backporting to an older version of the object.
+        """
+        # Test set/get.
+        secgroup = security_group.SecurityGroup(
+            self.context, uuid=uuids.neutron_id)
+        self.assertEqual(uuids.neutron_id, secgroup.uuid)
+        # Test backport.
+        primitive = secgroup.obj_to_primitive(target_version='1.2')
+        self.assertIn('uuid', primitive['nova_object.data'])
+        primitive = secgroup.obj_to_primitive(target_version='1.1')
+        self.assertNotIn('uuid', primitive['nova_object.data'])
+        # Make sure the uuid is still set before we save().
+        self.assertIn('uuid', secgroup)
+        secgroup.save()
+        self.assertFalse(mock_db_update.called)
+
+    def test_identifier(self):
+        secgroup = security_group.SecurityGroup(name='foo')
+        self.assertEqual('foo', secgroup.identifier)
+        secgroup.uuid = uuids.secgroup
+        self.assertEqual(uuids.secgroup, secgroup.identifier)
 
 
 class TestSecurityGroupObject(test_objects._LocalTest,
@@ -125,47 +149,43 @@ fake_secgroups = [
 
 
 class _TestSecurityGroupListObject(object):
-    def test_get_all(self):
-        self.mox.StubOutWithMock(db, 'security_group_get_all')
-        db.security_group_get_all(self.context).AndReturn(fake_secgroups)
-        self.mox.ReplayAll()
+    @mock.patch.object(db, 'security_group_get_all',
+                       return_value=fake_secgroups)
+    def test_get_all(self, mock_get):
         secgroup_list = security_group.SecurityGroupList.get_all(self.context)
         for i in range(len(fake_secgroups)):
             self.assertIsInstance(secgroup_list[i],
                                   security_group.SecurityGroup)
             self.assertEqual(fake_secgroups[i]['id'],
-                             secgroup_list[i]['id'])
+                             secgroup_list[i].id)
             self.assertEqual(secgroup_list[i]._context, self.context)
+            mock_get.assert_called_once_with(self.context)
 
-    def test_get_by_project(self):
-        self.mox.StubOutWithMock(db, 'security_group_get_by_project')
-        db.security_group_get_by_project(self.context,
-                                         'fake-project').AndReturn(
-                                             fake_secgroups)
-        self.mox.ReplayAll()
+    @mock.patch.object(db, 'security_group_get_by_project',
+                       return_value=fake_secgroups)
+    def test_get_by_project(self, mock_get):
         secgroup_list = security_group.SecurityGroupList.get_by_project(
             self.context, 'fake-project')
         for i in range(len(fake_secgroups)):
             self.assertIsInstance(secgroup_list[i],
                                   security_group.SecurityGroup)
             self.assertEqual(fake_secgroups[i]['id'],
-                             secgroup_list[i]['id'])
+                             secgroup_list[i].id)
+        mock_get.assert_called_once_with(self.context, 'fake-project')
 
-    def test_get_by_instance(self):
+    @mock.patch.object(db, 'security_group_get_by_instance',
+                       return_value=fake_secgroups)
+    def test_get_by_instance(self, mock_get):
         inst = instance.Instance()
-        inst.uuid = 'fake-inst-uuid'
-        self.mox.StubOutWithMock(db, 'security_group_get_by_instance')
-        db.security_group_get_by_instance(self.context,
-                                          'fake-inst-uuid').AndReturn(
-                                              fake_secgroups)
-        self.mox.ReplayAll()
+        inst.uuid = uuids.instance
         secgroup_list = security_group.SecurityGroupList.get_by_instance(
             self.context, inst)
         for i in range(len(fake_secgroups)):
             self.assertIsInstance(secgroup_list[i],
                                   security_group.SecurityGroup)
             self.assertEqual(fake_secgroups[i]['id'],
-                             secgroup_list[i]['id'])
+                             secgroup_list[i].id)
+        mock_get.assert_called_once_with(self.context, inst.uuid)
 
 
 class TestSecurityGroupListObject(test_objects._LocalTest,

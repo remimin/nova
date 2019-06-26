@@ -13,11 +13,10 @@
 #    under the License.
 
 import mock
-from mox3 import mox
 
 from nova.compute import manager as compute_manager
 from nova import context
-from nova import db
+from nova.db import api as db
 from nova import exception
 from nova import objects
 from nova import test
@@ -42,9 +41,6 @@ class VirtAPIBaseTest(test.NoDBTestCase, test.APICoverage):
                           getattr(self.virtapi, method), self.context,
                           *args, **kwargs)
 
-    def test_provider_fw_rule_get_all(self):
-        self.assertExpected('provider_fw_rule_get_all')
-
     def test_wait_for_instance_event(self):
         self.assertExpected('wait_for_instance_event',
                             'instance', ['event'])
@@ -65,8 +61,6 @@ class FakeVirtAPITest(VirtAPIBaseTest):
             self.assertTrue(run)
             return
 
-        self.mox.StubOutWithMock(db, method)
-
         if method in ('aggregate_metadata_add', 'aggregate_metadata_delete',
                       'security_group_rule_get_by_security_group'):
             # NOTE(danms): FakeVirtAPI will convert the first argument to
@@ -77,17 +71,18 @@ class FakeVirtAPITest(VirtAPIBaseTest):
         else:
             e_args = args
 
-        getattr(db, method)(self.context, *e_args, **kwargs).AndReturn(
-                'it worked')
-        self.mox.ReplayAll()
-        result = getattr(self.virtapi, method)(self.context, *args, **kwargs)
-        self.assertEqual(result, 'it worked')
+        with mock.patch.object(db, method,
+                               return_value='it worked') as mock_call:
+            result = getattr(self.virtapi, method)(self.context, *args,
+                                                   **kwargs)
+            self.assertEqual('it worked', result)
+            mock_call.assert_called_once_with(self.context, *e_args, **kwargs)
 
 
 class FakeCompute(object):
     def __init__(self):
-        self.conductor_api = mox.MockAnything()
-        self.db = mox.MockAnything()
+        self.conductor_api = mock.MagicMock()
+        self.db = mock.MagicMock()
         self._events = []
         self.instance_events = mock.MagicMock()
         self.instance_events.prepare_for_instance_event.side_effect = \
@@ -98,10 +93,12 @@ class FakeCompute(object):
         event.status = 'completed'
         return event
 
-    def _prepare_for_instance_event(self, instance, event_name):
+    def _prepare_for_instance_event(self, instance, name, tag):
         m = mock.MagicMock()
         m.instance = instance
-        m.event_name = event_name
+        m.name = name
+        m.tag = tag
+        m.event_name = '%s-%s' % (name, tag)
         m.wait.side_effect = self._event_waiter
         self._events.append(m)
         return m
@@ -116,12 +113,12 @@ class ComputeVirtAPITest(VirtAPIBaseTest):
         self.virtapi = compute_manager.ComputeVirtAPI(self.compute)
 
     def assertExpected(self, method, *args, **kwargs):
-        self.mox.StubOutWithMock(self.compute.conductor_api, method)
-        getattr(self.compute.conductor_api, method)(
-            self.context, *args, **kwargs).AndReturn('it worked')
-        self.mox.ReplayAll()
-        result = getattr(self.virtapi, method)(self.context, *args, **kwargs)
-        self.assertEqual(result, 'it worked')
+        with mock.patch.object(self.compute.conductor_api,
+                               method, return_value='it worked') as mock_call:
+            result = getattr(self.virtapi, method)(self.context, *args,
+                                                   **kwargs)
+            self.assertEqual('it worked', result)
+            mock_call.assert_called_once_with(self.context, *args, **kwargs)
 
     def test_wait_for_instance_event(self):
         and_i_ran = ''
@@ -130,7 +127,7 @@ class ComputeVirtAPITest(VirtAPIBaseTest):
         event_2_tag = objects.InstanceExternalEvent.make_key(
             'event2', 'tag')
         events = {
-            'event1': event_1_tag,
+            ('event1', None): event_1_tag,
             ('event2', 'tag'): event_2_tag,
             }
         with self.virtapi.wait_for_instance_event('instance', events.keys()):
@@ -140,7 +137,7 @@ class ComputeVirtAPITest(VirtAPIBaseTest):
         self.assertEqual(2, len(self.compute._events))
         for event in self.compute._events:
             self.assertEqual('instance', event.instance)
-            self.assertIn(event.event_name, events.values())
+            self.assertIn((event.name, event.tag), events.keys())
             event.wait.assert_called_once_with()
 
     def test_wait_for_instance_event_failed(self):
@@ -151,7 +148,8 @@ class ComputeVirtAPITest(VirtAPIBaseTest):
 
         @mock.patch.object(self.virtapi._compute, '_event_waiter', _failer)
         def do_test():
-            with self.virtapi.wait_for_instance_event('instance', ['foo']):
+            with self.virtapi.wait_for_instance_event('instance',
+                                                      [('foo', 'bar')]):
                 pass
 
         self.assertRaises(exception.NovaException, do_test)
@@ -165,7 +163,8 @@ class ComputeVirtAPITest(VirtAPIBaseTest):
         @mock.patch.object(self.virtapi._compute, '_event_waiter', _failer)
         def do_test():
             callback = mock.MagicMock()
-            with self.virtapi.wait_for_instance_event('instance', ['foo'],
+            with self.virtapi.wait_for_instance_event('instance',
+                                                      [('foo', None)],
                                                       error_callback=callback):
                 pass
             callback.assert_called_with('foo', 'instance')
@@ -173,16 +172,12 @@ class ComputeVirtAPITest(VirtAPIBaseTest):
         do_test()
 
     def test_wait_for_instance_event_timeout(self):
-        class TestException(Exception):
-            pass
-
-        def _failer():
-            raise TestException()
-
-        @mock.patch.object(self.virtapi._compute, '_event_waiter', _failer)
+        @mock.patch.object(self.virtapi._compute, '_event_waiter',
+                           side_effect=test.TestingException())
         @mock.patch('eventlet.timeout.Timeout')
-        def do_test(timeout):
-            with self.virtapi.wait_for_instance_event('instance', ['foo']):
+        def do_test(mock_timeout, mock_waiter):
+            with self.virtapi.wait_for_instance_event('instance',
+                                                      [('foo', 'bar')]):
                 pass
 
-        self.assertRaises(TestException, do_test)
+        self.assertRaises(test.TestingException, do_test)

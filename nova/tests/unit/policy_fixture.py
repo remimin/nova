@@ -15,15 +15,16 @@
 import os
 
 import fixtures
-from oslo_config import cfg
+from oslo_policy import policy as oslo_policy
 from oslo_serialization import jsonutils
 
-from nova.openstack.common import policy as common_policy
-from nova import paths
+import nova.conf
+from nova.conf import paths
+from nova import policies
 import nova.policy
 from nova.tests.unit import fake_policy
 
-CONF = cfg.CONF
+CONF = nova.conf.CONF
 
 
 class RealPolicyFixture(fixtures.Fixture):
@@ -47,15 +48,30 @@ class RealPolicyFixture(fixtures.Fixture):
         # policy_file can be overridden by subclasses
         self.policy_file = paths.state_path_def('etc/nova/policy.json')
         self._prepare_policy()
-        CONF.set_override('policy_file', self.policy_file)
+        CONF.set_override('policy_file', self.policy_file, group='oslo_policy')
         nova.policy.reset()
         nova.policy.init()
         self.addCleanup(nova.policy.reset)
 
-    def set_rules(self, rules):
+    def set_rules(self, rules, overwrite=True):
         policy = nova.policy._ENFORCER
-        policy.set_rules({k: common_policy.parse_rule(v)
-                          for k, v in rules.items()})
+        policy.set_rules(oslo_policy.Rules.from_dict(rules),
+                         overwrite=overwrite)
+
+    def add_missing_default_rules(self, rules):
+        """Adds default rules and their values to the given rules dict.
+
+        The given rulen dict may have an incomplete set of policy rules.
+        This method will add the default policy rules and their values to
+        the dict. It will not override the existing rules.
+        """
+
+        for rule in policies.list_rules():
+            # NOTE(lbragstad): Only write the rule if it isn't already in the
+            # rule set and if it isn't deprecated. Otherwise we're just going
+            # to spam test runs with deprecate policy warnings.
+            if rule.name not in rules and not rule.deprecated_for_removal:
+                rules[rule.name] = rule.check_str
 
 
 class PolicyFixture(RealPolicyFixture):
@@ -77,21 +93,22 @@ class PolicyFixture(RealPolicyFixture):
         self.policy_dir = self.useFixture(fixtures.TempDir())
         self.policy_file = os.path.join(self.policy_dir.path,
                                         'policy.json')
+
+        # load the fake_policy data and add the missing default rules.
+        policy_rules = jsonutils.loads(fake_policy.policy_data)
+        self.add_missing_default_rules(policy_rules)
         with open(self.policy_file, 'w') as f:
-            f.write(fake_policy.policy_data)
-        CONF.set_override('policy_dirs', [])
+            jsonutils.dump(policy_rules, f)
+        CONF.set_override('policy_dirs', [], group='oslo_policy')
 
 
 class RoleBasedPolicyFixture(RealPolicyFixture):
-    """Load a modified policy which allows all actions only be a single roll.
+    """Load a modified policy which allows all actions only by a single role.
 
     This fixture can be used for testing role based permissions as it
     provides a version of the policy which stomps over all previous
     declaration and makes every action only available to a single
     role.
-
-    NOTE(sdague): we could probably do this simpler by only loading a
-    single default rule.
 
     """
 
@@ -100,14 +117,12 @@ class RoleBasedPolicyFixture(RealPolicyFixture):
         self.role = role
 
     def _prepare_policy(self):
-        policy = jsonutils.load(open(CONF.policy_file))
-
-        # Convert all actions to require specified role
-        for action, rule in policy.iteritems():
-            policy[action] = 'role:%s' % self.role
+        # Convert all actions to require the specified role
+        policy = {}
+        for rule in policies.list_rules():
+            policy[rule.name] = 'role:%s' % self.role
 
         self.policy_dir = self.useFixture(fixtures.TempDir())
-        self.policy_file = os.path.join(self.policy_dir.path,
-                                            'policy.json')
+        self.policy_file = os.path.join(self.policy_dir.path, 'policy.json')
         with open(self.policy_file, 'w') as f:
             jsonutils.dump(policy, f)

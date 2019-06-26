@@ -14,7 +14,6 @@
 #    under the License.
 
 import copy
-import os
 
 from nova.api.openstack import common
 
@@ -28,6 +27,7 @@ class ViewBuilder(common.ViewBuilder):
 
     def __init__(self, base_url):
         """:param base_url: url of the root wsgi application."""
+        self.prefix = self._update_compute_link_prefix(base_url)
         self.base_url = base_url
 
     def build_choices(self, VERSIONS, req):
@@ -55,6 +55,8 @@ class ViewBuilder(common.ViewBuilder):
             version_objs.append({
                 "id": version['id'],
                 "status": version['status'],
+                "version": version['version'],
+                "min_version": version['min_version'],
                 "updated": version['updated'],
                 "links": self._build_links(version),
             })
@@ -65,7 +67,7 @@ class ViewBuilder(common.ViewBuilder):
         reval = copy.deepcopy(version)
         reval['links'].insert(0, {
             "rel": "self",
-            "href": self.base_url.rstrip('/') + '/',
+            "href": self.prefix.rstrip('/') + '/',
         })
         return dict(version=reval)
 
@@ -84,14 +86,10 @@ class ViewBuilder(common.ViewBuilder):
 
     def generate_href(self, version, path=None):
         """Create an url that refers to a specific version_number."""
-        prefix = self._update_compute_link_prefix(self.base_url)
         if version.find('v2.1') == 0:
             version_number = 'v2.1'
         else:
             version_number = 'v2'
 
-        if path:
-            path = path.strip('/')
-            return os.path.join(prefix, version_number, path)
-        else:
-            return os.path.join(prefix, version_number) + '/'
+        path = path or ''
+        return common.url_join(self.prefix, version_number, path)

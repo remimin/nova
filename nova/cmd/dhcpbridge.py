@@ -22,28 +22,23 @@ from __future__ import print_function
 
 import os
 import sys
-import traceback
 
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import importutils
 
+from nova.cmd import common as cmd_common
 from nova.conductor import rpcapi as conductor_rpcapi
+import nova.conf
 from nova import config
 from nova import context
-import nova.db.api
-from nova import exception
-from nova.i18n import _LE
 from nova.network import rpcapi as network_rpcapi
 from nova import objects
 from nova.objects import base as objects_base
 from nova import rpc
 
-CONF = cfg.CONF
-CONF.import_opt('host', 'nova.netconf')
-CONF.import_opt('network_manager', 'nova.service')
-CONF.import_opt('use_local', 'nova.conductor.api', group='conductor')
+CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
 
 
@@ -65,7 +60,7 @@ def del_lease(mac, ip_address):
     """Called when a lease expires."""
     api = network_rpcapi.NetworkAPI()
     api.release_fixed_ip(context.get_admin_context(), ip_address,
-                         CONF.host)
+                         CONF.host, mac)
 
 
 def init_leases(network_id):
@@ -77,18 +72,23 @@ def init_leases(network_id):
 
 
 def add_action_parsers(subparsers):
-    parser = subparsers.add_parser('init')
+    subparsers.add_parser('init')
 
     # NOTE(cfb): dnsmasq always passes mac, and ip. hostname
     #            is passed if known. We don't care about
     #            hostname, but argparse will complain if we
     #            do not accept it.
-    for action in ['add', 'del', 'old']:
+    actions = {
+        'add': add_lease,
+        'del': del_lease,
+        'old': old_lease,
+    }
+    for action, func in actions.items():
         parser = subparsers.add_parser(action)
         parser.add_argument('mac')
         parser.add_argument('ip')
         parser.add_argument('hostname', nargs='?', default='')
-        parser.set_defaults(func=globals()[action + '_lease'])
+        parser.set_defaults(func=func)
 
 
 CONF.register_cli_opt(
@@ -96,20 +96,6 @@ CONF.register_cli_opt(
                       title='Action options',
                       help='Available dhcpbridge options',
                       handler=add_action_parsers))
-
-
-def block_db_access():
-    class NoDB(object):
-        def __getattr__(self, attr):
-            return self
-
-        def __call__(self, *args, **kwargs):
-            stacktrace = "".join(traceback.format_stack())
-            LOG.error(_LE('No db access allowed in nova-dhcpbridge: %s'),
-                      stacktrace)
-            raise exception.DBNotAllowed('nova-dhcpbridge')
-
-    nova.db.api.IMPL = NoDB()
 
 
 def main():
@@ -120,15 +106,21 @@ def main():
     logging.setup(CONF, "nova")
     global LOG
     LOG = logging.getLogger('nova.dhcpbridge')
+
+    if CONF.action.name == 'old':
+        # NOTE(sdague): old is the most frequent message sent, and
+        # it's a noop. We should just exit immediately otherwise we
+        # can stack up a bunch of requests in dnsmasq. A SIGHUP seems
+        # to dump this list, so actions queued up get lost.
+        return
+
     objects.register_all()
 
-    if not CONF.conductor.use_local:
-        block_db_access()
-        objects_base.NovaObject.indirection_api = \
-            conductor_rpcapi.ConductorAPI()
+    cmd_common.block_db_access('nova-dhcpbridge')
+    objects_base.NovaObject.indirection_api = conductor_rpcapi.ConductorAPI()
 
-    if CONF.action.name in ['add', 'del', 'old']:
-        LOG.debug("Called '%(action)s' for mac '%(mac)s' with ip '%(ip)s'",
+    if CONF.action.name in ['add', 'del']:
+        LOG.debug("Called '%(action)s' for mac '%(mac)s' with IP '%(ip)s'",
                   {"action": CONF.action.name,
                    "mac": CONF.action.mac,
                    "ip": CONF.action.ip})
@@ -137,8 +129,8 @@ def main():
         try:
             network_id = int(os.environ.get('NETWORK_ID'))
         except TypeError:
-            LOG.error(_LE("Environment variable 'NETWORK_ID' must be set."))
-            return(1)
+            LOG.error("Environment variable 'NETWORK_ID' must be set.")
+            return 1
 
         print(init_leases(network_id))
 

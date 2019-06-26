@@ -19,23 +19,33 @@ import sys
 
 from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_reports import guru_meditation_report as gmr
+from oslo_reports import opts as gmr_opts
 
 from nova import config
-from nova.openstack.common.report import guru_meditation_report as gmr
+from nova.console import rpcapi as console_rpcapi
+from nova import objects
 from nova import service
 from nova import version
 
 CONF = cfg.CONF
-CONF.import_opt('console_topic', 'nova.console.rpcapi')
+LOG = logging.getLogger('nova.console')
 
 
 def main():
     config.parse_args(sys.argv)
     logging.setup(CONF, "nova")
+    objects.register_all()
+    gmr_opts.set_defaults(CONF)
 
-    gmr.TextGuruMeditation.setup_autorun(version)
+    gmr.TextGuruMeditation.setup_autorun(version, conf=CONF)
+
+    LOG.warning('The nova-console service is deprecated as it is Xen '
+                'specific, does not function properly in a multi-cell '
+                'environment, and has effectively been replaced by noVNC '
+                'and the nova-novncproxy service.')
 
     server = service.Service.create(binary='nova-console',
-                                    topic=CONF.console_topic)
+                                    topic=console_rpcapi.RPC_TOPIC)
     service.serve(server)
     service.wait()

@@ -20,56 +20,16 @@ except ImportError:
 
 import time
 
-from oslo_config import cfg
 from oslo_log import log as logging
 
+import nova.conf
 from nova import exception
-from nova.i18n import _, _LW
+from nova.i18n import _
 from nova.network import dns_driver
 from nova import utils
 
-CONF = cfg.CONF
+CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
-
-ldap_dns_opts = [
-    cfg.StrOpt('ldap_dns_url',
-               default='ldap://ldap.example.com:389',
-               help='URL for LDAP server which will store DNS entries'),
-    cfg.StrOpt('ldap_dns_user',
-               default='uid=admin,ou=people,dc=example,dc=org',
-               help='User for LDAP DNS'),
-    cfg.StrOpt('ldap_dns_password',
-               default='password',
-               help='Password for LDAP DNS',
-               secret=True),
-    cfg.StrOpt('ldap_dns_soa_hostmaster',
-               default='hostmaster@example.org',
-               help='Hostmaster for LDAP DNS driver Statement of Authority'),
-    cfg.MultiStrOpt('ldap_dns_servers',
-                    default=['dns.example.org'],
-                    help='DNS Servers for LDAP DNS driver'),
-    cfg.StrOpt('ldap_dns_base_dn',
-               default='ou=hosts,dc=example,dc=org',
-               help='Base DN for DNS entries in LDAP'),
-    cfg.StrOpt('ldap_dns_soa_refresh',
-               default='1800',
-               help='Refresh interval (in seconds) for LDAP DNS driver '
-                    'Statement of Authority'),
-    cfg.StrOpt('ldap_dns_soa_retry',
-               default='3600',
-               help='Retry interval (in seconds) for LDAP DNS driver '
-                    'Statement of Authority'),
-    cfg.StrOpt('ldap_dns_soa_expiry',
-               default='86400',
-               help='Expiry interval (in seconds) for LDAP DNS driver '
-                    'Statement of Authority'),
-    cfg.StrOpt('ldap_dns_soa_minimum',
-               default='7200',
-               help='Minimum interval (in seconds) for LDAP DNS driver '
-                    'Statement of Authority'),
-    ]
-
-CONF.register_opts(ldap_dns_opts)
 
 
 # Importing ldap.modlist breaks the tests for some reason,
@@ -105,8 +65,8 @@ class DNSEntry(object):
         if not entry:
             return None
         if len(entry) > 1:
-            LOG.warning(_LW("Found multiple matches for domain "
-                            "%(domain)s.\n%(entry)s"),
+            LOG.warning("Found multiple matches for domain "
+                        "%(domain)s.\n%(entry)s",
                         domain, entry)
         return entry[0]
 
@@ -132,8 +92,8 @@ class DNSEntry(object):
         if name.endswith(z):
             dequalified = name[0:name.rfind(z)]
         else:
-            LOG.warning(_LW("Unable to dequalify.  %(name)s is not in "
-                            "%(domain)s.\n"),
+            LOG.warning("Unable to dequalify.  %(name)s is not in "
+                        "%(domain)s.\n",
                         {'name': name,
                          'domain': self.qualified_domain})
             dequalified = None
@@ -154,7 +114,7 @@ class DomainEntry(DNSEntry):
     @classmethod
     def _soa(cls):
         date = time.strftime('%Y%m%d%H%M%S')
-        soa = '%s %s %s %s %s %s %s' % (
+        soa = '%s %s %s %d %d %d %d' % (
                  CONF.ldap_dns_servers[0],
                  CONF.ldap_dns_soa_hostmaster,
                  date,
@@ -373,6 +333,5 @@ class LdapDNS(dns_driver.DNSDriver):
         dEntry.delete()
 
     def delete_dns_file(self):
-        LOG.warning(_LW("This shouldn't be getting called except during "
-                        "testing."))
+        LOG.warning("This shouldn't be getting called except during testing.")
         pass

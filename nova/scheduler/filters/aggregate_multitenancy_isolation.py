@@ -28,7 +28,9 @@ class AggregateMultiTenancyIsolation(filters.BaseHostFilter):
     # Aggregate data and tenant do not change within a request
     run_filter_once_per_request = True
 
-    def host_passes(self, host_state, filter_properties):
+    RUN_ON_REBUILD = False
+
+    def host_passes(self, host_state, spec_obj):
         """If a host is in an aggregate that has the metadata key
         "filter_tenant_id" it can only create instances from that tenant(s).
         A host can be in different aggregates.
@@ -36,15 +38,18 @@ class AggregateMultiTenancyIsolation(filters.BaseHostFilter):
         If a host doesn't belong to an aggregate with the metadata key
         "filter_tenant_id" it can create instances from all tenants.
         """
-        spec = filter_properties.get('request_spec', {})
-        props = spec.get('instance_properties', {})
-        tenant_id = props.get('project_id')
+        tenant_id = spec_obj.project_id
 
         metadata = utils.aggregate_metadata_get_by_host(host_state,
                                                         key="filter_tenant_id")
 
         if metadata != {}:
-            if tenant_id not in metadata["filter_tenant_id"]:
-                LOG.debug("%s fails tenant id on aggregate", host_state)
-                return False
+            configured_tenant_ids = metadata.get("filter_tenant_id")
+            if configured_tenant_ids:
+                if tenant_id not in configured_tenant_ids:
+                    LOG.debug("%s fails tenant id on aggregate", host_state)
+                    return False
+                LOG.debug("Host tenant id %s matched", tenant_id)
+            else:
+                LOG.debug("No tenant id's defined on host. Host passes.")
         return True

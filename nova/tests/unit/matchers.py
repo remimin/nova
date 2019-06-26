@@ -16,11 +16,13 @@
 
 """Matcher classes to be used inside of the testtools assertThat framework."""
 
+import copy
 import pprint
-import StringIO
 
 from lxml import etree
+import six
 from testtools import content
+import testtools.matchers
 
 
 class DictKeysMismatch(object):
@@ -81,8 +83,8 @@ class DictMatches(object):
         d1keys = set(self.d1.keys())
         d2keys = set(d2.keys())
         if d1keys != d2keys:
-            d1only = d1keys - d2keys
-            d2only = d2keys - d1keys
+            d1only = sorted(d1keys - d2keys)
+            d2only = sorted(d2keys - d1keys)
             return DictKeysMismatch(d1only, d2only)
 
         for key in d1keys:
@@ -166,10 +168,10 @@ class SubDictMismatch(object):
         if self.keys:
             return "Keys between dictionaries did not match"
         else:
-            return("Dictionaries do not match at %s. d1: %s d2: %s"
-                   % (self.key,
-                      self.super_value,
-                      self.sub_value))
+            return ("Dictionaries do not match at %s. d1: %s d2: %s"
+                    % (self.key,
+                       self.super_value,
+                       self.sub_value))
 
     def get_details(self):
         return {}
@@ -338,7 +340,11 @@ class XMLUnexpectedChild(XMLMismatch):
 
 
 class XMLExpectedChild(XMLMismatch):
-    """Expected child not present in XML."""
+    """Expected child not present in XML.
+
+    idx indicates at which position the child was expected.
+    If idx is None, that indicates that strict ordering was not required.
+    """
 
     def __init__(self, state, tag, idx):
         super(XMLExpectedChild, self).__init__(state)
@@ -346,9 +352,15 @@ class XMLExpectedChild(XMLMismatch):
         self.idx = idx
 
     def describe(self):
-        return ("%(path)s: XML expected child element <%(tag)s> "
-                "not present at index %(idx)d" %
-                {'path': self.path, 'tag': self.tag, 'idx': self.idx})
+        s = ("%(path)s: XML expected child element <%(tag)s> "
+             "not present" %
+             {'path': self.path, 'tag': self.tag})
+        # If we are not requiring strict ordering then the child element
+        # can be expected at any index, so don't claim that it is expected
+        # at a particular one.
+        if self.idx is not None:
+            s += " at index %d" % self.idx
+        return s
 
 
 class XMLMatchState(object):
@@ -363,31 +375,30 @@ class XMLMatchState(object):
         self.expected = expected
         self.actual = actual
 
-    def __enter__(self):
-        pass
-
-    def __exit__(self, exc_type, exc_value, exc_tb):
-        self.path.pop()
-        return False
-
     def __str__(self):
         return '/' + '/'.join(self.path)
 
     def node(self, tag, idx):
-        """Adds tag and index to the path; they will be popped off when
-        the corresponding 'with' statement exits.
+        """Returns a new state based on the current one, with tag and idx
+        appended to the path.  We avoid appending in place and popping
+        on exit from the context of the comparison at this level in
+        the XML tree, because this would mutate state objects embedded
+        in XMLMismatch objects which are bubbled up through recursive
+        calls to _compare_nodes.  This would result in a misleading
+        error by the time the XMLMismatch object surfaced at the top
+        of the assertThat() part of the stack.
 
         :param tag: The element tag
         :param idx: If not None, the integer index of the element
                     within its parent.  Not included in the path
                     element if None.
         """
-
+        new_state = copy.deepcopy(self)
         if idx is not None:
-            self.path.append("%s[%d]" % (tag, idx))
+            new_state.path.append("%s[%d]" % (tag, idx))
         else:
-            self.path.append(tag)
-        return self
+            new_state.path.append(tag)
+        return new_state
 
 
 class XMLMatches(object):
@@ -395,10 +406,17 @@ class XMLMatches(object):
 
     SKIP_TAGS = (etree.Comment, etree.ProcessingInstruction)
 
+    @staticmethod
+    def _parse(text_or_bytes):
+        if isinstance(text_or_bytes, six.text_type):
+            text_or_bytes = text_or_bytes.encode("utf-8")
+        parser = etree.XMLParser(encoding="UTF-8")
+        return etree.parse(six.BytesIO(text_or_bytes), parser)
+
     def __init__(self, expected, allow_mixed_nodes=False,
                  skip_empty_text_nodes=True, skip_values=('DONTCARE',)):
         self.expected_xml = expected
-        self.expected = etree.parse(StringIO.StringIO(expected))
+        self.expected = self._parse(expected)
         self.allow_mixed_nodes = allow_mixed_nodes
         self.skip_empty_text_nodes = skip_empty_text_nodes
         self.skip_values = set(skip_values)
@@ -407,7 +425,7 @@ class XMLMatches(object):
         return 'XMLMatches(%r)' % self.expected_xml
 
     def match(self, actual_xml):
-        actual = etree.parse(StringIO.StringIO(actual_xml))
+        actual = self._parse(actual_xml)
 
         state = XMLMatchState(self.expected_xml, actual_xml)
         expected_doc_info = self._get_xml_docinfo(self.expected)
@@ -455,76 +473,111 @@ class XMLMatches(object):
         if expected.tag != actual.tag:
             return XMLTagMismatch(state, idx, expected.tag, actual.tag)
 
-        with state.node(expected.tag, idx):
-            # Compare the attribute keys
-            expected_attrs = set(expected.attrib.keys())
-            actual_attrs = set(actual.attrib.keys())
-            if expected_attrs != actual_attrs:
-                expected_only = expected_attrs - actual_attrs
-                actual_only = actual_attrs - expected_attrs
-                return XMLAttrKeysMismatch(state, expected_only, actual_only)
+        new_state = state.node(expected.tag, idx)
 
-            # Compare the attribute values
-            for key in expected_attrs:
-                expected_value = expected.attrib[key]
-                actual_value = actual.attrib[key]
+        # Compare the attribute keys
+        expected_attrs = set(expected.attrib.keys())
+        actual_attrs = set(actual.attrib.keys())
+        if expected_attrs != actual_attrs:
+            expected_only = expected_attrs - actual_attrs
+            actual_only = actual_attrs - expected_attrs
+            return XMLAttrKeysMismatch(new_state, expected_only, actual_only)
 
-                if self.skip_values.intersection(
-                        [expected_value, actual_value]):
-                    continue
-                elif expected_value != actual_value:
-                    return XMLAttrValueMismatch(state, key, expected_value,
-                                                actual_value)
+        # Compare the attribute values
+        for key in expected_attrs:
+            expected_value = expected.attrib[key]
+            actual_value = actual.attrib[key]
 
-            # Compare text nodes
-            text_nodes_mismatch = self._compare_text_nodes(
-                expected, actual, state)
-            if text_nodes_mismatch:
-                return text_nodes_mismatch
+            if self.skip_values.intersection(
+                    [expected_value, actual_value]):
+                continue
+            elif expected_value != actual_value:
+                return XMLAttrValueMismatch(new_state, key, expected_value,
+                                            actual_value)
 
-            # Compare the contents of the node
-            matched_actual_child_idxs = set()
-            # first_actual_child_idx - pointer to next actual child
-            # used with allow_mixed_nodes=False ONLY
-            # prevent to visit actual child nodes twice
-            first_actual_child_idx = 0
-            for expected_child in expected:
-                if expected_child.tag in self.SKIP_TAGS:
-                    continue
-                related_actual_child_idx = None
+        # Compare text nodes
+        text_nodes_mismatch = self._compare_text_nodes(
+            expected, actual, new_state)
+        if text_nodes_mismatch:
+            return text_nodes_mismatch
 
-                if self.allow_mixed_nodes:
-                    first_actual_child_idx = 0
-                for actual_child_idx in range(
-                        first_actual_child_idx, len(actual)):
-                    if actual[actual_child_idx].tag in self.SKIP_TAGS:
-                        first_actual_child_idx += 1
-                        continue
-                    if actual_child_idx in matched_actual_child_idxs:
-                        continue
-                    # Compare the nodes
-                    result = self._compare_node(expected_child,
-                                                actual[actual_child_idx],
-                                                state, actual_child_idx)
+        # Compare the contents of the node
+        matched_actual_child_idxs = set()
+        # first_actual_child_idx - pointer to next actual child
+        # used with allow_mixed_nodes=False ONLY
+        # prevent to visit actual child nodes twice
+        first_actual_child_idx = 0
+        result = None
+        for expected_child in expected:
+            if expected_child.tag in self.SKIP_TAGS:
+                continue
+            related_actual_child_idx = None
+
+            if self.allow_mixed_nodes:
+                first_actual_child_idx = 0
+            for actual_child_idx in range(
+                    first_actual_child_idx, len(actual)):
+                if actual[actual_child_idx].tag in self.SKIP_TAGS:
                     first_actual_child_idx += 1
-                    if result is not True:
-                        if self.allow_mixed_nodes:
-                            continue
-                        else:
-                            return result
-                    else:  # nodes match
-                        related_actual_child_idx = actual_child_idx
-                        break
-                if related_actual_child_idx is not None:
-                    matched_actual_child_idxs.add(actual_child_idx)
+                    continue
+                if actual_child_idx in matched_actual_child_idxs:
+                    continue
+                # Compare the nodes
+                result = self._compare_node(expected_child,
+                                            actual[actual_child_idx],
+                                            new_state, actual_child_idx)
+                first_actual_child_idx += 1
+                if result is not True:
+                    if self.allow_mixed_nodes:
+                        continue
+                    else:
+                        return result
+                else:  # nodes match
+                    related_actual_child_idx = actual_child_idx
+                    break
+            if related_actual_child_idx is not None:
+                matched_actual_child_idxs.add(actual_child_idx)
+            else:
+                if isinstance(result, XMLExpectedChild) or \
+                   isinstance(result, XMLUnexpectedChild):
+                    return result
+                if self.allow_mixed_nodes:
+                    expected_child_idx = None
                 else:
-                    return XMLExpectedChild(state, expected_child.tag,
-                                            actual_child_idx + 1)
-            # Make sure we consumed all nodes in actual
-            for actual_child_idx, actual_child in enumerate(actual):
-                if (actual_child.tag not in self.SKIP_TAGS and
-                        actual_child_idx not in matched_actual_child_idxs):
-                    return XMLUnexpectedChild(state, actual_child.tag,
-                                              actual_child_idx)
+                    expected_child_idx = first_actual_child_idx
+                return XMLExpectedChild(new_state, expected_child.tag,
+                                        expected_child_idx)
+        # Make sure we consumed all nodes in actual
+        for actual_child_idx, actual_child in enumerate(actual):
+            if (actual_child.tag not in self.SKIP_TAGS and
+                    actual_child_idx not in matched_actual_child_idxs):
+                return XMLUnexpectedChild(new_state, actual_child.tag,
+                                          actual_child_idx)
         # The nodes match
         return True
+
+
+class EncodedByUTF8(object):
+    def match(self, obj):
+        if isinstance(obj, six.binary_type):
+            if hasattr(obj, "decode"):
+                try:
+                    obj.decode("utf-8")
+                except UnicodeDecodeError:
+                    return testtools.matchers.Mismatch(
+                        "%s is not encoded in UTF-8." % obj)
+        elif isinstance(obj, six.text_type):
+            try:
+                obj.encode("utf-8", "strict")
+            except UnicodeDecodeError:
+                return testtools.matchers.Mismatch(
+                        "%s cannot be encoded in UTF-8." % obj)
+        else:
+            reason = ("Type of '%(obj)s' is '%(obj_type)s', "
+                      "should be '%(correct_type)s'."
+                      % {
+                          "obj": obj,
+                          "obj_type": type(obj).__name__,
+                          "correct_type": six.binary_type.__name__
+                      })
+            return testtools.matchers.Mismatch(reason)

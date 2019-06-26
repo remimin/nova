@@ -16,112 +16,140 @@
 """
 Management class for live migration VM operations.
 """
-import functools
 
-from oslo_config import cfg
+from os_win import utilsfactory
 from oslo_log import log as logging
 from oslo_utils import excutils
 
+import nova.conf
+from nova import exception
 from nova.i18n import _
+from nova.objects import migrate_data as migrate_data_obj
+from nova.virt.hyperv import block_device_manager
 from nova.virt.hyperv import imagecache
-from nova.virt.hyperv import utilsfactory
+from nova.virt.hyperv import pathutils
+from nova.virt.hyperv import serialconsoleops
 from nova.virt.hyperv import vmops
-from nova.virt.hyperv import vmutilsv2
 from nova.virt.hyperv import volumeops
 
 LOG = logging.getLogger(__name__)
-CONF = cfg.CONF
-CONF.import_opt('use_cow_images', 'nova.virt.driver')
-
-
-def check_os_version_requirement(function):
-    @functools.wraps(function)
-    def wrapper(self, *args, **kwds):
-        if not self._livemigrutils:
-            raise NotImplementedError(_('Live migration is supported '
-                                        'starting with Hyper-V Server '
-                                        '2012'))
-        return function(self, *args, **kwds)
-    return wrapper
+CONF = nova.conf.CONF
 
 
 class LiveMigrationOps(object):
     def __init__(self):
-        # Live migration is supported starting from Hyper-V Server 2012
-        if utilsfactory.get_hostutils().check_min_windows_version(6, 2):
-            self._livemigrutils = utilsfactory.get_livemigrationutils()
-        else:
-            self._livemigrutils = None
-
-        self._pathutils = utilsfactory.get_pathutils()
+        self._livemigrutils = utilsfactory.get_livemigrationutils()
+        self._pathutils = pathutils.PathUtils()
         self._vmops = vmops.VMOps()
         self._volumeops = volumeops.VolumeOps()
+        self._serial_console_ops = serialconsoleops.SerialConsoleOps()
         self._imagecache = imagecache.ImageCache()
-        self._vmutils = vmutilsv2.VMUtilsV2()
+        self._vmutils = utilsfactory.get_vmutils()
+        self._block_dev_man = block_device_manager.BlockDeviceInfoManager()
 
-    @check_os_version_requirement
     def live_migration(self, context, instance_ref, dest, post_method,
                        recover_method, block_migration=False,
                        migrate_data=None):
         LOG.debug("live_migration called", instance=instance_ref)
         instance_name = instance_ref["name"]
 
+        if migrate_data and 'is_shared_instance_path' in migrate_data:
+            shared_storage = migrate_data.is_shared_instance_path
+        else:
+            shared_storage = (
+                self._pathutils.check_remote_instances_dir_shared(dest))
+            if migrate_data:
+                migrate_data.is_shared_instance_path = shared_storage
+            else:
+                migrate_data = migrate_data_obj.HyperVLiveMigrateData(
+                    is_shared_instance_path=shared_storage)
+
         try:
-            self._vmops.copy_vm_console_logs(instance_name, dest)
-            self._vmops.copy_vm_dvd_disks(instance_name, dest)
-            self._livemigrutils.live_migrate_vm(instance_name,
-                                                dest)
+            # We must make sure that the console log workers are stopped,
+            # otherwise we won't be able to delete / move VM log files.
+            self._serial_console_ops.stop_console_handler(instance_name)
+
+            if not shared_storage:
+                self._pathutils.copy_vm_console_logs(instance_name, dest)
+                self._vmops.copy_vm_dvd_disks(instance_name, dest)
+
+            self._livemigrutils.live_migrate_vm(
+                instance_name,
+                dest,
+                migrate_disks=not shared_storage)
         except Exception:
             with excutils.save_and_reraise_exception():
                 LOG.debug("Calling live migration recover_method "
                           "for instance: %s", instance_name)
-                recover_method(context, instance_ref, dest, block_migration)
+                recover_method(context, instance_ref, dest, migrate_data)
 
         LOG.debug("Calling live migration post_method for instance: %s",
                   instance_name)
-        post_method(context, instance_ref, dest, block_migration)
+        post_method(context, instance_ref, dest,
+                    block_migration, migrate_data)
 
-    @check_os_version_requirement
     def pre_live_migration(self, context, instance, block_device_info,
                            network_info):
         LOG.debug("pre_live_migration called", instance=instance)
         self._livemigrutils.check_live_migration_config()
 
         if CONF.use_cow_images:
-            boot_from_volume = self._volumeops.ebs_root_in_block_devices(
+            boot_from_volume = self._block_dev_man.is_boot_from_volume(
                 block_device_info)
             if not boot_from_volume and instance.image_ref:
                 self._imagecache.get_cached_image(context, instance)
 
-        self._volumeops.initialize_volumes_connection(block_device_info)
+        self._volumeops.connect_volumes(block_device_info)
 
-    @check_os_version_requirement
-    def post_live_migration(self, context, instance, block_device_info):
+        disk_path_mapping = self._volumeops.get_disk_path_mapping(
+            block_device_info)
+        if disk_path_mapping:
+            # We create a planned VM, ensuring that volumes will remain
+            # attached after the VM is migrated.
+            self._livemigrutils.create_planned_vm(instance.name,
+                                                  instance.host,
+                                                  disk_path_mapping)
+
+    def post_live_migration(self, context, instance, block_device_info,
+                            migrate_data):
         self._volumeops.disconnect_volumes(block_device_info)
 
-    @check_os_version_requirement
+        if not migrate_data.is_shared_instance_path:
+            self._pathutils.get_instance_dir(instance.name,
+                                             create_dir=False,
+                                             remove_dir=True)
+
     def post_live_migration_at_destination(self, ctxt, instance_ref,
                                            network_info, block_migration):
         LOG.debug("post_live_migration_at_destination called",
                   instance=instance_ref)
-        self._vmops.log_vm_serial_output(instance_ref['name'],
-                                         instance_ref['uuid'])
+        self._vmops.plug_vifs(instance_ref, network_info)
 
-    @check_os_version_requirement
     def check_can_live_migrate_destination(self, ctxt, instance_ref,
                                            src_compute_info, dst_compute_info,
                                            block_migration=False,
                                            disk_over_commit=False):
-        LOG.debug("check_can_live_migrate_destination called", instance_ref)
-        return {}
+        LOG.debug("check_can_live_migrate_destination called",
+                  instance=instance_ref)
 
-    @check_os_version_requirement
-    def check_can_live_migrate_destination_cleanup(self, ctxt,
-                                                   dest_check_data):
-        LOG.debug("check_can_live_migrate_destination_cleanup called")
+        migrate_data = migrate_data_obj.HyperVLiveMigrateData()
 
-    @check_os_version_requirement
+        try:
+            # The remote instance dir might not exist or other issue to cause
+            # OSError in check_remote_instances_dir_shared function
+            migrate_data.is_shared_instance_path = (
+                self._pathutils.check_remote_instances_dir_shared(
+                    instance_ref.host))
+        except exception.FileNotFound as e:
+            reason = _('Unavailable instance location: %s') % e
+            raise exception.MigrationPreCheckError(reason=reason)
+        return migrate_data
+
+    def cleanup_live_migration_destination_check(self, ctxt, dest_check_data):
+        LOG.debug("cleanup_live_migration_destination_check called")
+
     def check_can_live_migrate_source(self, ctxt, instance_ref,
                                       dest_check_data):
-        LOG.debug("check_can_live_migrate_source called", instance_ref)
+        LOG.debug("check_can_live_migrate_source called",
+                  instance=instance_ref)
         return dest_check_data

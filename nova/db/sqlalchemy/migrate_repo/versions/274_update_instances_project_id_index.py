@@ -16,8 +16,6 @@
 from oslo_log import log as logging
 from sqlalchemy import MetaData, Table, Index
 
-from nova.i18n import _LI
-
 LOG = logging.getLogger(__name__)
 
 
@@ -33,8 +31,8 @@ def upgrade(migrate_engine):
 
     for index in instances.indexes:
         if [c.name for c in index.columns] == ['project_id', 'deleted']:
-            LOG.info(_LI('Skipped adding instances_project_id_deleted_idx '
-                         'because an equivalent index already exists.'))
+            LOG.info('Skipped adding instances_project_id_deleted_idx '
+                     'because an equivalent index already exists.')
             break
     else:
         index = Index('instances_project_id_deleted_idx',
@@ -43,25 +41,4 @@ def upgrade(migrate_engine):
 
     for index in instances.indexes:
         if [c.name for c in index.columns] == ['project_id']:
-            index.drop()
-
-
-def downgrade(migrate_engine):
-    """Change instances (project_id, deleted) index to cover (project_id)."""
-
-    meta = MetaData(bind=migrate_engine)
-
-    instances = Table('instances', meta, autoload=True)
-
-    for index in instances.indexes:
-        if [c.name for c in index.columns] == ['project_id']:
-            LOG.info(_LI('Skipped adding instances_project_id_idx '
-                         'because an equivalent index already exists.'))
-            break
-    else:
-        index = Index('project_id', instances.c.project_id)
-        index.create()
-
-    for index in instances.indexes:
-        if [c.name for c in index.columns] == ['project_id', 'deleted']:
             index.drop()

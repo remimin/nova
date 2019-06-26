@@ -17,58 +17,49 @@
 """Starter script for Nova Network."""
 
 import sys
-import traceback
 
-from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_reports import guru_meditation_report as gmr
+from oslo_reports import opts as gmr_opts
 
+from nova.cmd import common as cmd_common
 from nova.conductor import rpcapi as conductor_rpcapi
+import nova.conf
 from nova import config
-import nova.db.api
-from nova import exception
-from nova.i18n import _LE
+from nova.network import rpcapi as network_rpcapi
 from nova import objects
 from nova.objects import base as objects_base
-from nova.openstack.common.report import guru_meditation_report as gmr
 from nova import service
-from nova import utils
 from nova import version
 
-CONF = cfg.CONF
-CONF.import_opt('network_topic', 'nova.network.rpcapi')
-CONF.import_opt('use_local', 'nova.conductor.api', group='conductor')
-
-
-def block_db_access():
-    class NoDB(object):
-        def __getattr__(self, attr):
-            return self
-
-        def __call__(self, *args, **kwargs):
-            stacktrace = "".join(traceback.format_stack())
-            LOG = logging.getLogger('nova.network')
-            LOG.error(_LE('No db access allowed in nova-network: %s'),
-                      stacktrace)
-            raise exception.DBNotAllowed('nova-network')
-
-    nova.db.api.IMPL = NoDB()
+CONF = nova.conf.CONF
+LOG = logging.getLogger('nova.network')
 
 
 def main():
     config.parse_args(sys.argv)
     logging.setup(CONF, "nova")
-    utils.monkey_patch()
+
+    # NOTE(stephenfin): Yes, this is silly, but the whole thing is being
+    # removed and we want to make the diff in individual changes as small as
+    # possible
+    if True:
+        LOG.error('Nova network is deprecated and not supported '
+                  'except as required for CellsV1 deployments.')
+        return 1
+
     objects.register_all()
+    gmr_opts.set_defaults(CONF)
 
-    gmr.TextGuruMeditation.setup_autorun(version)
+    gmr.TextGuruMeditation.setup_autorun(version, conf=CONF)
 
-    if not CONF.conductor.use_local:
-        block_db_access()
-        objects_base.NovaObject.indirection_api = \
-            conductor_rpcapi.ConductorAPI()
+    cmd_common.block_db_access('nova-network')
+    objects_base.NovaObject.indirection_api = conductor_rpcapi.ConductorAPI()
 
+    LOG.warning('Nova network is deprecated and will be removed '
+                'in the future')
     server = service.Service.create(binary='nova-network',
-                                    topic=CONF.network_topic,
-                                    db_allowed=CONF.conductor.use_local)
+                                    topic=network_rpcapi.RPC_TOPIC,
+                                    manager=CONF.network_manager)
     service.serve(server)
     service.wait()

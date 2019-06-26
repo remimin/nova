@@ -15,43 +15,49 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo_config import cfg
-from oslo_db import options
 from oslo_log import log
+from oslo_utils import importutils
 
-from nova import debugger
-from nova import paths
+from nova.common import config
+import nova.conf
+from nova.db.sqlalchemy import api as sqlalchemy_api
 from nova import rpc
 from nova import version
 
-
-CONF = cfg.CONF
-
-_DEFAULT_SQL_CONNECTION = 'sqlite:///' + paths.state_path_def('nova.sqlite')
-
-_DEFAULT_LOG_LEVELS = ['amqp=WARN', 'amqplib=WARN', 'boto=WARN',
-                       'qpid=WARN', 'sqlalchemy=WARN', 'suds=INFO',
-                       'oslo_messaging=INFO', 'iso8601=WARN',
-                       'requests.packages.urllib3.connectionpool=WARN',
-                       'urllib3.connectionpool=WARN', 'websocket=WARN',
-                       'keystonemiddleware=WARN', 'routes.middleware=WARN',
-                       'stevedore=WARN', 'glanceclient=WARN']
-
-_DEFAULT_LOGGING_CONTEXT_FORMAT = ('%(asctime)s.%(msecs)03d %(process)d '
-                                   '%(levelname)s %(name)s [%(request_id)s '
-                                   '%(user_identity)s] %(instance)s'
-                                   '%(message)s')
+profiler = importutils.try_import('osprofiler.opts')
 
 
-def parse_args(argv, default_config_files=None):
-    log.set_defaults(_DEFAULT_LOGGING_CONTEXT_FORMAT, _DEFAULT_LOG_LEVELS)
+CONF = nova.conf.CONF
+
+
+def parse_args(argv, default_config_files=None, configure_db=True,
+               init_rpc=True):
     log.register_options(CONF)
-    options.set_defaults(CONF, connection=_DEFAULT_SQL_CONNECTION,
-                         sqlite_db='nova.sqlite')
+    # We use the oslo.log default log levels which includes suds=INFO
+    # and add only the extra levels that Nova needs
+    if CONF.glance.debug:
+        extra_default_log_levels = ['glanceclient=DEBUG']
+    else:
+        extra_default_log_levels = ['glanceclient=WARN']
+
+    # NOTE(danms): DEBUG logging in privsep will result in some large
+    # and potentially sensitive things being logged.
+    extra_default_log_levels.append('oslo.privsep.daemon=INFO')
+
+    log.set_defaults(default_log_levels=log.get_default_log_levels() +
+                     extra_default_log_levels)
     rpc.set_defaults(control_exchange='nova')
-    debugger.register_cli_opts()
+    if profiler:
+        profiler.set_defaults(CONF)
+    config.set_middleware_defaults()
+
     CONF(argv[1:],
          project='nova',
          version=version.version_string(),
          default_config_files=default_config_files)
-    rpc.init(CONF)
+
+    if init_rpc:
+        rpc.init(CONF)
+
+    if configure_db:
+        sqlalchemy_api.configure(CONF)

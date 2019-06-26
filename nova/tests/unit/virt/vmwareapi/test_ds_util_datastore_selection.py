@@ -81,7 +81,7 @@ class VMwareDSUtilDatastoreSelectionTestCase(test.NoDBTestCase):
                               capacity=0, freespace=0)
         rec = ds_util._select_datastore(None, datastores, best_match)
 
-        self.assertEqual(rec, best_match)
+        self.assertEqual(best_match, rec)
 
     def test_filter_datastores_no_match(self):
         datastores = self.build_result_set(self.data)
@@ -93,7 +93,7 @@ class VMwareDSUtilDatastoreSelectionTestCase(test.NoDBTestCase):
                                         best_match,
                                         datastore_regex)
 
-        self.assertEqual(rec, best_match, "did not match datastore properly")
+        self.assertEqual(best_match, rec, "did not match datastore properly")
 
     def test_filter_datastores_specific_match(self):
 
@@ -141,12 +141,13 @@ class VMwareDSUtilDatastoreSelectionTestCase(test.NoDBTestCase):
                               capacity=0, freespace=0)
 
         rec = ds_util._select_datastore(None, datastores, best_match)
-        self.assertEqual(rec, best_match, "no matches were expected")
+        self.assertEqual(best_match, rec, "no matches were expected")
 
     def test_filter_datastores_best_match(self):
         data = [
             ['VMFS', 'spam-good', True, 20 * units.Gi, 10 * units.Gi],
             ['NFS', 'eggs-good', True, 40 * units.Gi, 15 * units.Gi],
+            ['NFS41', 'nfs41-is-good', True, 35 * units.Gi, 12 * units.Gi],
             ['BAD', 'some-name-bad', True, 30 * units.Gi, 20 * units.Gi],
             ['VMFS', 'some-name-good', True, 50 * units.Gi, 5 * units.Gi],
             ['VMFS', 'some-other-good', True, 10 * units.Gi, 10 * units.Gi],
@@ -162,4 +163,4 @@ class VMwareDSUtilDatastoreSelectionTestCase(test.NoDBTestCase):
                                         datastores,
                                         best_match,
                                         datastore_regex)
-        self.assertEqual(rec, best_match, "did not match datastore properly")
+        self.assertEqual(best_match, rec, "did not match datastore properly")

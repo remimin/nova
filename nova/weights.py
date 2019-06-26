@@ -76,12 +76,17 @@ class BaseWeigher(object):
     minval = None
     maxval = None
 
-    def weight_multiplier(self):
+    def weight_multiplier(self, host_state):
         """How weighted this weigher should be.
 
         Override this method in a subclass, so that the returned value is
         read from a configuration option to permit operators specify a
-        multiplier for the weigher.
+        multiplier for the weigher. If the host is in an aggregate, this
+        method of subclass can read the ``weight_multiplier`` from aggregate
+        metadata of ``host_state``, and use it to overwrite multiplier
+        configuration.
+
+        :param host_state: The HostState object.
         """
         return 1.0
 
@@ -101,8 +106,8 @@ class BaseWeigher(object):
         for obj in weighed_obj_list:
             weight = self._weigh_object(obj.obj, weight_properties)
 
-            # Record the min and max values if they are None. If they anything
-            # but none we assume that the weigher has set them
+            # Record the min and max values if they are None. If they are
+            # anything but none, we assume that the weigher had set them.
             if self.minval is None:
                 self.minval = weight
             if self.maxval is None:
@@ -123,11 +128,11 @@ class BaseWeightHandler(loadables.BaseLoader):
 
     def get_weighed_objects(self, weighers, obj_list, weighing_properties):
         """Return a sorted (descending), normalized list of WeighedObjects."""
-
-        if not obj_list:
-            return []
-
         weighed_objs = [self.object_class(obj, 0.0) for obj in obj_list]
+
+        if len(weighed_objs) <= 1:
+            return weighed_objs
+
         for weigher in weighers:
             weights = weigher.weigh_objects(weighed_objs, weighing_properties)
 
@@ -138,6 +143,6 @@ class BaseWeightHandler(loadables.BaseLoader):
 
             for i, weight in enumerate(weights):
                 obj = weighed_objs[i]
-                obj.weight += weigher.weight_multiplier() * weight
+                obj.weight += weigher.weight_multiplier(obj.obj) * weight
 
         return sorted(weighed_objs, key=lambda x: x.weight, reverse=True)

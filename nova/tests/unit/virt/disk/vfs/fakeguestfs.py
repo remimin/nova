@@ -22,6 +22,7 @@ EVENT_TRACE = 0x4
 class GuestFS(object):
     SUPPORT_CLOSE_ON_EXIT = True
     SUPPORT_RETURN_DICT = True
+    CAN_SET_OWNERSHIP = True
 
     def __init__(self, **kwargs):
         if not self.SUPPORT_CLOSE_ON_EXIT and 'close_on_exit' in kwargs:
@@ -52,6 +53,7 @@ class GuestFS(object):
         self.drives = []
 
     def set_backend_settings(self, settings):
+        assert isinstance(settings, list), 'set_backend_settings takes a list'
         self.backend_settings = settings
 
     def close(self):
@@ -61,7 +63,7 @@ class GuestFS(object):
         if file == "/some/fail/file":
             raise RuntimeError("%s: No such file or directory", file)
 
-        self.drives.append((file, kwargs['format']))
+        self.drives.append((file, kwargs))
 
     def add_drive(self, file, format=None, *args, **kwargs):
         self.add_drive_opts(file, format=None, *args, **kwargs)
@@ -163,6 +165,11 @@ class GuestFS(object):
     def aug_get(self, cfgpath):
         if not self.auginit:
             raise RuntimeError("Augeus not initialized")
+
+        if ((cfgpath.startswith("/files/etc/passwd") or
+                cfgpath.startswith("/files/etc/group")) and not
+                self.CAN_SET_OWNERSHIP):
+            raise RuntimeError("Node not found %s", cfgpath)
 
         if cfgpath == "/files/etc/passwd/root/uid":
             return 0

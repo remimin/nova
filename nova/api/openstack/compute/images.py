@@ -15,6 +15,8 @@
 
 import webob.exc
 
+from nova.api.openstack.api_version_request \
+    import MAX_PROXY_API_SUPPORT_VERSION
 from nova.api.openstack import common
 from nova.api.openstack.compute.views import images as views_images
 from nova.api.openstack import wsgi
@@ -35,13 +37,13 @@ SUPPORTED_FILTERS = {
 }
 
 
-class Controller(wsgi.Controller):
+class ImagesController(wsgi.Controller):
     """Base controller for retrieving/displaying images."""
 
     _view_builder_class = views_images.ViewBuilder
 
-    def __init__(self, **kwargs):
-        super(Controller, self).__init__(**kwargs)
+    def __init__(self):
+        super(ImagesController, self).__init__()
         self._image_api = nova.image.API()
 
     def _get_filters(self, req):
@@ -71,6 +73,8 @@ class Controller(wsgi.Controller):
 
         return filters
 
+    @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @wsgi.expected_errors(404)
     def show(self, req, id):
         """Return detailed information about a specific image.
 
@@ -81,13 +85,15 @@ class Controller(wsgi.Controller):
 
         try:
             image = self._image_api.get(context, id)
-        except (exception.NotFound, exception.InvalidImageRef):
+        except (exception.ImageNotFound, exception.InvalidImageRef):
             explanation = _("Image not found.")
             raise webob.exc.HTTPNotFound(explanation=explanation)
 
-        req.cache_db_items('images', [image], 'id')
         return self._view_builder.show(req, image)
 
+    @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @wsgi.expected_errors((403, 404))
+    @wsgi.response(204)
     def delete(self, req, id):
         """Delete an image, if allowed.
 
@@ -105,8 +111,9 @@ class Controller(wsgi.Controller):
             # raises HTTPForbidden.
             explanation = _("You are not allowed to delete the image.")
             raise webob.exc.HTTPForbidden(explanation=explanation)
-        return webob.exc.HTTPNoContent()
 
+    @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @wsgi.expected_errors(400)
     def index(self, req):
         """Return an index listing of images available to the request.
 
@@ -115,10 +122,7 @@ class Controller(wsgi.Controller):
         """
         context = req.environ['nova.context']
         filters = self._get_filters(req)
-        params = req.GET.copy()
         page_params = common.get_pagination_params(req)
-        for key, val in page_params.iteritems():
-            params[key] = val
 
         try:
             images = self._image_api.get_all(context, filters=filters,
@@ -127,6 +131,8 @@ class Controller(wsgi.Controller):
             raise webob.exc.HTTPBadRequest(explanation=e.format_message())
         return self._view_builder.index(req, images)
 
+    @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @wsgi.expected_errors(400)
     def detail(self, req):
         """Return a detailed index listing of images available to the request.
 
@@ -135,22 +141,11 @@ class Controller(wsgi.Controller):
         """
         context = req.environ['nova.context']
         filters = self._get_filters(req)
-        params = req.GET.copy()
         page_params = common.get_pagination_params(req)
-        for key, val in page_params.iteritems():
-            params[key] = val
         try:
             images = self._image_api.get_all(context, filters=filters,
                                              **page_params)
         except exception.Invalid as e:
             raise webob.exc.HTTPBadRequest(explanation=e.format_message())
 
-        req.cache_db_items('images', images, 'id')
         return self._view_builder.detail(req, images)
-
-    def create(self, *args, **kwargs):
-        raise webob.exc.HTTPMethodNotAllowed()
-
-
-def create_resource():
-    return wsgi.Resource(Controller())

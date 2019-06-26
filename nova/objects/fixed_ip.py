@@ -13,8 +13,11 @@
 #    under the License.
 
 from oslo_utils import timeutils
+from oslo_utils import versionutils
 
-from nova import db
+from nova.db import api as db
+from nova.db.sqlalchemy import api as db_api
+from nova.db.sqlalchemy import models
 from nova import exception
 from nova import objects
 from nova.objects import base as obj_base
@@ -27,6 +30,7 @@ FIXED_IP_OPTIONAL_ATTRS = ['instance', 'network', 'virtual_interface',
 
 
 # TODO(berrange): Remove NovaObjectDictCompat
+@obj_base.NovaObjectRegistry.register
 class FixedIP(obj_base.NovaPersistentObject, obj_base.NovaObject,
               obj_base.NovaObjectDictCompat):
     # Version 1.0: Initial version
@@ -38,8 +42,13 @@ class FixedIP(obj_base.NovaPersistentObject, obj_base.NovaObject,
     # Version 1.6: Instance 1.16
     # Version 1.7: Instance 1.17
     # Version 1.8: Instance 1.18
-    # Version 1.8: Instance 1.19
-    VERSION = '1.9'
+    # Version 1.9: Instance 1.19
+    # Version 1.10: Instance 1.20
+    # Version 1.11: Instance 1.21
+    # Version 1.12: Instance 1.22, FloatingIPList 1.9
+    # Version 1.13: Instance 1.23, FloatingIPList 1.10
+    # Version 1.14: Added vif_id kwarg to associate(_pool), FloatingIPList 1.11
+    VERSION = '1.14'
 
     fields = {
         'id': fields.IntegerField(),
@@ -62,18 +71,9 @@ class FixedIP(obj_base.NovaPersistentObject, obj_base.NovaObject,
         'floating_ips': fields.ObjectField('FloatingIPList'),
         }
 
-    obj_relationships = {
-        'instance': [('1.0', '1.13'), ('1.2', '1.14'), ('1.3', '1.15'),
-                     ('1.6', '1.16'), ('1.7', '1.17'), ('1.8', '1.18'),
-                     ('1.9', '1.19')],
-        'network': [('1.0', '1.2')],
-        'virtual_interface': [('1.1', '1.0')],
-        'floating_ips': [('1.5', '1.7')],
-    }
-
     def obj_make_compatible(self, primitive, target_version):
         super(FixedIP, self).obj_make_compatible(primitive, target_version)
-        target_version = utils.convert_version_to_tuple(target_version)
+        target_version = versionutils.convert_version_to_tuple(target_version)
         if target_version < (1, 4) and 'default_route' in primitive:
             del primitive['default_route']
 
@@ -146,18 +146,20 @@ class FixedIP(obj_base.NovaPersistentObject, obj_base.NovaObject,
 
     @obj_base.remotable_classmethod
     def associate(cls, context, address, instance_uuid, network_id=None,
-                  reserved=False):
+                  reserved=False, vif_id=None):
         db_fixedip = db.fixed_ip_associate(context, address, instance_uuid,
                                            network_id=network_id,
-                                           reserved=reserved)
+                                           reserved=reserved,
+                                           virtual_interface_id=vif_id)
         return cls._from_db_object(context, cls(context), db_fixedip)
 
     @obj_base.remotable_classmethod
     def associate_pool(cls, context, network_id, instance_uuid=None,
-                       host=None):
+                       host=None, vif_id=None):
         db_fixedip = db.fixed_ip_associate_pool(context, network_id,
                                                 instance_uuid=instance_uuid,
-                                                host=host)
+                                                host=host,
+                                                virtual_interface_id=vif_id)
         return cls._from_db_object(context, cls(context), db_fixedip)
 
     @obj_base.remotable_classmethod
@@ -172,7 +174,7 @@ class FixedIP(obj_base.NovaPersistentObject, obj_base.NovaObject,
     @classmethod
     def disassociate_all_by_timeout(cls, context, host, time):
         return cls._disassociate_all_by_timeout(context, host,
-                                                timeutils.isotime(time))
+                                                utils.isotime(time))
 
     @obj_base.remotable
     def create(self):
@@ -202,6 +204,7 @@ class FixedIP(obj_base.NovaPersistentObject, obj_base.NovaObject,
         self.obj_reset_changes(['instance_uuid', 'instance'])
 
 
+@obj_base.NovaObjectRegistry.register
 class FixedIPList(obj_base.ObjectListBase, obj_base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: Added get_by_network()
@@ -212,24 +215,28 @@ class FixedIPList(obj_base.ObjectListBase, obj_base.NovaObject):
     # Version 1.6: FixedIP <= version 1.6
     # Version 1.7: FixedIP <= version 1.7
     # Version 1.8: FixedIP <= version 1.8
-    # Version 1.8: FixedIP <= version 1.9
-    VERSION = '1.9'
+    # Version 1.9: FixedIP <= version 1.9
+    # Version 1.10: FixedIP <= version 1.10
+    # Version 1.11: FixedIP <= version 1.11
+    # Version 1.12: FixedIP <= version 1.12
+    # Version 1.13: FixedIP <= version 1.13
+    # Version 1.14: FixedIP <= version 1.14
+    # Version 1.15: Added get_count_by_project() for quotas
+    VERSION = '1.15'
 
     fields = {
         'objects': fields.ListOfObjectsField('FixedIP'),
         }
-    child_versions = {
-        '1.0': '1.0',
-        '1.1': '1.1',
-        '1.2': '1.2',
-        '1.3': '1.3',
-        '1.4': '1.4',
-        '1.5': '1.5',
-        '1.6': '1.6',
-        '1.7': '1.7',
-        '1.8': '1.8',
-        '1.9': '1.9',
-        }
+
+    @staticmethod
+    @db_api.pick_context_manager_reader
+    def _get_count_by_project_from_db(context, project_id):
+        return context.session.query(models.FixedIp.id).\
+                filter_by(deleted=0).\
+                join(models.Instance,
+                     models.Instance.uuid == models.FixedIp.instance_uuid).\
+                filter(models.Instance.project_id == project_id).\
+                count()
 
     @obj_base.remotable_classmethod
     def get_all(cls, context):
@@ -302,3 +309,7 @@ class FixedIPList(obj_base.ObjectListBase, obj_base.NovaObject):
                                                   reason='already created')
             ips.append(ip)
         db.fixed_ip_bulk_create(context, ips)
+
+    @obj_base.remotable_classmethod
+    def get_count_by_project(cls, context, project_id):
+        return cls._get_count_by_project_from_db(context, project_id)

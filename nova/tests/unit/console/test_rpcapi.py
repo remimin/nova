@@ -16,16 +16,11 @@
 Unit Tests for nova.console.rpcapi
 """
 
-import contextlib
-
 import mock
-from oslo_config import cfg
 
 from nova.console import rpcapi as console_rpcapi
 from nova import context
 from nova import test
-
-CONF = cfg.CONF
 
 
 class ConsoleRpcAPITestCase(test.NoDBTestCase):
@@ -34,11 +29,12 @@ class ConsoleRpcAPITestCase(test.NoDBTestCase):
 
         rpcapi = console_rpcapi.ConsoleAPI()
         self.assertIsNotNone(rpcapi.client)
-        self.assertEqual(rpcapi.client.target.topic, CONF.console_topic)
+        self.assertEqual(rpcapi.client.target.topic,
+                         console_rpcapi.RPC_TOPIC)
 
         orig_prepare = rpcapi.client.prepare
 
-        with contextlib.nested(
+        with test.nested(
             mock.patch.object(rpcapi.client, rpc_method),
             mock.patch.object(rpcapi.client, 'prepare'),
             mock.patch.object(rpcapi.client, 'can_send_version'),

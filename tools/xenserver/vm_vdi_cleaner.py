@@ -21,6 +21,7 @@ import os
 import sys
 
 from oslo_config import cfg
+from oslo_utils import timeutils
 import XenAPI
 
 possible_topdir = os.getcwd()
@@ -29,9 +30,9 @@ if os.path.exists(os.path.join(possible_topdir, "nova", "__init__.py")):
 
 from nova import config
 from nova import context
+import nova.conf
 from nova import db
 from nova import exception
-from oslo_utils import timeutils
 from nova.virt import virtapi
 from nova.virt.xenapi import driver as xenapi_driver
 
@@ -45,11 +46,9 @@ cleaner_opts = [
 cli_opt = cfg.StrOpt('command',
                      help='Cleaner command')
 
-CONF = cfg.CONF
+CONF = nova.conf.CONF
 CONF.register_opts(cleaner_opts)
 CONF.register_cli_opt(cli_opt)
-CONF.import_opt('verbose', 'nova.openstack.common.log')
-CONF.import_opt("resize_confirm_window", "nova.compute.manager")
 
 
 ALLOWED_COMMANDS = ["list-vdis", "clean-vdis", "list-instances",
@@ -106,7 +105,7 @@ def _get_applicable_vm_recs(xenapi):
     for vm_ref in call_xenapi(xenapi, 'VM.get_all'):
         try:
             vm_rec = call_xenapi(xenapi, 'VM.get_record', vm_ref)
-        except XenAPI.Failure, e:
+        except XenAPI.Failure as e:
             if e.details[0] != 'HANDLE_INVALID':
                 raise
             continue
@@ -123,16 +122,14 @@ def print_xen_object(obj_type, obj, indent_level=0, spaces_per_indent=4):
 
         VM (abcd-abcd-abcd): 'name label here'
     """
-    if not CONF.verbose:
-        return
     uuid = obj["uuid"]
     try:
         name_label = obj["name_label"]
     except KeyError:
         name_label = ""
-    msg = "%(obj_type)s (%(uuid)s) '%(name_label)s'" % locals()
+    msg = "%s (%s) '%s'" % (obj_type, uuid, name_label)
     indent = " " * spaces_per_indent * indent_level
-    print "".join([indent, msg])
+    print("".join([indent, msg]))
 
 
 def _find_vdis_connected_to_vm(xenapi, connected_vdi_uuids):
@@ -164,7 +161,7 @@ def _find_vdis_connected_to_vm(xenapi, connected_vdi_uuids):
                 try:
                     cur_vdi_rec = call_xenapi(xenapi, 'VDI.get_record',
                             cur_vdi_ref)
-                except XenAPI.Failure, e:
+                except XenAPI.Failure as e:
                     if e.details[0] != 'HANDLE_INVALID':
                         raise
                     break
@@ -179,7 +176,7 @@ def _find_vdis_connected_to_vm(xenapi, connected_vdi_uuids):
         for vbd_ref in vbd_refs:
             try:
                 vbd_rec = call_xenapi(xenapi, 'VBD.get_record', vbd_ref)
-            except XenAPI.Failure, e:
+            except XenAPI.Failure as e:
                 if e.details[0] != 'HANDLE_INVALID':
                     raise
                 continue
@@ -194,7 +191,7 @@ def _find_vdis_connected_to_vm(xenapi, connected_vdi_uuids):
 
             try:
                 vdi_rec = call_xenapi(xenapi, 'VDI.get_record', vbd_vdi_ref)
-            except XenAPI.Failure, e:
+            except XenAPI.Failure as e:
                 if e.details[0] != 'HANDLE_INVALID':
                     raise
                 continue
@@ -213,7 +210,7 @@ def _find_all_vdis_and_system_vdis(xenapi, all_vdi_uuids, connected_vdi_uuids):
     for vdi_ref in call_xenapi(xenapi, 'VDI.get_all'):
         try:
             vdi_rec = call_xenapi(xenapi, 'VDI.get_record', vdi_ref)
-        except XenAPI.Failure, e:
+        except XenAPI.Failure as e:
             if e.details[0] != 'HANDLE_INVALID':
                 raise
             continue
@@ -246,39 +243,31 @@ def find_orphaned_vdi_uuids(xenapi):
 def list_orphaned_vdis(vdi_uuids):
     """List orphaned VDIs."""
     for vdi_uuid in vdi_uuids:
-        if CONF.verbose:
-            print "ORPHANED VDI (%s)" % vdi_uuid
-        else:
-            print vdi_uuid
+        print("ORPHANED VDI (%s)" % vdi_uuid)
 
 
 def clean_orphaned_vdis(xenapi, vdi_uuids):
     """Clean orphaned VDIs."""
     for vdi_uuid in vdi_uuids:
-        if CONF.verbose:
-            print "CLEANING VDI (%s)" % vdi_uuid
+        print("CLEANING VDI (%s)" % vdi_uuid)
 
         vdi_ref = call_xenapi(xenapi, 'VDI.get_by_uuid', vdi_uuid)
         try:
             call_xenapi(xenapi, 'VDI.destroy', vdi_ref)
-        except XenAPI.Failure, exc:
-            print >> sys.stderr, "Skipping %s: %s" % (vdi_uuid, exc)
+        except XenAPI.Failure as exc:
+            sys.stderr.write("Skipping %s: %s" % (vdi_uuid, exc))
 
 
 def list_orphaned_instances(orphaned_instances):
     """List orphaned instances."""
     for vm_ref, vm_rec, orphaned_instance in orphaned_instances:
-        if CONF.verbose:
-            print "ORPHANED INSTANCE (%s)" % orphaned_instance.name
-        else:
-            print orphaned_instance.name
+        print("ORPHANED INSTANCE (%s)" % orphaned_instance.name)
 
 
 def clean_orphaned_instances(xenapi, orphaned_instances):
     """Clean orphaned instances."""
     for vm_ref, vm_rec, instance in orphaned_instances:
-        if CONF.verbose:
-            print "CLEANING INSTANCE (%s)" % instance.name
+        print("CLEANING INSTANCE (%s)" % instance.name)
 
         cleanup_instance(xenapi, instance, vm_ref, vm_rec)
 
@@ -303,11 +292,9 @@ def main():
     xenapi = xenapi_driver.XenAPIDriver(virtapi.VirtAPI())
 
     if command == "list-vdis":
-        if CONF.verbose:
-            print "Connected VDIs:\n"
+        print("Connected VDIs:\n")
         orphaned_vdi_uuids = find_orphaned_vdi_uuids(xenapi)
-        if CONF.verbose:
-            print "\nOrphaned VDIs:\n"
+        print("\nOrphaned VDIs:\n")
         list_orphaned_vdis(orphaned_vdi_uuids)
     elif command == "clean-vdis":
         orphaned_vdi_uuids = find_orphaned_vdi_uuids(xenapi)
@@ -321,7 +308,7 @@ def main():
     elif command == "test":
         doctest.testmod()
     else:
-        print "Unknown command '%s'" % command
+        print("Unknown command '%s'" % command)
         sys.exit(1)
 
 

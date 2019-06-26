@@ -16,31 +16,21 @@
 Client side of the network RPC API.
 """
 
-from oslo_config import cfg
 import oslo_messaging as messaging
 from oslo_serialization import jsonutils
 
+import nova.conf
+from nova import exception
 from nova.objects import base as objects_base
+from nova import profiler
 from nova import rpc
 
-rpcapi_opts = [
-    cfg.StrOpt('network_topic',
-               default='network',
-               help='The topic network nodes listen on'),
-    cfg.BoolOpt('multi_host',
-                default=False,
-                help='Default value for multi_host in networks. Also, if set, '
-                     'some rpc network calls will be sent directly to host.'),
-]
 
-CONF = cfg.CONF
-CONF.register_opts(rpcapi_opts)
-
-rpcapi_cap_opt = cfg.StrOpt('network',
-        help='Set a version cap for messages sent to network services')
-CONF.register_opt(rpcapi_cap_opt, 'upgrade_levels')
+CONF = nova.conf.CONF
+RPC_TOPIC = 'network'
 
 
+@profiler.trace_cls("rpc")
 class NetworkAPI(object):
     '''Client side of the network rpc API.
 
@@ -84,7 +74,7 @@ class NetworkAPI(object):
         * 1.13 - Convert allocate_for_instance()
                  to use NetworkRequestList objects
 
-        ... Juno supports message version 1.13.  So, any changes to
+        ... Juno and Kilo supports message version 1.13.  So, any changes to
         existing methods in 1.x after that point should be done such that they
         can handle the version_cap being set to 1.13.
 
@@ -103,6 +93,26 @@ class NetworkAPI(object):
         * NOTE: remove unused method associate_floating_ip()
         * NOTE: remove unused method disassociate_floating_ip()
         * NOTE: remove unused method associate()
+
+        * 1.14 - Add mac parameter to release_fixed_ip().
+        * 1.15 - Convert set_network_host() to use Network objects.
+
+        ... Liberty supports message version 1.15.  So, any changes to
+        existing methods in 1.x after that point should be done such that they
+        can handle the version_cap being set to 1.15.
+
+        * 1.16 - Transfer instance in addition to instance_id in
+                 setup_networks_on_host
+
+        ... Mitaka supports message version 1.16.  So, any changes to
+        existing methods in 1.x after that point should be done such that they
+        can handle the version_cap being set to 1.16.
+
+        * 1.17 - Add method release_dhcp()
+
+        ... Newton and Ocata support message version 1.17.  So, any changes to
+        existing methods in 1.x after that point should be done such that they
+        can handle the version_cap being set to 1.17.
     '''
 
     VERSION_ALIASES = {
@@ -110,11 +120,16 @@ class NetworkAPI(object):
         'havana': '1.10',
         'icehouse': '1.12',
         'juno': '1.13',
+        'kilo': '1.13',
+        'liberty': '1.15',
+        'mitaka': '1.16',
+        'newton': '1.17',
+        'ocata': '1.17',
     }
 
     def __init__(self, topic=None):
         super(NetworkAPI, self).__init__()
-        topic = topic or CONF.network_topic
+        topic = topic or RPC_TOPIC
         target = messaging.Target(topic=topic, version='1.0')
         version_cap = self.VERSION_ALIASES.get(CONF.upgrade_levels.network,
                                                CONF.upgrade_levels.network)
@@ -134,6 +149,7 @@ class NetworkAPI(object):
     def allocate_for_instance(self, ctxt, instance_id, project_id, host,
                               rxtx_factor, vpn, requested_networks, macs=None,
                               dhcp_options=None):
+        # NOTE(mriedem): dhcp_options should be removed in version 2.0
         version = '1.13'
         if not self.client.can_send_version(version):
             version = '1.9'
@@ -169,6 +185,14 @@ class NetworkAPI(object):
         if CONF.multi_host:
             cctxt = cctxt.prepare(server=instance.host, version=version)
         return cctxt.call(ctxt, 'deallocate_for_instance', **kwargs)
+
+    def release_dhcp(self, ctxt, host, dev, address, vif_address):
+        if self.client.can_send_version('1.17'):
+            cctxt = self.client.prepare(version='1.17', server=host)
+            return cctxt.call(ctxt, 'release_dhcp', dev=dev, address=address,
+                              vif_address=vif_address)
+        else:
+            raise exception.RPCPinnedToOldVersion()
 
     def add_fixed_ip_to_instance(self, ctxt, instance_id, rxtx_factor,
                                  host, network_id):
@@ -234,16 +258,27 @@ class NetworkAPI(object):
         return self.client.call(ctxt, 'create_public_dns_domain',
                                 domain=domain, project=project)
 
-    def setup_networks_on_host(self, ctxt, instance_id, host, teardown):
+    def setup_networks_on_host(self, ctxt, instance_id, host, teardown,
+                               instance):
         # NOTE(tr3buchet): the call is just to wait for completion
-        return self.client.call(ctxt, 'setup_networks_on_host',
-                                instance_id=instance_id, host=host,
-                                teardown=teardown)
+        version = '1.16'
+        kwargs = {}
+        if not self.client.can_send_version(version):
+            version = '1.0'
+        else:
+            kwargs['instance'] = instance
+        cctxt = self.client.prepare(version=version)
+        return cctxt.call(ctxt, 'setup_networks_on_host',
+                          instance_id=instance_id, host=host,
+                          teardown=teardown, **kwargs)
 
     def set_network_host(self, ctxt, network_ref):
-        network_ref_p = jsonutils.to_primitive(network_ref)
-        return self.client.call(ctxt, 'set_network_host',
-                                network_ref=network_ref_p)
+        version = '1.15'
+        if not self.client.can_send_version(version):
+            version = '1.0'
+            network_ref = objects_base.obj_to_primitive(network_ref)
+        cctxt = self.client.prepare(version=version)
+        return cctxt.call(ctxt, 'set_network_host', network_ref=network_ref)
 
     def rpc_setup_network_on_host(self, ctxt, network_id, teardown, host):
         # NOTE(tr3buchet): the call is just to wait for completion
@@ -304,9 +339,15 @@ class NetworkAPI(object):
         cctxt = self.client.prepare(server=host)
         cctxt.cast(ctxt, 'lease_fixed_ip', address=address)
 
-    def release_fixed_ip(self, ctxt, address, host):
-        cctxt = self.client.prepare(server=host)
-        cctxt.cast(ctxt, 'release_fixed_ip', address=address)
+    def release_fixed_ip(self, ctxt, address, host, mac):
+        kwargs = {}
+        if self.client.can_send_version('1.14'):
+            version = '1.14'
+            kwargs['mac'] = mac
+        else:
+            version = '1.0'
+        cctxt = self.client.prepare(server=host, version=version)
+        cctxt.cast(ctxt, 'release_fixed_ip', address=address, **kwargs)
 
     def migrate_instance_start(self, ctxt, instance_uuid, rxtx_factor,
                                project_id, source_compute, dest_compute,

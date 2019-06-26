@@ -14,51 +14,30 @@
 #    under the License.
 
 import collections
-import functools
 import itertools
-import os
 import re
 
-from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_utils import strutils
+import six
 import six.moves.urllib.parse as urlparse
 import webob
 from webob import exc
 
-from nova.api.validation import parameter_types
+from nova.api.openstack import api_version_request
 from nova.compute import task_states
-from nova.compute import utils as compute_utils
 from nova.compute import vm_states
+import nova.conf
 from nova import exception
 from nova.i18n import _
-from nova.i18n import _LE
-from nova.i18n import _LW
+from nova import objects
 from nova import quota
+from nova import utils
 
-osapi_opts = [
-    cfg.IntOpt('osapi_max_limit',
-               default=1000,
-               help='The maximum number of items returned in a single '
-                    'response from a collection resource'),
-    cfg.StrOpt('osapi_compute_link_prefix',
-               help='Base URL that will be presented to users in links '
-                    'to the OpenStack Compute API'),
-    cfg.StrOpt('osapi_glance_link_prefix',
-               help='Base URL that will be presented to users in links '
-                    'to glance resources'),
-]
-CONF = cfg.CONF
-CONF.register_opts(osapi_opts)
+CONF = nova.conf.CONF
 
 LOG = logging.getLogger(__name__)
 QUOTAS = quota.QUOTAS
-
-CONF.import_opt('enable', 'nova.cells.opts', group='cells')
-
-VALID_NAME_REGEX = re.compile(parameter_types.valid_name_regex, re.UNICODE)
-
-
-XML_NS_V11 = 'http://docs.openstack.org/compute/api/v1.1'
 
 
 _STATE_MAP = {
@@ -97,7 +76,7 @@ _STATE_MAP = {
         'default': 'VERIFY_RESIZE',
         # Note(maoy): the OS API spec 1.1 doesn't have CONFIRMING_RESIZE
         # state so we comment that out for future reference only.
-        #task_states.RESIZE_CONFIRMING: 'CONFIRMING_RESIZE',
+        # task_states.RESIZE_CONFIRMING: 'CONFIRMING_RESIZE',
         task_states.RESIZE_REVERTING: 'REVERT_RESIZE',
     },
     vm_states.PAUSED: {
@@ -136,9 +115,9 @@ def status_from_state(vm_state, task_state='default'):
     task_map = _STATE_MAP.get(vm_state, dict(default='UNKNOWN'))
     status = task_map.get(task_state, task_map['default'])
     if status == "UNKNOWN":
-        LOG.error(_LE("status is UNKNOWN from vm_state=%(vm_state)s "
-                      "task_state=%(task_state)s. Bad upgrade or db "
-                      "corrupted?"),
+        LOG.error("status is UNKNOWN from vm_state=%(vm_state)s "
+                  "task_state=%(task_state)s. Bad upgrade or db "
+                  "corrupted?",
                   {'vm_state': vm_state, 'task_state': task_state})
     return status
 
@@ -150,8 +129,8 @@ def task_and_vm_state_from_status(statuses):
     vm_states = set()
     task_states = set()
     lower_statuses = [status.lower() for status in statuses]
-    for state, task_map in _STATE_MAP.iteritems():
-        for task_state, mapped_state in task_map.iteritems():
+    for state, task_map in _STATE_MAP.items():
+        for task_state, mapped_state in task_map.items():
             status_string = mapped_state
             if status_string.lower() in lower_statuses:
                 vm_states.add(state)
@@ -212,19 +191,18 @@ def get_pagination_params(request):
         params['page_size'] = _get_int_param(request, 'page_size')
     if 'marker' in request.GET:
         params['marker'] = _get_marker_param(request)
+    if 'offset' in request.GET:
+        params['offset'] = _get_int_param(request, 'offset')
     return params
 
 
 def _get_int_param(request, param):
     """Extract integer param from request or fail."""
     try:
-        int_param = int(request.GET[param])
-    except ValueError:
-        msg = _('%s param must be an integer') % param
-        raise webob.exc.HTTPBadRequest(explanation=msg)
-    if int_param < 0:
-        msg = _('%s param must be positive') % param
-        raise webob.exc.HTTPBadRequest(explanation=msg)
+        int_param = utils.validate_integer(request.GET[param], param,
+                                           min_value=0)
+    except exception.InvalidInput as e:
+        raise webob.exc.HTTPBadRequest(explanation=e.format_message())
     return int_param
 
 
@@ -233,7 +211,7 @@ def _get_marker_param(request):
     return request.GET['marker']
 
 
-def limited(items, request, max_limit=CONF.osapi_max_limit):
+def limited(items, request):
     """Return a slice of items according to requested offset and limit.
 
     :param items: A sliceable entity
@@ -243,39 +221,21 @@ def limited(items, request, max_limit=CONF.osapi_max_limit):
                     'limit' is not specified, 0, or > max_limit, we default
                     to max_limit. Negative values for either offset or limit
                     will cause exc.HTTPBadRequest() exceptions to be raised.
-    :kwarg max_limit: The maximum number of items to return from 'items'
     """
-    try:
-        offset = int(request.GET.get('offset', 0))
-    except ValueError:
-        msg = _('offset param must be an integer')
-        raise webob.exc.HTTPBadRequest(explanation=msg)
-
-    try:
-        limit = int(request.GET.get('limit', max_limit))
-    except ValueError:
-        msg = _('limit param must be an integer')
-        raise webob.exc.HTTPBadRequest(explanation=msg)
-
-    if limit < 0:
-        msg = _('limit param must be positive')
-        raise webob.exc.HTTPBadRequest(explanation=msg)
-
-    if offset < 0:
-        msg = _('offset param must be positive')
-        raise webob.exc.HTTPBadRequest(explanation=msg)
-
-    limit = min(max_limit, limit or max_limit)
-    range_end = offset + limit
-    return items[offset:range_end]
-
-
-def get_limit_and_marker(request, max_limit=CONF.osapi_max_limit):
-    """get limited parameter from request."""
     params = get_pagination_params(request)
-    limit = params.get('limit', max_limit)
-    limit = min(max_limit, limit)
-    marker = params.get('marker')
+    offset = params.get('offset', 0)
+    limit = CONF.api.max_limit
+    limit = min(limit, params.get('limit') or limit)
+
+    return items[offset:(offset + limit)]
+
+
+def get_limit_and_marker(request):
+    """Get limited parameter from request."""
+    params = get_pagination_params(request)
+    limit = CONF.api.max_limit
+    limit = min(limit, params.get('limit', limit))
+    marker = params.get('marker', None)
 
     return limit, marker
 
@@ -293,30 +253,26 @@ def get_id_from_href(href):
     return urlparse.urlsplit("%s" % href).path.split('/')[-1]
 
 
-def remove_version_from_href(href):
-    """Removes the first api version from the href.
+def remove_trailing_version_from_href(href):
+    """Removes the api version from the href.
 
-    Given: 'http://www.nova.com/v1.1/123'
-    Returns: 'http://www.nova.com/123'
+    Given: 'http://www.nova.com/compute/v1.1'
+    Returns: 'http://www.nova.com/compute'
 
     Given: 'http://www.nova.com/v1.1'
     Returns: 'http://www.nova.com'
 
     """
     parsed_url = urlparse.urlsplit(href)
-    url_parts = parsed_url.path.split('/', 2)
+    url_parts = parsed_url.path.rsplit('/', 1)
 
     # NOTE: this should match vX.X or vX
     expression = re.compile(r'^v([0-9]+|[0-9]+\.[0-9]+)(/.*|$)')
-    if expression.match(url_parts[1]):
-        del url_parts[1]
-
-    new_path = '/'.join(url_parts)
-
-    if new_path == parsed_url.path:
-        LOG.debug('href %s does not contain version' % href)
+    if not expression.match(url_parts.pop()):
+        LOG.debug('href %s does not contain version', href)
         raise ValueError(_('href %s does not contain version') % href)
 
+    new_path = url_join(*url_parts)
     parsed_url = list(parsed_url)
     parsed_url[2] = new_path
     return urlparse.urlunsplit(parsed_url)
@@ -330,29 +286,6 @@ def check_img_metadata_properties_quota(context, metadata):
     except exception.OverQuota:
         expl = _("Image metadata limit exceeded")
         raise webob.exc.HTTPForbidden(explanation=expl)
-
-    #  check the key length.
-    if isinstance(metadata, dict):
-        for key, value in metadata.iteritems():
-            if len(key) == 0:
-                expl = _("Image metadata key cannot be blank")
-                raise webob.exc.HTTPBadRequest(explanation=expl)
-            if len(key) > 255:
-                expl = _("Image metadata key too long")
-                raise webob.exc.HTTPBadRequest(explanation=expl)
-    else:
-        expl = _("Invalid image metadata")
-        raise webob.exc.HTTPBadRequest(explanation=expl)
-
-
-def dict_to_query_str(params):
-    # TODO(throughnothing): we should just use urllib.urlencode instead of this
-    # But currently we don't work with urlencoded url's
-    param_str = ""
-    for key, val in params.iteritems():
-        param_str = param_str + '='.join([str(key), str(val)]) + '&'
-
-    return param_str.rstrip('&')
 
 
 def get_networks_for_instance_from_nw_info(nw_info):
@@ -389,7 +322,7 @@ def get_networks_for_instance(context, instance):
                                       'mac_address': 'aa:aa:aa:aa:aa:aa'}]},
          ...}
     """
-    nw_info = compute_utils.get_nw_info_for_instance(instance)
+    nw_info = instance.get_network_info()
     return get_networks_for_instance_from_nw_info(nw_info)
 
 
@@ -412,16 +345,19 @@ def raise_http_conflict_for_instance_invalid_state(exc, action, server_id):
     raise webob.exc.HTTPConflict(explanation=msg)
 
 
-def check_snapshots_enabled(f):
-    @functools.wraps(f)
-    def inner(*args, **kwargs):
-        if not CONF.allow_instance_snapshots:
-            LOG.warning(_LW('Rejecting snapshot request, snapshots currently'
-                            ' disabled'))
-            msg = _("Instance snapshots are not permitted at this time.")
-            raise webob.exc.HTTPBadRequest(explanation=msg)
-        return f(*args, **kwargs)
-    return inner
+def url_join(*parts):
+    """Convenience method for joining parts of a URL
+
+    Any leading and trailing '/' characters are removed, and the parts joined
+    together with '/' as a separator. If last element of 'parts' is an empty
+    string, the returned URL will have a trailing slash.
+    """
+    parts = parts or [""]
+    clean_parts = [part.strip("/") for part in parts if part]
+    if not parts[-1]:
+        # Empty last element should add a trailing slash
+        clean_parts.append("")
+    return "/".join(clean_parts)
 
 
 class ViewBuilder(object):
@@ -432,7 +368,7 @@ class ViewBuilder(object):
         otherwise
         """
         project_id = request.environ["nova.context"].project_id
-        if project_id in request.url:
+        if project_id and project_id in request.url:
             return project_id
         return ''
 
@@ -450,30 +386,30 @@ class ViewBuilder(object):
 
     def _get_next_link(self, request, identifier, collection_name):
         """Return href string with proper limit and marker params."""
-        params = request.params.copy()
+        params = collections.OrderedDict(sorted(request.params.items()))
         params["marker"] = identifier
         prefix = self._update_compute_link_prefix(request.application_url)
-        url = os.path.join(prefix,
-                           self._get_project_id(request),
-                           collection_name)
-        return "%s?%s" % (url, dict_to_query_str(params))
+        url = url_join(prefix,
+                       self._get_project_id(request),
+                       collection_name)
+        return "%s?%s" % (url, urlparse.urlencode(params))
 
     def _get_href_link(self, request, identifier, collection_name):
         """Return an href string pointing to this object."""
         prefix = self._update_compute_link_prefix(request.application_url)
-        return os.path.join(prefix,
-                            self._get_project_id(request),
-                            collection_name,
-                            str(identifier))
+        return url_join(prefix,
+                        self._get_project_id(request),
+                        collection_name,
+                        str(identifier))
 
     def _get_bookmark_link(self, request, identifier, collection_name):
         """Create a URL that refers to a specific resource."""
-        base_url = remove_version_from_href(request.application_url)
+        base_url = remove_trailing_version_from_href(request.application_url)
         base_url = self._update_compute_link_prefix(base_url)
-        return os.path.join(base_url,
-                            self._get_project_id(request),
-                            collection_name,
-                            str(identifier))
+        return url_join(base_url,
+                        self._get_project_id(request),
+                        collection_name,
+                        str(identifier))
 
     def _get_collection_links(self,
                               request,
@@ -482,15 +418,15 @@ class ViewBuilder(object):
                               id_key="uuid"):
         """Retrieve 'next' link, if applicable. This is included if:
         1) 'limit' param is specified and equals the number of items.
-        2) 'limit' param is specified but it exceeds CONF.osapi_max_limit,
-        in this case the number of items is CONF.osapi_max_limit.
+        2) 'limit' param is specified but it exceeds CONF.api.max_limit,
+        in this case the number of items is CONF.api.max_limit.
         3) 'limit' param is NOT specified but the number of items is
-        CONF.osapi_max_limit.
+        CONF.api.max_limit.
         """
         links = []
         max_items = min(
-            int(request.params.get("limit", CONF.osapi_max_limit)),
-            CONF.osapi_max_limit)
+            int(request.params.get("limit", CONF.api.max_limit)),
+            CONF.api.max_limit)
         if max_items and max_items == len(items):
             last_item = items[-1]
             if id_key in last_item:
@@ -517,29 +453,134 @@ class ViewBuilder(object):
         return urlparse.urlunsplit(url_parts).rstrip('/')
 
     def _update_glance_link_prefix(self, orig_url):
-        return self._update_link_prefix(orig_url,
-                                        CONF.osapi_glance_link_prefix)
+        return self._update_link_prefix(orig_url, CONF.api.glance_link_prefix)
 
     def _update_compute_link_prefix(self, orig_url):
-        return self._update_link_prefix(orig_url,
-                                        CONF.osapi_compute_link_prefix)
+        return self._update_link_prefix(orig_url, CONF.api.compute_link_prefix)
 
 
-def get_instance(compute_api, context, instance_id, expected_attrs=None):
+def get_instance(compute_api, context, instance_id, expected_attrs=None,
+                 cell_down_support=False):
     """Fetch an instance from the compute API, handling error checking."""
     try:
         return compute_api.get(context, instance_id,
-                               want_objects=True,
-                               expected_attrs=expected_attrs)
+                               expected_attrs=expected_attrs,
+                               cell_down_support=cell_down_support)
     except exception.InstanceNotFound as e:
         raise exc.HTTPNotFound(explanation=e.format_message())
 
 
-def check_cells_enabled(function):
-    @functools.wraps(function)
-    def inner(*args, **kwargs):
-        if not CONF.cells.enable:
-            msg = _("Cells is not enabled.")
-            raise webob.exc.HTTPNotImplemented(explanation=msg)
-        return function(*args, **kwargs)
-    return inner
+def normalize_name(name):
+    # NOTE(alex_xu): This method is used by v2.1 legacy v2 compat mode.
+    # In the legacy v2 API, some of APIs strip the spaces and some of APIs not.
+    # The v2.1 disallow leading/trailing, for compatible v2 API and consistent,
+    # we enable leading/trailing spaces and strip spaces in legacy v2 compat
+    # mode. Althrough in legacy v2 API there are some APIs didn't strip spaces,
+    # but actually leading/trailing spaces(that means user depend on leading/
+    # trailing spaces distinguish different instance) is pointless usecase.
+    return name.strip()
+
+
+def raise_feature_not_supported(msg=None):
+    if msg is None:
+        msg = _("The requested functionality is not supported.")
+    raise webob.exc.HTTPNotImplemented(explanation=msg)
+
+
+def get_flavor(context, flavor_id):
+    try:
+        return objects.Flavor.get_by_flavor_id(context, flavor_id)
+    except exception.FlavorNotFound as error:
+        raise exc.HTTPNotFound(explanation=error.format_message())
+
+
+def is_all_tenants(search_opts):
+    """Checks to see if the all_tenants flag is in search_opts
+
+    :param dict search_opts: The search options for a request
+    :returns: boolean indicating if all_tenants are being requested or not
+    """
+    all_tenants = search_opts.get('all_tenants')
+    if all_tenants:
+        try:
+            all_tenants = strutils.bool_from_string(all_tenants, True)
+        except ValueError as err:
+            raise exception.InvalidInput(six.text_type(err))
+    else:
+        # The empty string is considered enabling all_tenants
+        all_tenants = 'all_tenants' in search_opts
+    return all_tenants
+
+
+def is_locked(search_opts):
+    """Converts the value of the locked parameter to a boolean. Note that
+    this function will be called only if locked exists in search_opts.
+
+    :param dict search_opts: The search options for a request
+    :returns: boolean indicating if locked is being requested or not
+    """
+    locked = search_opts.get('locked')
+    try:
+        locked = strutils.bool_from_string(locked, strict=True)
+    except ValueError as err:
+        raise exception.InvalidInput(six.text_type(err))
+    return locked
+
+
+def supports_multiattach_volume(req):
+    """Check to see if the requested API version is high enough for multiattach
+
+    Microversion 2.60 adds support for booting from a multiattach volume.
+    The actual validation for a multiattach volume is done in the compute
+    API code, this is just checking the version so we can tell the API
+    code if the request version is high enough to even support it.
+
+    :param req: The incoming API request
+    :returns: True if the requested API microversion is high enough for
+        volume multiattach support, False otherwise.
+    """
+    return api_version_request.is_supported(req, '2.60')
+
+
+def supports_port_resource_request(req):
+    """Check to see if the requested API version is high enough for resource
+    request
+
+    :param req: The incoming API request
+    :returns: True if the requested API microversion is high enough for
+        port resource request support, False otherwise.
+    """
+    return api_version_request.is_supported(req, '2.72')
+
+
+def supports_port_resource_request_during_move(req):
+    """Check to see if the requested API version is high enough for support
+    port resource request during move operation.
+
+    NOTE: At the moment there is no such microversion that supports port
+    resource request during move. This function is added as a preparation for
+    that microversion (assuming there will be a new microversion, which is
+    yet to be decided).
+
+    :param req: The incoming API request
+    :returns: True if the requested API microversion is high enough for
+        port resource request move support, False otherwise.
+    """
+    return False
+
+
+def instance_has_port_with_resource_request(
+        context, instance_uuid, network_api):
+
+    # TODO(gibi): Use instance.info_cache to see if there is VIFs with
+    # allocation key in the profile. If there is no such VIF for an instance
+    # and the instance is not shelve offloaded then we can be sure that the
+    # instance has no port with resource request. If the instance is shelve
+    # offloaded then we still have to hit neutron.
+    search_opts = {'device_id': instance_uuid,
+                   'fields': ['resource_request']}
+    ports = network_api.list_ports(context, **search_opts).get('ports', [])
+    for port in ports:
+        if port.get('resource_request'):
+            return True
+    return False

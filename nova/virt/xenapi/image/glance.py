@@ -16,64 +16,61 @@
 import functools
 import sys
 
-from oslo_config import cfg
+from os_xenapi.client import exception as xenapi_exception
+from os_xenapi.client import host_glance
 from oslo_log import log as logging
+import six
 
 from nova.compute import utils as compute_utils
+import nova.conf
 from nova import exception
 from nova.image import glance
 from nova import utils
 from nova.virt.xenapi import vm_utils
 
-CONF = cfg.CONF
-CONF.import_opt('num_retries', 'nova.image.glance', group='glance')
+CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
 
 
 class GlanceStore(object):
-    def _call_glance_plugin(self, context, instance, session, fn, params):
-        glance_api_servers = glance.get_api_servers()
+    def _call_glance_plugin(self, context, instance, session, fn, image_id,
+                            params):
+        glance_api_servers = glance.get_api_servers(context)
+        sr_path = vm_utils.get_sr_path(session)
+        extra_headers = glance.generate_identity_headers(context)
 
         def pick_glance(kwargs):
-            g_host, g_port, g_use_ssl = glance_api_servers.next()
-            kwargs['glance_host'] = g_host
-            kwargs['glance_port'] = g_port
-            kwargs['glance_use_ssl'] = g_use_ssl
-            return g_host
+            server = next(glance_api_servers)
+            kwargs['endpoint'] = server
+            kwargs['api_version'] = 2
+            # NOTE(sdague): is the return significant here at all?
+            return server
 
         def retry_cb(context, instance, exc=None):
             if exc:
                 exc_info = sys.exc_info()
-                LOG.debug(exc.message, exc_info=exc_info)
+                LOG.debug(six.text_type(exc), exc_info=exc_info)
                 compute_utils.add_instance_fault_from_exc(
                     context, instance, exc, exc_info)
 
         cb = functools.partial(retry_cb, context, instance)
 
-        return session.call_plugin_serialized_with_retry(
-            'glance', fn, CONF.glance.num_retries, pick_glance, cb, **params)
-
-    def _make_params(self, context, session, image_id):
-        return {'image_id': image_id,
-                'sr_path': vm_utils.get_sr_path(session),
-                'extra_headers': glance.generate_identity_headers(context)}
+        return fn(session, CONF.glance.num_retries, pick_glance, cb, image_id,
+                  sr_path, extra_headers, **params)
 
     def download_image(self, context, session, instance, image_id):
-        params = self._make_params(context, session, image_id)
-        params['uuid_stack'] = vm_utils._make_uuid_stack()
-
+        params = {'uuid_stack': vm_utils._make_uuid_stack()}
         try:
             vdis = self._call_glance_plugin(context, instance, session,
-                                            'download_vhd', params)
-        except exception.PluginRetriesExceeded:
+                                            host_glance.download_vhd, image_id,
+                                            params)
+        except xenapi_exception.PluginRetriesExceeded:
             raise exception.CouldNotFetchImage(image_id=image_id)
 
         return vdis
 
     def upload_image(self, context, session, instance, image_id, vdi_uuids):
-        params = self._make_params(context, session, image_id)
-        params['vdi_uuids'] = vdi_uuids
-
+        params = {'vdi_uuids': vdi_uuids}
         props = params['properties'] = {}
         props['auto_disk_config'] = instance['auto_disk_config']
         props['os_type'] = instance.get('os_type', None) or (
@@ -89,6 +86,8 @@ class GlanceStore(object):
 
         try:
             self._call_glance_plugin(context, instance, session,
-                                     'upload_vhd', params)
-        except exception.PluginRetriesExceeded:
+                                     host_glance.upload_vhd, image_id, params)
+        except xenapi_exception.PluginRetriesExceeded:
             raise exception.CouldNotUploadImage(image_id=image_id)
+        except xenapi_exception.PluginImageNotFound:
+            raise exception.ImageNotFound(image_id=image_id)

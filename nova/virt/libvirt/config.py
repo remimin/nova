@@ -26,7 +26,6 @@ helpers for populating up config object instances.
 import time
 
 from lxml import etree
-from oslo_log import log as logging
 from oslo_utils import units
 import six
 
@@ -35,8 +34,6 @@ from nova.i18n import _
 from nova.pci import utils as pci_utils
 from nova.virt import hardware
 
-
-LOG = logging.getLogger(__name__)
 
 # Namespace to use for Nova specific metadata items in XML
 NOVA_NS = "http://openstack.org/xmlns/libvirt/nova/1.0"
@@ -51,16 +48,16 @@ class LibvirtConfigObject(object):
         self.ns_prefix = kwargs.get('ns_prefix')
         self.ns_uri = kwargs.get('ns_uri')
 
-    def _new_node(self, name, **kwargs):
+    def _new_node(self, node_name, **kwargs):
         if self.ns_uri is None:
-            return etree.Element(name, **kwargs)
+            return etree.Element(node_name, **kwargs)
         else:
-            return etree.Element("{" + self.ns_uri + "}" + name,
+            return etree.Element("{" + self.ns_uri + "}" + node_name,
                                  nsmap={self.ns_prefix: self.ns_uri},
                                  **kwargs)
 
-    def _text_node(self, name, value, **kwargs):
-        child = self._new_node(name, **kwargs)
+    def _text_node(self, node_name, value, **kwargs):
+        child = self._new_node(node_name, **kwargs)
         child.text = six.text_type(value)
         return child
 
@@ -78,8 +75,8 @@ class LibvirtConfigObject(object):
 
     def to_xml(self, pretty_print=True):
         root = self.format_dom()
-        xml_str = etree.tostring(root, pretty_print=pretty_print)
-        LOG.debug("Generated XML %s ", (xml_str,))
+        xml_str = etree.tostring(root, encoding='unicode',
+                                 pretty_print=pretty_print)
         return xml_str
 
 
@@ -113,6 +110,74 @@ class LibvirtConfigCaps(LibvirtConfigObject):
             caps.append(g.format_dom())
 
         return caps
+
+
+class LibvirtConfigDomainCaps(LibvirtConfigObject):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigDomainCaps, self).__init__(
+            root_name="domainCapabilities", **kwargs)
+        self._features = None
+
+    def parse_dom(self, xmldoc):
+        super(LibvirtConfigDomainCaps, self).parse_dom(xmldoc)
+
+        for c in xmldoc.getchildren():
+            if c.tag == "features":
+                features = LibvirtConfigDomainCapsFeatures()
+                features.parse_dom(c)
+                self._features = features
+
+    @property
+    def features(self):
+        if self._features is None:
+            return []
+        return self._features.features
+
+
+class LibvirtConfigDomainCapsFeatures(LibvirtConfigObject):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigDomainCapsFeatures, self).__init__(
+            root_name="features", **kwargs)
+        self.features = []
+
+    def parse_dom(self, xmldoc):
+        super(LibvirtConfigDomainCapsFeatures, self).parse_dom(xmldoc)
+
+        for c in xmldoc.getchildren():
+            feature = None
+            if c.tag == "sev":
+                feature = LibvirtConfigDomainCapsFeatureSev()
+            if feature:
+                feature.parse_dom(c)
+                self.features.append(feature)
+
+            # There are many other features and domain capabilities,
+            # but we don't need to regenerate the XML (it's read-only
+            # data provided by libvirtd), so there's no point parsing
+            # them until we actually need their values.
+
+    # For the same reason, we do not need a format_dom() method, but
+    # it's a bug if this ever gets called and we inherited one from
+    # the base class, so override that to watch out for accidental
+    # calls.
+    def format_dom(self):
+        raise RuntimeError(_('BUG: tried to generate domainCapabilities XML'))
+
+
+class LibvirtConfigDomainCapsFeatureSev(LibvirtConfigObject):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigDomainCapsFeatureSev, self).__init__(
+            root_name='sev', **kwargs)
+        self.supported = False
+
+    def parse_dom(self, xmldoc):
+        super(LibvirtConfigDomainCapsFeatureSev, self).parse_dom(xmldoc)
+
+        if xmldoc.get('supported') == 'yes':
+            self.supported = True
 
 
 class LibvirtConfigCapsNUMATopology(LibvirtConfigObject):
@@ -307,6 +372,21 @@ class LibvirtConfigCapsGuest(LibvirtConfigObject):
         self.ostype = None
         self.domtype = list()
 
+        # Track <emulator> values, which we need in order to be able
+        # to call virConnectGetDomainCapabilities() - typically
+        # something like '/usr/bin/qemu-system-i386'.
+        #
+        # Firstly we track the default for any <domain> child without
+        # its own <emulator> sub-child:
+        self.emulator = None
+        #
+        # Also per-<domain> overrides for the default in self.emulator.
+        # The dict maps domain types such as 'kvm' to the emulator
+        # path for that domain type.  Note that these overrides come
+        # from <emulator> elements under each <domain>; there is no
+        # <domemulator> element.
+        self.domemulator = dict()
+
     def parse_dom(self, xmldoc):
         super(LibvirtConfigCapsGuest, self).parse_dom(xmldoc)
 
@@ -315,9 +395,18 @@ class LibvirtConfigCapsGuest(LibvirtConfigObject):
                 self.ostype = c.text
             elif c.tag == "arch":
                 self.arch = c.get("name")
-                for sc in c.getchildren():
-                    if sc.tag == "domain":
-                        self.domtype.append(sc.get("type"))
+                for ac in c.getchildren():
+                    if ac.tag == "domain":
+                        self.parse_domain(ac)
+                    elif ac.tag == "emulator":
+                        self.emulator = ac.text
+
+    def parse_domain(self, domxml):
+        domtype = domxml.get("type")
+        self.domtype.append(domtype)
+        for dc in domxml.getchildren():
+            if dc.tag == "emulator":
+                self.domemulator[domtype] = dc.text
 
     def format_dom(self):
         caps = super(LibvirtConfigCapsGuest, self).format_dom()
@@ -326,9 +415,14 @@ class LibvirtConfigCapsGuest(LibvirtConfigObject):
             caps.append(self._text_node("os_type", self.ostype))
         if self.arch:
             arch = etree.Element("arch", name=self.arch)
+            if self.emulator is not None:
+                arch.append(self._text_node("emulator", self.emulator))
             for dt in self.domtype:
                 dte = etree.Element("domain")
                 dte.set("type", dt)
+                if dt in self.domemulator:
+                    dte.append(self._text_node("emulator",
+                                               self.domemulator[dt]))
                 arch.append(dte)
             caps.append(arch)
 
@@ -509,6 +603,7 @@ class LibvirtConfigGuestCPUNUMACell(LibvirtConfigObject):
         self.id = None
         self.cpus = None
         self.memory = None
+        self.memAccess = None
 
     def parse_dom(self, xmldoc):
         if xmldoc.get("id") is not None:
@@ -517,6 +612,7 @@ class LibvirtConfigGuestCPUNUMACell(LibvirtConfigObject):
             self.memory = int(xmldoc.get("memory"))
         if xmldoc.get("cpus") is not None:
             self.cpus = hardware.parse_cpu_spec(xmldoc.get("cpus"))
+        self.memAccess = xmldoc.get("memAccess")
 
     def format_dom(self):
         cell = super(LibvirtConfigGuestCPUNUMACell, self).format_dom()
@@ -528,6 +624,8 @@ class LibvirtConfigGuestCPUNUMACell(LibvirtConfigObject):
                      hardware.format_cpu_spec(self.cpus))
         if self.memory is not None:
             cell.set("memory", str(self.memory))
+        if self.memAccess is not None:
+            cell.set("memAccess", self.memAccess)
 
         return cell
 
@@ -618,67 +716,52 @@ class LibvirtConfigGuestSysinfo(LibvirtConfigObject):
         self.system_version = None
         self.system_serial = None
         self.system_uuid = None
+        self.system_family = None
 
     def format_dom(self):
         sysinfo = super(LibvirtConfigGuestSysinfo, self).format_dom()
 
         sysinfo.set("type", self.type)
 
-        bios = None
-        system = None
+        bios = etree.Element("bios")
+        system = etree.Element("system")
 
         if self.bios_vendor is not None:
-            if bios is None:
-                bios = etree.Element("bios")
-            info = etree.Element("entry", name="vendor")
-            info.text = self.bios_vendor
-            bios.append(info)
+            bios.append(self._text_node("entry", self.bios_vendor,
+                                        name="vendor"))
 
         if self.bios_version is not None:
-            if bios is None:
-                bios = etree.Element("bios")
-            info = etree.Element("entry", name="version")
-            info.text = self.bios_version
-            bios.append(info)
+            bios.append(self._text_node("entry", self.bios_version,
+                                        name="version"))
 
         if self.system_manufacturer is not None:
-            if system is None:
-                system = etree.Element("system")
-            info = etree.Element("entry", name="manufacturer")
-            info.text = self.system_manufacturer
-            system.append(info)
+            system.append(self._text_node("entry", self.system_manufacturer,
+                                          name="manufacturer"))
 
         if self.system_product is not None:
-            if system is None:
-                system = etree.Element("system")
-            info = etree.Element("entry", name="product")
-            info.text = self.system_product
-            system.append(info)
+            system.append(self._text_node("entry", self.system_product,
+                                          name="product"))
 
         if self.system_version is not None:
-            if system is None:
-                system = etree.Element("system")
-            info = etree.Element("entry", name="version")
-            info.text = self.system_version
-            system.append(info)
+            system.append(self._text_node("entry", self.system_version,
+                                          name="version"))
 
         if self.system_serial is not None:
-            if system is None:
-                system = etree.Element("system")
-            info = etree.Element("entry", name="serial")
-            info.text = self.system_serial
-            system.append(info)
+            system.append(self._text_node("entry", self.system_serial,
+                                          name="serial"))
 
         if self.system_uuid is not None:
-            if system is None:
-                system = etree.Element("system")
-            info = etree.Element("entry", name="uuid")
-            info.text = self.system_uuid
-            system.append(info)
+            system.append(self._text_node("entry", self.system_uuid,
+                                          name="uuid"))
 
-        if bios is not None:
+        if self.system_family is not None:
+            system.append(self._text_node("entry", self.system_family,
+                                          name="family"))
+
+        if len(list(bios)) > 0:
             sysinfo.append(bios)
-        if system is not None:
+
+        if len(list(system)) > 0:
             sysinfo.append(system)
 
         return sysinfo
@@ -702,6 +785,7 @@ class LibvirtConfigGuestDisk(LibvirtConfigGuestDevice):
         self.driver_format = None
         self.driver_cache = None
         self.driver_discard = None
+        self.driver_io = None
         self.source_path = None
         self.source_protocol = None
         self.source_name = None
@@ -720,11 +804,81 @@ class LibvirtConfigGuestDisk(LibvirtConfigGuestDevice):
         self.disk_write_iops_sec = None
         self.disk_total_bytes_sec = None
         self.disk_total_iops_sec = None
+        self.disk_read_bytes_sec_max = None
+        self.disk_write_bytes_sec_max = None
+        self.disk_total_bytes_sec_max = None
+        self.disk_read_iops_sec_max = None
+        self.disk_write_iops_sec_max = None
+        self.disk_total_iops_sec_max = None
+        self.disk_size_iops_sec = None
         self.logical_block_size = None
         self.physical_block_size = None
         self.readonly = False
+        self.shareable = False
         self.snapshot = None
         self.backing_store = None
+        self.device_addr = None
+        self.boot_order = None
+        self.mirror = None
+        self.encryption = None
+
+    def _format_iotune(self, dev):
+        iotune = etree.Element("iotune")
+
+        if self.disk_read_bytes_sec is not None:
+            iotune.append(self._text_node("read_bytes_sec",
+                          self.disk_read_bytes_sec))
+
+        if self.disk_read_iops_sec is not None:
+            iotune.append(self._text_node("read_iops_sec",
+                          self.disk_read_iops_sec))
+
+        if self.disk_write_bytes_sec is not None:
+            iotune.append(self._text_node("write_bytes_sec",
+                          self.disk_write_bytes_sec))
+
+        if self.disk_write_iops_sec is not None:
+            iotune.append(self._text_node("write_iops_sec",
+                          self.disk_write_iops_sec))
+
+        if self.disk_total_bytes_sec is not None:
+            iotune.append(self._text_node("total_bytes_sec",
+                          self.disk_total_bytes_sec))
+
+        if self.disk_total_iops_sec is not None:
+            iotune.append(self._text_node("total_iops_sec",
+                          self.disk_total_iops_sec))
+
+        if self.disk_read_bytes_sec_max is not None:
+            iotune.append(self._text_node("read_bytes_sec_max",
+                          self.disk_read_bytes_sec_max))
+
+        if self.disk_write_bytes_sec_max is not None:
+            iotune.append(self._text_node("write_bytes_sec_max",
+                          self.disk_write_bytes_sec_max))
+
+        if self.disk_total_bytes_sec_max is not None:
+            iotune.append(self._text_node("total_bytes_sec_max",
+                          self.disk_total_bytes_sec_max))
+
+        if self.disk_read_iops_sec_max is not None:
+            iotune.append(self._text_node("read_iops_sec_max",
+                          self.disk_read_iops_sec_max))
+
+        if self.disk_write_iops_sec_max is not None:
+            iotune.append(self._text_node("write_iops_sec_max",
+                          self.disk_write_iops_sec_max))
+
+        if self.disk_total_iops_sec_max is not None:
+            iotune.append(self._text_node("total_iops_sec_max",
+                          self.disk_total_iops_sec_max))
+
+        if self.disk_size_iops_sec is not None:
+            iotune.append(self._text_node("size_iops_sec",
+                          self.disk_size_iops_sec))
+
+        if len(iotune) > 0:
+            dev.append(iotune)
 
     def format_dom(self):
         dev = super(LibvirtConfigGuestDisk, self).format_dom()
@@ -744,6 +898,8 @@ class LibvirtConfigGuestDisk(LibvirtConfigGuestDevice):
                 drv.set("cache", self.driver_cache)
             if self.driver_discard is not None:
                 drv.set("discard", self.driver_discard)
+            if self.driver_io is not None:
+                drv.set("io", self.driver_io)
             dev.append(drv)
 
         if self.source_type == "file":
@@ -752,7 +908,7 @@ class LibvirtConfigGuestDisk(LibvirtConfigGuestDevice):
             dev.append(etree.Element("source", dev=self.source_path))
         elif self.source_type == "mount":
             dev.append(etree.Element("source", dir=self.source_path))
-        elif self.source_type == "network":
+        elif self.source_type == "network" and self.source_protocol:
             source = etree.Element("source", protocol=self.source_protocol)
             if self.source_name is not None:
                 source.set('name', self.source_name)
@@ -780,34 +936,7 @@ class LibvirtConfigGuestDisk(LibvirtConfigGuestDevice):
         if self.serial is not None:
             dev.append(self._text_node("serial", self.serial))
 
-        iotune = etree.Element("iotune")
-
-        if self.disk_read_bytes_sec is not None:
-            iotune.append(self._text_node("read_bytes_sec",
-                self.disk_read_bytes_sec))
-
-        if self.disk_read_iops_sec is not None:
-            iotune.append(self._text_node("read_iops_sec",
-                self.disk_read_iops_sec))
-
-        if self.disk_write_bytes_sec is not None:
-            iotune.append(self._text_node("write_bytes_sec",
-                self.disk_write_bytes_sec))
-
-        if self.disk_write_iops_sec is not None:
-            iotune.append(self._text_node("write_iops_sec",
-                self.disk_write_iops_sec))
-
-        if self.disk_total_bytes_sec is not None:
-            iotune.append(self._text_node("total_bytes_sec",
-                self.disk_total_bytes_sec))
-
-        if self.disk_total_iops_sec is not None:
-            iotune.append(self._text_node("total_iops_sec",
-                self.disk_total_iops_sec))
-
-        if len(iotune) > 0:
-            dev.append(iotune)
+        self._format_iotune(dev)
 
         # Block size tuning
         if (self.logical_block_size is not None or
@@ -824,6 +953,17 @@ class LibvirtConfigGuestDisk(LibvirtConfigGuestDevice):
 
         if self.readonly:
             dev.append(etree.Element("readonly"))
+        if self.shareable:
+            dev.append(etree.Element("shareable"))
+
+        if self.boot_order:
+            dev.append(etree.Element("boot", order=self.boot_order))
+
+        if self.device_addr:
+            dev.append(self.device_addr.format_dom())
+
+        if self.encryption:
+            dev.append(self.encryption.format_dom())
 
         return dev
 
@@ -839,6 +979,7 @@ class LibvirtConfigGuestDisk(LibvirtConfigGuestDevice):
                 self.driver_format = c.get('type')
                 self.driver_cache = c.get('cache')
                 self.driver_discard = c.get('discard')
+                self.driver_io = c.get('io')
             elif c.tag == 'source':
                 if self.source_type == 'file':
                     self.source_path = c.get('file')
@@ -867,6 +1008,23 @@ class LibvirtConfigGuestDisk(LibvirtConfigGuestDevice):
                 b = LibvirtConfigGuestDiskBackingStore()
                 b.parse_dom(c)
                 self.backing_store = b
+            elif c.tag == 'readonly':
+                self.readonly = True
+            elif c.tag == 'shareable':
+                self.shareable = True
+            elif c.tag == 'address':
+                obj = LibvirtConfigGuestDeviceAddress.parse_dom(c)
+                self.device_addr = obj
+            elif c.tag == 'boot':
+                self.boot_order = c.get('order')
+            elif c.tag == 'mirror':
+                m = LibvirtConfigGuestDiskMirror()
+                m.parse_dom(c)
+                self.mirror = m
+            elif c.tag == 'encryption':
+                e = LibvirtConfigGuestDiskEncryption()
+                e.parse_dom(c)
+                self.encryption = e
 
 
 class LibvirtConfigGuestDiskBackingStore(LibvirtConfigObject):
@@ -1071,6 +1229,77 @@ class LibvirtConfigGuestFilesys(LibvirtConfigGuestDevice):
 
         return dev
 
+    def parse_dom(self, xmldoc):
+        super(LibvirtConfigGuestFilesys, self).parse_dom(xmldoc)
+
+        self.source_type = xmldoc.get('type')
+
+        for c in xmldoc.getchildren():
+            if c.tag == 'driver':
+                if self.source_type == 'file':
+                    self.driver_type = c.get('type')
+                    self.driver_format = c.get('format')
+            elif c.tag == 'source':
+                if self.source_type == 'file':
+                    self.source_file = c.get('file')
+                elif self.source_type == 'block':
+                    self.source_dev = c.get('dev')
+                else:
+                    self.source_dir = c.get('dir')
+            elif c.tag == 'target':
+                self.target_dir = c.get('dir')
+
+
+class LibvirtConfigGuestDiskEncryptionSecret(LibvirtConfigObject):
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestDiskEncryptionSecret, self).__init__(**kwargs)
+        self.type = None
+        self.uuid = None
+
+    def parse_dom(self, xmldoc):
+        self.type = xmldoc.get('type')
+        self.uuid = xmldoc.get('uuid')
+
+    def format_dom(self):
+        obj = etree.Element("secret")
+        obj.set("type", self.type)
+        obj.set("uuid", self.uuid)
+        return obj
+
+
+class LibvirtConfigGuestDiskEncryption(LibvirtConfigObject):
+    """https://libvirt.org/formatstorageencryption.html
+    """
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestDiskEncryption, self).__init__(**kwargs)
+        self.format = None
+        self.secret = None
+
+    def parse_dom(self, xmldoc):
+        self.format = xmldoc.get('format')
+        for c in xmldoc.getchildren():
+            if c.tag == 'secret':
+                m = LibvirtConfigGuestDiskEncryptionSecret()
+                m.parse_dom(c)
+                self.secret = m
+
+    def format_dom(self):
+        obj = etree.Element("encryption")
+        obj.set("format", self.format)
+        obj.append(self.secret.format_dom())
+
+        return obj
+
+
+class LibvirtConfigGuestDiskMirror(LibvirtConfigObject):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestDiskMirror, self).__init__(**kwargs)
+        self.ready = None
+
+    def parse_dom(self, xmldoc):
+        self.ready = xmldoc.get('ready')
+
 
 class LibvirtConfigGuestIDMap(LibvirtConfigObject):
 
@@ -1109,6 +1338,100 @@ class LibvirtConfigGuestGIDMap(LibvirtConfigGuestIDMap):
                                                        **kwargs)
 
 
+class LibvirtConfigGuestDeviceAddress(LibvirtConfigObject):
+    def __init__(self, type=None, **kwargs):
+        super(LibvirtConfigGuestDeviceAddress, self).__init__(
+            root_name='address', **kwargs)
+        self.type = type
+
+    def format_dom(self):
+        xml = super(LibvirtConfigGuestDeviceAddress, self).format_dom()
+        xml.set("type", self.type)
+        return xml
+
+    @staticmethod
+    def parse_dom(xmldoc):
+        addr_type = xmldoc.get('type')
+        if addr_type == 'pci':
+            obj = LibvirtConfigGuestDeviceAddressPCI()
+        elif addr_type == 'drive':
+            obj = LibvirtConfigGuestDeviceAddressDrive()
+        else:
+            return None
+        obj.parse_dom(xmldoc)
+        return obj
+
+
+class LibvirtConfigGuestDeviceAddressDrive(LibvirtConfigGuestDeviceAddress):
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestDeviceAddressDrive, self).\
+                __init__(type='drive', **kwargs)
+        self.controller = None
+        self.bus = None
+        self.target = None
+        self.unit = None
+
+    def format_dom(self):
+        xml = super(LibvirtConfigGuestDeviceAddressDrive, self).format_dom()
+
+        if self.controller is not None:
+            xml.set("controller", str(self.controller))
+        if self.bus is not None:
+            xml.set("bus", str(self.bus))
+        if self.target is not None:
+            xml.set("target", str(self.target))
+        if self.unit is not None:
+            xml.set("unit", str(self.unit))
+
+        return xml
+
+    def parse_dom(self, xmldoc):
+        self.controller = xmldoc.get('controller')
+        self.bus = xmldoc.get('bus')
+        self.target = xmldoc.get('target')
+        self.unit = xmldoc.get('unit')
+
+    def format_address(self):
+        return None
+
+
+class LibvirtConfigGuestDeviceAddressPCI(LibvirtConfigGuestDeviceAddress):
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestDeviceAddressPCI, self).\
+                __init__(type='pci', **kwargs)
+        self.domain = None
+        self.bus = None
+        self.slot = None
+        self.function = None
+
+    def format_dom(self):
+        xml = super(LibvirtConfigGuestDeviceAddressPCI, self).format_dom()
+
+        if self.domain is not None:
+            xml.set("domain", str(self.domain))
+        if self.bus is not None:
+            xml.set("bus", str(self.bus))
+        if self.slot is not None:
+            xml.set("slot", str(self.slot))
+        if self.function is not None:
+            xml.set("function", str(self.function))
+
+        return xml
+
+    def parse_dom(self, xmldoc):
+        self.domain = xmldoc.get('domain')
+        self.bus = xmldoc.get('bus')
+        self.slot = xmldoc.get('slot')
+        self.function = xmldoc.get('function')
+
+    def format_address(self):
+        if self.domain is not None:
+            return pci_utils.get_pci_address(self.domain[2:],
+                                             self.bus[2:],
+                                             self.slot[2:],
+                                             self.function[2:])
+
+
 class LibvirtConfigGuestInterface(LibvirtConfigGuestDevice):
 
     def __init__(self, **kwargs):
@@ -1131,6 +1454,9 @@ class LibvirtConfigGuestInterface(LibvirtConfigGuestDevice):
         self.vhostuser_mode = None
         self.vhostuser_path = None
         self.vhostuser_type = None
+        self.vhost_queues = None
+        self.vhost_rx_queue_size = None
+        self.vhost_tx_queue_size = None
         self.vif_inbound_peak = None
         self.vif_inbound_burst = None
         self.vif_inbound_average = None
@@ -1138,6 +1464,8 @@ class LibvirtConfigGuestInterface(LibvirtConfigGuestDevice):
         self.vif_outbound_burst = None
         self.vif_outbound_average = None
         self.vlan = None
+        self.device_addr = None
+        self.mtu = None
 
     def format_dom(self):
         dev = super(LibvirtConfigGuestInterface, self).format_dom()
@@ -1149,12 +1477,33 @@ class LibvirtConfigGuestInterface(LibvirtConfigGuestDevice):
         if self.model:
             dev.append(etree.Element("model", type=self.model))
 
+        drv_elem = None
         if self.driver_name:
-            dev.append(etree.Element("driver", name=self.driver_name))
+            drv_elem = etree.Element("driver", name=self.driver_name)
+        if self.net_type == "vhostuser":
+            # For vhostuser interface we should not set the driver
+            # name.
+            drv_elem = etree.Element("driver")
+        if drv_elem is not None:
+            if self.vhost_queues is not None:
+                drv_elem.set('queues', str(self.vhost_queues))
+            if self.vhost_rx_queue_size is not None:
+                drv_elem.set('rx_queue_size', str(self.vhost_rx_queue_size))
+            if self.vhost_tx_queue_size is not None:
+                drv_elem.set('tx_queue_size', str(self.vhost_tx_queue_size))
+
+            if (drv_elem.get('name') or drv_elem.get('queues') or
+                drv_elem.get('rx_queue_size') or
+                drv_elem.get('tx_queue_size')):
+                # Append the driver element into the dom only if name
+                # or queues or tx/rx attributes are set.
+                dev.append(drv_elem)
 
         if self.net_type == "ethernet":
             if self.script is not None:
                 dev.append(etree.Element("script", path=self.script))
+            if self.mtu is not None:
+                dev.append(etree.Element("mtu", size=str(self.mtu)))
         elif self.net_type == "direct":
             dev.append(etree.Element("source", dev=self.source_dev,
                                      mode=self.source_mode))
@@ -1173,12 +1522,18 @@ class LibvirtConfigGuestInterface(LibvirtConfigGuestDevice):
             dev.append(etree.Element("source", type=self.vhostuser_type,
                                      mode=self.vhostuser_mode,
                                      path=self.vhostuser_path))
+        elif self.net_type == "bridge":
+            dev.append(etree.Element("source", bridge=self.source_dev))
+            if self.script is not None:
+                dev.append(etree.Element("script", path=self.script))
+            if self.mtu is not None:
+                dev.append(etree.Element("mtu", size=str(self.mtu)))
         else:
             dev.append(etree.Element("source", bridge=self.source_dev))
 
         if self.vlan and self.net_type in ("direct", "hostdev"):
             vlan_elem = etree.Element("vlan")
-            tag_elem = etree.Element("tag", id=self.vlan)
+            tag_elem = etree.Element("tag", id=str(self.vlan))
             vlan_elem.append(tag_elem)
             dev.append(vlan_elem)
 
@@ -1223,6 +1578,91 @@ class LibvirtConfigGuestInterface(LibvirtConfigGuestDevice):
             dev.append(bandwidth)
 
         return dev
+
+    def parse_dom(self, xmldoc):
+        super(LibvirtConfigGuestInterface, self).parse_dom(xmldoc)
+
+        self.net_type = xmldoc.get('type')
+
+        for c in xmldoc.getchildren():
+            if c.tag == 'mac':
+                self.mac_addr = c.get('address')
+            elif c.tag == 'model':
+                self.model = c.get('type')
+            elif c.tag == 'driver':
+                self.driver_name = c.get('name')
+                self.vhost_queues = c.get('queues')
+                self.vhost_rx_queue_size = c.get('rx_queue_size')
+                self.vhost_tx_queue_size = c.get('tx_queue_size')
+            elif c.tag == 'source':
+                if self.net_type == 'direct':
+                    self.source_dev = c.get('dev')
+                    self.source_mode = c.get('mode', 'private')
+                elif self.net_type == 'vhostuser':
+                    self.vhostuser_type = c.get('type')
+                    self.vhostuser_mode = c.get('mode')
+                    self.vhostuser_path = c.get('path')
+                elif self.net_type == 'hostdev':
+                    for sub in c.getchildren():
+                        if sub.tag == 'address' and sub.get('type') == 'pci':
+                            # strip the 0x prefix on each attribute since
+                            # format_dom puts them back on - note that
+                            # LibvirtConfigGuestHostdevPCI does not do this...
+                            self.source_dev = (
+                                pci_utils.get_pci_address(
+                                    sub.get('domain')[2:],
+                                    sub.get('bus')[2:],
+                                    sub.get('slot')[2:],
+                                    sub.get('function')[2:]
+                                )
+                            )
+                else:
+                    self.source_dev = c.get('bridge')
+            elif c.tag == 'target':
+                self.target_dev = c.get('dev')
+            elif c.tag == 'script':
+                self.script = c.get('path')
+            elif c.tag == 'vlan':
+                # NOTE(mriedem): The vlan element can have multiple tag
+                # sub-elements but we're currently only storing a single tag
+                # id in the vlan attribute.
+                for sub in c.getchildren():
+                    if sub.tag == 'tag' and sub.get('id'):
+                        self.vlan = int(sub.get('id'))
+                        break
+            elif c.tag == 'virtualport':
+                self.vporttype = c.get('type')
+                for sub in c.getchildren():
+                    if sub.tag == 'parameters':
+                        for k, v in dict(sub.attrib).items():
+                            self.add_vport_param(k, v)
+            elif c.tag == 'filterref':
+                self.filtername = c.get('filter')
+                for sub in c.getchildren():
+                    if sub.tag == 'parameter':
+                        self.add_filter_param(sub.get('name'),
+                                              sub.get('value'))
+            elif c.tag == 'bandwidth':
+                for sub in c.getchildren():
+                    # Note that only average is mandatory, burst and peak are
+                    # optional (and all are ints).
+                    if sub.tag == 'inbound':
+                        self.vif_inbound_average = int(sub.get('average'))
+                        if sub.get('burst'):
+                            self.vif_inbound_burst = int(sub.get('burst'))
+                        if sub.get('peak'):
+                            self.vif_inbound_peak = int(sub.get('peak'))
+                    elif sub.tag == 'outbound':
+                        self.vif_outbound_average = int(sub.get('average'))
+                        if sub.get('burst'):
+                            self.vif_outbound_burst = int(sub.get('burst'))
+                        if sub.get('peak'):
+                            self.vif_outbound_peak = int(sub.get('peak'))
+            elif c.tag == 'address':
+                obj = LibvirtConfigGuestDeviceAddress.parse_dom(c)
+                self.device_addr = obj
+            elif c.tag == 'mtu':
+                self.mtu = int(c.get('size'))
 
     def add_filter_param(self, key, value):
         self.filterparams.append({'key': key, 'value': value})
@@ -1360,13 +1800,40 @@ class LibvirtConfigGuestController(LibvirtConfigGuestDevice):
         return controller
 
 
+class LibvirtConfigGuestUSBHostController(LibvirtConfigGuestController):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestUSBHostController, self).__init__(**kwargs)
+        self.type = 'usb'
+
+
+class LibvirtConfigGuestPCIeRootController(LibvirtConfigGuestController):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestPCIeRootController, self).\
+                __init__(**kwargs)
+        self.type = 'pci'
+        self.model = 'pcie-root'
+
+
+class LibvirtConfigGuestPCIeRootPortController(LibvirtConfigGuestController):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestPCIeRootPortController, self).\
+                __init__(**kwargs)
+        self.type = 'pci'
+        self.model = 'pcie-root-port'
+
+
 class LibvirtConfigGuestHostdev(LibvirtConfigGuestDevice):
     def __init__(self, **kwargs):
         super(LibvirtConfigGuestHostdev, self).\
                 __init__(root_name="hostdev", **kwargs)
         self.mode = kwargs.get('mode')
         self.type = kwargs.get('type')
-        self.managed = 'yes'
+        # managed attribute is only used by PCI devices but mediated devices
+        # need to say managed=no
+        self.managed = kwargs.get('managed', 'yes')
 
     def format_dom(self):
         dev = super(LibvirtConfigGuestHostdev, self).format_dom()
@@ -1418,6 +1885,37 @@ class LibvirtConfigGuestHostdevPCI(LibvirtConfigGuestHostdev):
                         self.function = sub.get('function')
 
 
+class LibvirtConfigGuestHostdevMDEV(LibvirtConfigGuestHostdev):
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestHostdevMDEV, self).__init__(
+            mode='subsystem', type='mdev', managed='no', **kwargs)
+        # model attribute is only supported by mediated devices
+        self.model = kwargs.get('model', 'vfio-pci')
+        self.uuid = None
+
+    def format_dom(self):
+        dev = super(LibvirtConfigGuestHostdevMDEV, self).format_dom()
+        if self.model:
+            dev.set("model", self.model)
+
+        address = etree.Element("address", uuid=self.uuid)
+        source = etree.Element("source")
+        source.append(address)
+        dev.append(source)
+        return dev
+
+    def parse_dom(self, xmldoc):
+        children = super(LibvirtConfigGuestHostdevMDEV, self).parse_dom(xmldoc)
+        if xmldoc.get('model'):
+            self.model = xmldoc.get('model')
+        for c in children:
+            if c.tag == "source":
+                for sub in c.getchildren():
+                    if sub.tag == 'address':
+                        self.uuid = sub.get('uuid')
+                        return
+
+
 class LibvirtConfigGuestCharBase(LibvirtConfigGuestDevice):
 
     def __init__(self, **kwargs):
@@ -1427,6 +1925,7 @@ class LibvirtConfigGuestCharBase(LibvirtConfigGuestDevice):
         self.source_path = None
         self.listen_port = None
         self.listen_host = None
+        self.log = None
 
     def format_dom(self):
         dev = super(LibvirtConfigGuestCharBase, self).format_dom()
@@ -1442,6 +1941,9 @@ class LibvirtConfigGuestCharBase(LibvirtConfigGuestDevice):
             dev.append(etree.Element("source", mode="bind",
                                      host=self.listen_host,
                                      service=str(self.listen_port)))
+
+        if self.log:
+            dev.append(self.log.format_dom())
 
         return dev
 
@@ -1466,6 +1968,27 @@ class LibvirtConfigGuestChar(LibvirtConfigGuestCharBase):
             dev.append(target)
 
         return dev
+
+
+class LibvirtConfigGuestCharDeviceLog(LibvirtConfigObject):
+    """Represents a sub-element to a character device."""
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestCharDeviceLog, self).__init__(root_name="log",
+                                                              **kwargs)
+        self.file = None
+        self.append = "off"
+
+    def parse_dom(self, xmldoc):
+        super(LibvirtConfigGuestCharDeviceLog, self).parse_dom(xmldoc)
+        self.file = xmldoc.get("file")
+        self.append = xmldoc.get("append")
+
+    def format_dom(self):
+        log = super(LibvirtConfigGuestCharDeviceLog, self).format_dom()
+        log.set("file", self.file)
+        log.set("append", self.append)
+        return log
 
 
 class LibvirtConfigGuestSerial(LibvirtConfigGuestChar):
@@ -1559,6 +2082,31 @@ class LibvirtConfigGuestCPUTuneEmulatorPin(LibvirtConfigObject):
         return root
 
 
+class LibvirtConfigGuestCPUTuneVCPUSched(LibvirtConfigObject):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestCPUTuneVCPUSched, self).__init__(
+            root_name="vcpusched",
+            **kwargs)
+
+        self.vcpus = None
+        self.scheduler = None
+        self.priority = None
+
+    def format_dom(self):
+        root = super(LibvirtConfigGuestCPUTuneVCPUSched, self).format_dom()
+
+        if self.vcpus is not None:
+            root.set("vcpus",
+                     hardware.format_cpu_spec(self.vcpus))
+        if self.scheduler is not None:
+            root.set("scheduler", self.scheduler)
+        if self.priority is not None:
+            root.set("priority", str(self.priority))
+
+        return root
+
+
 class LibvirtConfigGuestCPUTune(LibvirtConfigObject):
 
     def __init__(self, **kwargs):
@@ -1569,6 +2117,7 @@ class LibvirtConfigGuestCPUTune(LibvirtConfigObject):
         self.period = None
         self.vcpupin = []
         self.emulatorpin = None
+        self.vcpusched = []
 
     def format_dom(self):
         root = super(LibvirtConfigGuestCPUTune, self).format_dom()
@@ -1584,6 +2133,8 @@ class LibvirtConfigGuestCPUTune(LibvirtConfigObject):
             root.append(self.emulatorpin.format_dom())
         for vcpu in self.vcpupin:
             root.append(vcpu.format_dom())
+        for sched in self.vcpusched:
+            root.append(sched.format_dom())
 
         return root
 
@@ -1597,6 +2148,10 @@ class LibvirtConfigGuestMemoryBacking(LibvirtConfigObject):
         self.hugepages = []
         self.sharedpages = True
         self.locked = False
+        self.filesource = False
+        self.sharedaccess = False
+        self.allocateimmediate = False
+        self.discard = False
 
     def format_dom(self):
         root = super(LibvirtConfigGuestMemoryBacking, self).format_dom()
@@ -1607,9 +2162,17 @@ class LibvirtConfigGuestMemoryBacking(LibvirtConfigObject):
                 hugepages.append(item.format_dom())
             root.append(hugepages)
         if not self.sharedpages:
-            root.append(etree.Element("nosharedpages"))
+            root.append(etree.Element("nosharepages"))
         if self.locked:
             root.append(etree.Element("locked"))
+        if self.filesource:
+            root.append(etree.Element("source", type="file"))
+        if self.sharedaccess:
+            root.append(etree.Element("access", mode="shared"))
+        if self.allocateimmediate:
+            root.append(etree.Element("allocation", mode="immediate"))
+        if self.discard:
+            root.append(etree.Element("discard"))
 
         return root
 
@@ -1753,10 +2316,26 @@ class LibvirtConfigGuestFeaturePAE(LibvirtConfigGuestFeature):
                                                            **kwargs)
 
 
+class LibvirtConfigGuestFeatureKvmHidden(LibvirtConfigGuestFeature):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestFeatureKvmHidden, self).__init__("kvm",
+                                                                 **kwargs)
+
+    def format_dom(self):
+        root = super(LibvirtConfigGuestFeatureKvmHidden, self).format_dom()
+
+        root.append(etree.Element("hidden", state="on"))
+
+        return root
+
+
 class LibvirtConfigGuestFeatureHyperV(LibvirtConfigGuestFeature):
 
     # QEMU requires at least this value to be set
     MIN_SPINLOCK_RETRIES = 4095
+    # The spoofed vendor_id can be any alphanumeric string
+    SPOOFED_VENDOR_ID = "1234567890ab"
 
     def __init__(self, **kwargs):
         super(LibvirtConfigGuestFeatureHyperV, self).__init__("hyperv",
@@ -1766,6 +2345,8 @@ class LibvirtConfigGuestFeatureHyperV(LibvirtConfigGuestFeature):
         self.vapic = False
         self.spinlocks = False
         self.spinlock_retries = self.MIN_SPINLOCK_RETRIES
+        self.vendorid_spoof = False
+        self.vendorid = self.SPOOFED_VENDOR_ID
 
     def format_dom(self):
         root = super(LibvirtConfigGuestFeatureHyperV, self).format_dom()
@@ -1777,6 +2358,9 @@ class LibvirtConfigGuestFeatureHyperV(LibvirtConfigGuestFeature):
         if self.spinlocks:
             root.append(etree.Element("spinlocks", state="on",
                                       retries=str(self.spinlock_retries)))
+        if self.vendorid_spoof:
+            root.append(etree.Element("vendor_id", state="on",
+                                      value=self.vendorid))
 
         return root
 
@@ -1803,6 +2387,7 @@ class LibvirtConfigGuest(LibvirtConfigObject):
         self.sysinfo = None
         self.os_type = None
         self.os_loader = None
+        self.os_loader_type = None
         self.os_kernel = None
         self.os_initrd = None
         self.os_cmdline = None
@@ -1815,6 +2400,7 @@ class LibvirtConfigGuest(LibvirtConfigObject):
         self.devices = []
         self.metadata = []
         self.idmaps = []
+        self.perf_events = []
 
     def _format_basic_props(self, root):
         root.append(self._text_node("uuid", self.uuid))
@@ -1848,7 +2434,14 @@ class LibvirtConfigGuest(LibvirtConfigObject):
         if self.os_kernel is not None:
             os.append(self._text_node("kernel", self.os_kernel))
         if self.os_loader is not None:
-            os.append(self._text_node("loader", self.os_loader))
+            # Generate XML nodes for UEFI boot.
+            if self.os_loader_type == "pflash":
+                loader = self._text_node("loader", self.os_loader)
+                loader.set("type", "pflash")
+                loader.set("readonly", "yes")
+                os.append(loader)
+            else:
+                os.append(self._text_node("loader", self.os_loader))
         if self.os_initrd is not None:
             os.append(self._text_node("initrd", self.os_initrd))
         if self.os_cmdline is not None:
@@ -1891,6 +2484,15 @@ class LibvirtConfigGuest(LibvirtConfigObject):
             idmaps.append(idmap.format_dom())
         root.append(idmaps)
 
+    def _format_perf_events(self, root):
+        if len(self.perf_events) == 0:
+            return
+        perfs = etree.Element("perf")
+        for pe in self.perf_events:
+            event = etree.Element("event", name=pe, enabled="yes")
+            perfs.append(event)
+        root.append(perfs)
+
     def format_dom(self):
         root = super(LibvirtConfigGuest, self).format_dom()
 
@@ -1917,11 +2519,58 @@ class LibvirtConfigGuest(LibvirtConfigObject):
 
         self._format_idmaps(root)
 
+        self._format_perf_events(root)
+
         return root
 
+    def _parse_basic_props(self, xmldoc):
+        # memmbacking, memtune, numatune, metadata are skipped just because
+        # corresponding config types do not implement parse_dom method
+        if xmldoc.tag == 'uuid':
+            self.uuid = xmldoc.text
+        elif xmldoc.tag == 'name':
+            self.name = xmldoc.text
+        elif xmldoc.tag == 'memory':
+            self.memory = int(xmldoc.text)
+        elif xmldoc.tag == 'vcpu':
+            self.vcpus = int(xmldoc.text)
+            if xmldoc.get('cpuset') is not None:
+                self.cpuset = hardware.parse_cpu_spec(xmldoc.get('cpuset'))
+
+    def _parse_os(self, xmldoc):
+        # smbios is skipped just because LibvirtConfigGuestSMBIOS
+        # does not implement parse_dom method
+        for c in xmldoc.getchildren():
+            if c.tag == 'type':
+                self.os_type = c.text
+                self.os_mach_type = c.get('machine')
+            elif c.tag == 'kernel':
+                self.os_kernel = c.text
+            elif c.tag == 'loader':
+                self.os_loader = c.text
+                if c.get('type') == 'pflash':
+                    self.os_loader_type = 'pflash'
+            elif c.tag == 'initrd':
+                self.os_initrd = c.text
+            elif c.tag == 'cmdline':
+                self.os_cmdline = c.text
+            elif c.tag == 'root':
+                self.os_root = c.text
+            elif c.tag == 'init':
+                self.os_init_path = c.text
+            elif c.tag == 'boot':
+                self.os_boot_dev.append(c.get('dev'))
+            elif c.tag == 'bootmenu':
+                if c.get('enable') == 'yes':
+                    self.os_bootmenu = True
+
     def parse_dom(self, xmldoc):
+        self.virt_type = xmldoc.get('type')
         # Note: This cover only for: LibvirtConfigGuestDisks
+        #                            LibvirtConfigGuestFilesys
         #                            LibvirtConfigGuestHostdevPCI
+        #                            LibvirtConfigGuestHostdevMDEV
+        #                            LibvirtConfigGuestInterface
         #                            LibvirtConfigGuestUidMap
         #                            LibvirtConfigGuestGidMap
         #                            LibvirtConfigGuestCPU
@@ -1932,8 +2581,20 @@ class LibvirtConfigGuest(LibvirtConfigObject):
                         obj = LibvirtConfigGuestDisk()
                         obj.parse_dom(d)
                         self.devices.append(obj)
+                    elif d.tag == 'filesystem':
+                        obj = LibvirtConfigGuestFilesys()
+                        obj.parse_dom(d)
+                        self.devices.append(obj)
                     elif d.tag == 'hostdev' and d.get('type') == 'pci':
                         obj = LibvirtConfigGuestHostdevPCI()
+                        obj.parse_dom(d)
+                        self.devices.append(obj)
+                    elif d.tag == 'hostdev' and d.get('type') == 'mdev':
+                        obj = LibvirtConfigGuestHostdevMDEV()
+                        obj.parse_dom(d)
+                        self.devices.append(obj)
+                    elif d.tag == 'interface':
+                        obj = LibvirtConfigGuestInterface()
                         obj.parse_dom(d)
                         self.devices.append(obj)
             if c.tag == 'idmap':
@@ -1951,9 +2612,20 @@ class LibvirtConfigGuest(LibvirtConfigObject):
                 obj = LibvirtConfigGuestCPU()
                 obj.parse_dom(c)
                 self.cpu = obj
+            elif c.tag == 'perf':
+                for p in c.getchildren():
+                    if p.get('enabled') and p.get('enabled') == 'yes':
+                        self.add_perf_event(p.get('name'))
+            elif c.tag == 'os':
+                self._parse_os(c)
+            else:
+                self._parse_basic_props(c)
 
     def add_device(self, dev):
         self.devices.append(dev)
+
+    def add_perf_event(self, event):
+        self.perf_events.append(event)
 
     def set_clock(self, clk):
         self.clock = clk
@@ -1996,8 +2668,8 @@ class LibvirtConfigNodeDevice(LibvirtConfigObject):
                                                 **kwargs)
         self.name = None
         self.parent = None
-        self.driver = None
         self.pci_capability = None
+        self.mdev_information = None
 
     def parse_dom(self, xmldoc):
         super(LibvirtConfigNodeDevice, self).parse_dom(xmldoc)
@@ -2007,10 +2679,14 @@ class LibvirtConfigNodeDevice(LibvirtConfigObject):
                 self.name = c.text
             elif c.tag == "parent":
                 self.parent = c.text
-            elif c.tag == "capability" and c.get("type") == 'pci':
+            elif c.tag == "capability" and c.get("type") in ['pci', 'net']:
                 pcicap = LibvirtConfigNodeDevicePciCap()
                 pcicap.parse_dom(c)
                 self.pci_capability = pcicap
+            elif c.tag == "capability" and c.get("type") in ['mdev']:
+                mdev_info = LibvirtConfigNodeDeviceMdevInformation()
+                mdev_info.parse_dom(c)
+                self.mdev_information = mdev_info
 
 
 class LibvirtConfigNodeDevicePciCap(LibvirtConfigObject):
@@ -2028,7 +2704,12 @@ class LibvirtConfigNodeDevicePciCap(LibvirtConfigObject):
         self.vendor = None
         self.vendor_id = None
         self.numa_node = None
-        self.fun_capability = list()
+        self.fun_capability = []
+        self.mdev_capability = []
+        self.interface = None
+        self.address = None
+        self.link_state = None
+        self.features = []
 
     def parse_dom(self, xmldoc):
         super(LibvirtConfigNodeDevicePciCap, self).parse_dom(xmldoc)
@@ -2050,11 +2731,23 @@ class LibvirtConfigNodeDevicePciCap(LibvirtConfigObject):
                 self.vendor_id = int(c.get('id'), 16)
             elif c.tag == "numa":
                 self.numa_node = int(c.get('node'))
+            elif c.tag == "interface":
+                self.interface = c.text
+            elif c.tag == "address":
+                self.address = c.text
+            elif c.tag == "link":
+                self.link_state = c.get('state')
+            elif c.tag == "feature":
+                self.features.append(c.get('name'))
             elif c.tag == "capability" and c.get('type') in \
                             ('virt_functions', 'phys_function'):
                 funcap = LibvirtConfigNodeDevicePciSubFunctionCap()
                 funcap.parse_dom(c)
                 self.fun_capability.append(funcap)
+            elif c.tag == "capability" and c.get('type') in ('mdev_types',):
+                mdevcap = LibvirtConfigNodeDeviceMdevCapableSubFunctionCap()
+                mdevcap.parse_dom(c)
+                self.mdev_capability.append(mdevcap)
 
 
 class LibvirtConfigNodeDevicePciSubFunctionCap(LibvirtConfigObject):
@@ -2073,6 +2766,45 @@ class LibvirtConfigNodeDevicePciSubFunctionCap(LibvirtConfigObject):
                                           int(c.get('bus'), 16),
                                           int(c.get('slot'), 16),
                                           int(c.get('function'), 16)))
+
+
+class LibvirtConfigNodeDeviceMdevCapableSubFunctionCap(LibvirtConfigObject):
+    def __init__(self, **kwargs):
+        super(LibvirtConfigNodeDeviceMdevCapableSubFunctionCap, self).__init__(
+                                        root_name="capability", **kwargs)
+        # mdev_types is a list of dictionaries where each item looks like:
+        # {'type': 'nvidia-11', 'name': 'GRID M60-0B', 'deviceAPI': 'vfio-pci',
+        #  'availableInstances': 16}
+        self.mdev_types = list()
+
+    def parse_dom(self, xmldoc):
+        super(LibvirtConfigNodeDeviceMdevCapableSubFunctionCap,
+              self).parse_dom(xmldoc)
+        for c in xmldoc.getchildren():
+            if c.tag == "type":
+                mdev_type = {'type': c.get('id')}
+                for e in c.getchildren():
+                    mdev_type[e.tag] = (int(e.text)
+                                        if e.tag == 'availableInstances'
+                                        else e.text)
+                self.mdev_types.append(mdev_type)
+
+
+class LibvirtConfigNodeDeviceMdevInformation(LibvirtConfigObject):
+    def __init__(self, **kwargs):
+        super(LibvirtConfigNodeDeviceMdevInformation, self).__init__(
+                                        root_name="capability", **kwargs)
+        self.type = None
+        self.iommu_group = None
+
+    def parse_dom(self, xmldoc):
+        super(LibvirtConfigNodeDeviceMdevInformation,
+              self).parse_dom(xmldoc)
+        for c in xmldoc.getchildren():
+            if c.tag == "type":
+                self.type = c.get('id')
+            if c.tag == "iommuGroup":
+                self.iommu_group = int(c.get('number'))
 
 
 class LibvirtConfigGuestRng(LibvirtConfigGuestDevice):

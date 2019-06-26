@@ -25,22 +25,36 @@ class RetryFilter(filters.BaseHostFilter):
     purposes
     """
 
-    def host_passes(self, host_state, filter_properties):
+    # NOTE(danms): This does not affect _where_ an instance lands, so not
+    # related to rebuild.
+    RUN_ON_REBUILD = False
+
+    def __init__(self):
+        super(RetryFilter, self).__init__()
+        LOG.warning('The RetryFilter is deprecated since the 20.0.0 Train '
+                    'release. Since the 17.0.0 (Queens) release, the '
+                    'scheduler has provided alternate hosts for rescheduling '
+                    'so the scheduler does not need to be called during a '
+                    'reschedule which makes the RetryFilter useless.')
+
+    def host_passes(self, host_state, spec_obj):
         """Skip nodes that have already been attempted."""
-        retry = filter_properties.get('retry', None)
+        retry = spec_obj.retry
         if not retry:
-            # Re-scheduling is disabled
-            LOG.debug("Re-scheduling is disabled")
             return True
 
-        hosts = retry.get('hosts', [])
+        # TODO(sbauza): Once the HostState is actually a ComputeNode, we could
+        # easily get this one...
         host = [host_state.host, host_state.nodename]
+        # TODO(sbauza)... and we wouldn't need to primitive the hosts into
+        # lists
+        hosts = [[cn.host, cn.hypervisor_hostname] for cn in retry.hosts]
 
         passes = host not in hosts
 
         if not passes:
-            LOG.debug("Host %(host)s fails.  Previously tried hosts: "
-                        "%(hosts)s", {'host': host, 'hosts': hosts})
+            LOG.info("Host %(host)s fails.  Previously tried hosts: "
+                     "%(hosts)s", {'host': host, 'hosts': hosts})
 
         # Host passes if it's not in the list of previously attempted hosts:
         return passes

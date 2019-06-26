@@ -19,45 +19,74 @@
 Handling of VM disk images.
 """
 
+import operator
 import os
 
-from oslo_config import cfg
+from oslo_concurrency import processutils
 from oslo_log import log as logging
+from oslo_utils import fileutils
+from oslo_utils import imageutils
+from oslo_utils import units
 
+from nova.compute import utils as compute_utils
+import nova.conf
 from nova import exception
-from nova.i18n import _, _LE
+from nova.i18n import _
 from nova import image
-from nova.openstack.common import fileutils
-from nova.openstack.common import imageutils
-from nova import utils
+import nova.privsep.qemu
 
 LOG = logging.getLogger(__name__)
 
-image_opts = [
-    cfg.BoolOpt('force_raw_images',
-                default=True,
-                help='Force backing images to raw format'),
-]
-
-CONF = cfg.CONF
-CONF.register_opts(image_opts)
+CONF = nova.conf.CONF
 IMAGE_API = image.API()
 
+QEMU_IMG_LIMITS = processutils.ProcessLimits(
+    cpu_time=30,
+    address_space=1 * units.Gi)
 
-def qemu_img_info(path):
+# This is set by the libvirt driver on startup. The version is used to
+# determine what flags need to be set on the command line.
+QEMU_VERSION = None
+QEMU_VERSION_REQ_SHARED = 2010000
+
+
+def qemu_img_info(path, format=None):
     """Return an object containing the parsed output from qemu-img info."""
     # TODO(mikal): this code should not be referring to a libvirt specific
     # flag.
-    # NOTE(sirp): The config option import must go here to avoid an import
-    # cycle
-    CONF.import_opt('images_type', 'nova.virt.libvirt.imagebackend',
-                    group='libvirt')
     if not os.path.exists(path) and CONF.libvirt.images_type != 'rbd':
-        msg = (_("Path does not exist %(path)s") % {'path': path})
+        raise exception.DiskNotFound(location=path)
+
+    try:
+        # The following check is about ploop images that reside within
+        # directories and always have DiskDescriptor.xml file beside them
+        if (os.path.isdir(path) and
+            os.path.exists(os.path.join(path, "DiskDescriptor.xml"))):
+            path = os.path.join(path, "root.hds")
+
+        cmd = ('env', 'LC_ALL=C', 'LANG=C', 'qemu-img', 'info', path)
+        if format is not None:
+            cmd = cmd + ('-f', format)
+        # Check to see if the qemu version is >= 2.10 because if so, we need
+        # to add the --force-share flag.
+        if QEMU_VERSION and operator.ge(QEMU_VERSION, QEMU_VERSION_REQ_SHARED):
+            cmd = cmd + ('--force-share',)
+        out, err = processutils.execute(*cmd, prlimit=QEMU_IMG_LIMITS)
+    except processutils.ProcessExecutionError as exp:
+        if exp.exit_code == -9:
+            # this means we hit prlimits, make the exception more specific
+            msg = (_("qemu-img aborted by prlimits when inspecting "
+                    "%(path)s : %(exp)s") % {'path': path, 'exp': exp})
+        elif exp.exit_code == 1 and 'No such file or directory' in exp.stderr:
+            # The os.path.exists check above can race so this is a simple
+            # best effort at catching that type of failure and raising a more
+            # specific error.
+            raise exception.DiskNotFound(location=path)
+        else:
+            msg = (_("qemu-img failed to execute on %(path)s : %(exp)s") %
+                   {'path': path, 'exp': exp})
         raise exception.InvalidDiskInfo(reason=msg)
 
-    out, err = utils.execute('env', 'LC_ALL=C', 'LANG=C',
-                             'qemu-img', 'info', path)
     if not out:
         msg = (_("Failed to run qemu-img info on %(path)s : %(error)s") %
                {'path': path, 'error': err})
@@ -66,25 +95,62 @@ def qemu_img_info(path):
     return imageutils.QemuImgInfo(out)
 
 
-def convert_image(source, dest, out_format, run_as_root=False):
+def convert_image(source, dest, in_format, out_format, run_as_root=False,
+                  compress=False):
     """Convert image to other format."""
-    cmd = ('qemu-img', 'convert', '-O', out_format, source, dest)
-    utils.execute(*cmd, run_as_root=run_as_root)
+    if in_format is None:
+        raise RuntimeError("convert_image without input format is a security"
+                           " risk")
+    _convert_image(source, dest, in_format, out_format, run_as_root,
+                   compress=compress)
 
 
-def fetch(context, image_href, path, _user_id, _project_id, max_size=0):
+def convert_image_unsafe(source, dest, out_format, run_as_root=False):
+    """Convert image to other format, doing unsafe automatic input format
+    detection. Do not call this function.
+    """
+
+    # NOTE: there is only 1 caller of this function:
+    # imagebackend.Lvm.create_image. It is not easy to fix that without a
+    # larger refactor, so for the moment it has been manually audited and
+    # allowed to continue. Remove this function when Lvm.create_image has
+    # been fixed.
+    _convert_image(source, dest, None, out_format, run_as_root)
+
+
+def _convert_image(source, dest, in_format, out_format, run_as_root,
+                   compress=False):
+    try:
+        with compute_utils.disk_ops_semaphore:
+            if not run_as_root:
+                nova.privsep.qemu.unprivileged_convert_image(
+                    source, dest, in_format, out_format, CONF.instances_path,
+                    compress)
+            else:
+                nova.privsep.qemu.convert_image(
+                    source, dest, in_format, out_format, CONF.instances_path,
+                    compress)
+
+    except processutils.ProcessExecutionError as exp:
+        msg = (_("Unable to convert image to %(format)s: %(exp)s") %
+               {'format': out_format, 'exp': exp})
+        raise exception.ImageUnacceptable(image_id=source, reason=msg)
+
+
+def fetch(context, image_href, path, trusted_certs=None):
     with fileutils.remove_path_on_error(path):
-        IMAGE_API.download(context, image_href, dest_path=path)
+        with compute_utils.disk_ops_semaphore:
+            IMAGE_API.download(context, image_href, dest_path=path,
+                               trusted_certs=trusted_certs)
 
 
 def get_info(context, image_href):
     return IMAGE_API.get(context, image_href)
 
 
-def fetch_to_raw(context, image_href, path, user_id, project_id, max_size=0):
+def fetch_to_raw(context, image_href, path, trusted_certs=None):
     path_tmp = "%s.part" % path
-    fetch(context, image_href, path_tmp, user_id, project_id,
-          max_size=max_size)
+    fetch(context, image_href, path_tmp, trusted_certs)
 
     with fileutils.remove_path_on_error(path_tmp):
         data = qemu_img_info(path_tmp)
@@ -101,28 +167,18 @@ def fetch_to_raw(context, image_href, path, user_id, project_id, max_size=0):
                 reason=(_("fmt=%(fmt)s backed by: %(backing_file)s") %
                         {'fmt': fmt, 'backing_file': backing_file}))
 
-        # We can't generally shrink incoming images, so disallow
-        # images > size of the flavor we're booting.  Checking here avoids
-        # an immediate DoS where we convert large qcow images to raw
-        # (which may compress well but not be sparse).
-        # TODO(p-draigbrady): loop through all flavor sizes, so that
-        # we might continue here and not discard the download.
-        # If we did that we'd have to do the higher level size checks
-        # irrespective of whether the base image was prepared or not.
-        disk_size = data.virtual_size
-        if max_size and max_size < disk_size:
-            LOG.error(_LE('%(base)s virtual size %(disk_size)s '
-                          'larger than flavor root disk size %(size)s'),
-                      {'base': path,
-                       'disk_size': disk_size,
-                       'size': max_size})
-            raise exception.FlavorDiskTooSmall()
-
         if fmt != "raw" and CONF.force_raw_images:
             staged = "%s.converted" % path
-            LOG.debug("%s was %s, converting to raw" % (image_href, fmt))
+            LOG.debug("%s was %s, converting to raw", image_href, fmt)
             with fileutils.remove_path_on_error(staged):
-                convert_image(path_tmp, staged, 'raw')
+                try:
+                    convert_image(path_tmp, staged, fmt, 'raw')
+                except exception.ImageUnacceptable as exp:
+                    # re-raise to include image_href
+                    raise exception.ImageUnacceptable(image_id=image_href,
+                        reason=_("Unable to convert image to raw: %(exp)s")
+                        % {'exp': exp})
+
                 os.unlink(path_tmp)
 
                 data = qemu_img_info(staged)

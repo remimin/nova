@@ -13,8 +13,9 @@
 #    under the License.
 
 import mock
+from oslo_utils.fixture import uuidsentinel as uuids
 
-from nova import db
+from nova.db import api as db
 from nova import exception
 from nova.objects import instance_fault
 from nova.tests.unit.objects import test_objects
@@ -22,63 +23,60 @@ from nova.tests.unit.objects import test_objects
 
 fake_faults = {
     'fake-uuid': [
-        {'id': 1, 'instance_uuid': 'fake-uuid', 'code': 123, 'message': 'msg1',
-         'details': 'details', 'host': 'host', 'deleted': False,
-         'created_at': None, 'updated_at': None, 'deleted_at': None},
-        {'id': 2, 'instance_uuid': 'fake-uuid', 'code': 456, 'message': 'msg2',
-         'details': 'details', 'host': 'host', 'deleted': False,
-         'created_at': None, 'updated_at': None, 'deleted_at': None},
+        {'id': 1, 'instance_uuid': uuids.faults_instance, 'code': 123,
+         'message': 'msg1', 'details': 'details', 'host': 'host',
+         'deleted': False, 'created_at': None, 'updated_at': None,
+         'deleted_at': None},
+        {'id': 2, 'instance_uuid': uuids.faults_instance, 'code': 456,
+         'message': 'msg2', 'details': 'details', 'host': 'host',
+         'deleted': False, 'created_at': None, 'updated_at': None,
+         'deleted_at': None},
         ]
     }
 
 
 class _TestInstanceFault(object):
-    def test_get_latest_for_instance(self):
-        self.mox.StubOutWithMock(db, 'instance_fault_get_by_instance_uuids')
-        db.instance_fault_get_by_instance_uuids(self.context, ['fake-uuid']
-                                                ).AndReturn(fake_faults)
-        self.mox.ReplayAll()
+    @mock.patch.object(db, 'instance_fault_get_by_instance_uuids',
+                       return_value=fake_faults)
+    def test_get_latest_for_instance(self, get_mock):
         fault = instance_fault.InstanceFault.get_latest_for_instance(
             self.context, 'fake-uuid')
         for key in fake_faults['fake-uuid'][0]:
             self.assertEqual(fake_faults['fake-uuid'][0][key], fault[key])
+        get_mock.assert_called_once_with(self.context, ['fake-uuid'])
 
-    def test_get_latest_for_instance_with_none(self):
-        self.mox.StubOutWithMock(db, 'instance_fault_get_by_instance_uuids')
-        db.instance_fault_get_by_instance_uuids(self.context, ['fake-uuid']
-                                                ).AndReturn({})
-        self.mox.ReplayAll()
+    @mock.patch.object(db, 'instance_fault_get_by_instance_uuids',
+                       return_value={})
+    def test_get_latest_for_instance_with_none(self, get_mock):
         fault = instance_fault.InstanceFault.get_latest_for_instance(
             self.context, 'fake-uuid')
         self.assertIsNone(fault)
+        get_mock.assert_called_once_with(self.context, ['fake-uuid'])
 
-    def test_get_by_instance(self):
-        self.mox.StubOutWithMock(db, 'instance_fault_get_by_instance_uuids')
-        db.instance_fault_get_by_instance_uuids(self.context, ['fake-uuid']
-                                                ).AndReturn(fake_faults)
-        self.mox.ReplayAll()
+    @mock.patch.object(db, 'instance_fault_get_by_instance_uuids',
+                       return_value=fake_faults)
+    def test_get_by_instance(self, get_mock):
         faults = instance_fault.InstanceFaultList.get_by_instance_uuids(
             self.context, ['fake-uuid'])
         for index, db_fault in enumerate(fake_faults['fake-uuid']):
             for key in db_fault:
                 self.assertEqual(fake_faults['fake-uuid'][index][key],
                                  faults[index][key])
+        get_mock.assert_called_once_with(self.context, ['fake-uuid'])
 
-    def test_get_by_instance_with_none(self):
-        self.mox.StubOutWithMock(db, 'instance_fault_get_by_instance_uuids')
-        db.instance_fault_get_by_instance_uuids(self.context, ['fake-uuid']
-                                                ).AndReturn({})
-        self.mox.ReplayAll()
+    @mock.patch.object(db, 'instance_fault_get_by_instance_uuids',
+                       return_value={})
+    def test_get_by_instance_with_none(self, get_mock):
         faults = instance_fault.InstanceFaultList.get_by_instance_uuids(
             self.context, ['fake-uuid'])
         self.assertEqual(0, len(faults))
+        get_mock.assert_called_once_with(self.context, ['fake-uuid'])
 
-    @mock.patch('nova.cells.rpcapi.CellsAPI.instance_fault_create_at_top')
-    @mock.patch('nova.db.instance_fault_create')
-    def _test_create(self, update_cells, mock_create, cells_fault_create):
+    @mock.patch('nova.db.api.instance_fault_create')
+    def test_create(self, mock_create):
         mock_create.return_value = fake_faults['fake-uuid'][1]
         fault = instance_fault.InstanceFault(context=self.context)
-        fault.instance_uuid = 'fake-uuid'
+        fault.instance_uuid = uuids.faults_instance
         fault.code = 456
         fault.message = 'foo'
         fault.details = 'you screwed up'
@@ -86,34 +84,17 @@ class _TestInstanceFault(object):
         fault.create()
         self.assertEqual(2, fault.id)
         mock_create.assert_called_once_with(self.context,
-                                            {'instance_uuid': 'fake-uuid',
-                                             'code': 456,
-                                             'message': 'foo',
-                                             'details': 'you screwed up',
-                                             'host': 'myhost'})
-        if update_cells:
-            cells_fault_create.assert_called_once_with(
-                    self.context, fake_faults['fake-uuid'][1])
-        else:
-            self.assertFalse(cells_fault_create.called)
-
-    def test_create_no_cells(self):
-        self.flags(enable=False, group='cells')
-        self._test_create(False)
-
-    def test_create_api_cell(self):
-        self.flags(cell_type='api', enable=True, group='cells')
-        self._test_create(False)
-
-    def test_create_compute_cell(self):
-        self.flags(cell_type='compute', enable=True, group='cells')
-        self._test_create(True)
+            {'instance_uuid': uuids.faults_instance,
+             'code': 456,
+             'message': 'foo',
+             'details': 'you screwed up',
+             'host': 'myhost'})
 
     def test_create_already_created(self):
-        fault = instance_fault.InstanceFault()
+        fault = instance_fault.InstanceFault(context=self.context)
         fault.id = 1
         self.assertRaises(exception.ObjectActionError,
-                          fault.create, self.context)
+                          fault.create)
 
 
 class TestInstanceFault(test_objects._LocalTest,

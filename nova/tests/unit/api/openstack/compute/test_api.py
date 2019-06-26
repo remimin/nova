@@ -14,7 +14,7 @@
 #    under the License.
 
 from oslo_serialization import jsonutils
-import webob
+from oslo_utils import encodeutils
 import webob.dec
 import webob.exc
 
@@ -27,37 +27,47 @@ from nova.tests.unit.api.openstack import fakes
 
 class APITest(test.NoDBTestCase):
 
+    @property
+    def wsgi_app(self):
+        return fakes.wsgi_app_v21()
+
     def _wsgi_app(self, inner_app):
-        # simpler version of the app than fakes.wsgi_app
         return openstack_api.FaultWrapper(inner_app)
 
     def test_malformed_json(self):
-        req = webob.Request.blank('/')
+        req = fakes.HTTPRequest.blank('/')
         req.method = 'POST'
-        req.body = '{'
+        req.body = b'{'
         req.headers["content-type"] = "application/json"
 
-        res = req.get_response(fakes.wsgi_app())
+        res = req.get_response(self.wsgi_app)
         self.assertEqual(res.status_int, 400)
 
     def test_malformed_xml(self):
-        req = webob.Request.blank('/')
+        req = fakes.HTTPRequest.blank('/')
         req.method = 'POST'
-        req.body = '<hi im not xml>'
+        req.body = b'<hi im not xml>'
         req.headers["content-type"] = "application/xml"
 
-        res = req.get_response(fakes.wsgi_app())
-        self.assertEqual(res.status_int, 400)
+        res = req.get_response(self.wsgi_app)
+        self.assertEqual(res.status_int, 415)
 
     def test_vendor_content_type_json(self):
         ctype = 'application/vnd.openstack.compute+json'
 
-        req = webob.Request.blank('/')
+        req = fakes.HTTPRequest.blank('/')
         req.headers['Accept'] = ctype
 
-        res = req.get_response(fakes.wsgi_app())
+        res = req.get_response(self.wsgi_app)
         self.assertEqual(res.status_int, 200)
-        self.assertEqual(res.content_type, ctype)
+        # NOTE(scottynomad): Webob's Response assumes that header values are
+        # strings so the `res.content_type` property is broken in python3.
+        #
+        # Consider changing `api.openstack.wsgi.Resource._process_stack`
+        # to encode header values in ASCII rather than UTF-8.
+        # https://tools.ietf.org/html/rfc7230#section-3.2.4
+        content_type = res.headers.get('Content-Type')
+        self.assertEqual(ctype, encodeutils.safe_decode(content_type))
 
         jsonutils.loads(res.body)
 
@@ -68,8 +78,8 @@ class APITest(test.NoDBTestCase):
 
         # api.application = raise_webob_exc
         api = self._wsgi_app(raise_webob_exc)
-        resp = webob.Request.blank('/').get_response(api)
-        self.assertEqual(resp.status_int, 404, resp.body)
+        resp = fakes.HTTPRequest.blank('/').get_response(api)
+        self.assertEqual(resp.status_int, 404, resp.text)
 
     def test_exceptions_are_converted_to_faults_api_fault(self):
         @webob.dec.wsgify
@@ -79,9 +89,9 @@ class APITest(test.NoDBTestCase):
 
         # api.application = raise_api_fault
         api = self._wsgi_app(raise_api_fault)
-        resp = webob.Request.blank('/').get_response(api)
-        self.assertIn('itemNotFound', resp.body)
-        self.assertEqual(resp.status_int, 404, resp.body)
+        resp = fakes.HTTPRequest.blank('/').get_response(api)
+        self.assertIn('itemNotFound', resp.text)
+        self.assertEqual(resp.status_int, 404, resp.text)
 
     def test_exceptions_are_converted_to_faults_exception(self):
         @webob.dec.wsgify
@@ -90,9 +100,9 @@ class APITest(test.NoDBTestCase):
 
         # api.application = fail
         api = self._wsgi_app(fail)
-        resp = webob.Request.blank('/').get_response(api)
-        self.assertIn('{"computeFault', resp.body)
-        self.assertEqual(resp.status_int, 500, resp.body)
+        resp = fakes.HTTPRequest.blank('/').get_response(api)
+        self.assertIn('{"computeFault', resp.text)
+        self.assertEqual(resp.status_int, 500, resp.text)
 
     def _do_test_exception_safety_reflected_in_faults(self, expose):
         class ExceptionWithSafety(exception.NovaException):
@@ -103,13 +113,13 @@ class APITest(test.NoDBTestCase):
             raise ExceptionWithSafety('some explanation')
 
         api = self._wsgi_app(fail)
-        resp = webob.Request.blank('/').get_response(api)
-        self.assertIn('{"computeFault', resp.body)
+        resp = fakes.HTTPRequest.blank('/').get_response(api)
+        self.assertIn('{"computeFault', resp.text)
         expected = ('ExceptionWithSafety: some explanation' if expose else
                     'The server has either erred or is incapable '
                     'of performing the requested operation.')
-        self.assertIn(expected, resp.body)
-        self.assertEqual(resp.status_int, 500, resp.body)
+        self.assertIn(expected, resp.text)
+        self.assertEqual(resp.status_int, 500, resp.text)
 
     def test_safe_exceptions_are_described_in_faults(self):
         self._do_test_exception_safety_reflected_in_faults(True)
@@ -123,12 +133,12 @@ class APITest(test.NoDBTestCase):
             raise exception_type(msg)
 
         api = self._wsgi_app(fail)
-        resp = webob.Request.blank('/').get_response(api)
-        self.assertIn(msg, resp.body)
-        self.assertEqual(resp.status_int, exception_type.code, resp.body)
+        resp = fakes.HTTPRequest.blank('/').get_response(api)
+        self.assertIn(msg, resp.text)
+        self.assertEqual(resp.status_int, exception_type.code, resp.text)
 
         if hasattr(exception_type, 'headers'):
-            for (key, value) in exception_type.headers.iteritems():
+            for (key, value) in exception_type.headers.items():
                 self.assertIn(key, resp.headers)
                 self.assertEqual(resp.headers[key], str(value))
 
@@ -158,5 +168,5 @@ class APITest(test.NoDBTestCase):
             raise ExceptionWithNoneCode()
 
         api = self._wsgi_app(fail)
-        resp = webob.Request.blank('/').get_response(api)
+        resp = fakes.HTTPRequest.blank('/').get_response(api)
         self.assertEqual(500, resp.status_int)

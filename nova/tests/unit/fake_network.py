@@ -13,30 +13,31 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from oslo_config import cfg
 from oslo_serialization import jsonutils
+from oslo_utils.fixture import uuidsentinel as uuids
+from six.moves import range
 
 from nova.compute import api as compute_api
 from nova.compute import manager as compute_manager
+import nova.conf
 import nova.context
-from nova import db
+from nova.db import api as db
 from nova import exception
-from nova.network import api as network_api
 from nova.network import manager as network_manager
 from nova.network import model as network_model
 from nova.network import rpcapi as network_rpcapi
 from nova import objects
 from nova.objects import base as obj_base
+from nova.objects import network as network_obj
 from nova.objects import virtual_interface as vif_obj
-from nova.pci import device as pci_device
 from nova.tests.unit.objects import test_fixed_ip
 from nova.tests.unit.objects import test_instance_info_cache
 from nova.tests.unit.objects import test_pci_device
+from nova.tests.unit import utils
 
 
 HOST = "testhost"
-CONF = cfg.CONF
-CONF.import_opt('use_ipv6', 'nova.netconf')
+CONF = nova.conf.CONF
 
 
 class FakeModel(dict):
@@ -56,28 +57,31 @@ class FakeNetworkManager(network_manager.NetworkManager):
                  'updated_at': None,
                  'deleted_at': None,
                  'deleted': 0,
-                 'instance_uuid': '00000000-0000-0000-0000-000000000010',
+                 'instance_uuid': uuids.instance_1,
                  'network_id': 1,
-                 'uuid': 'fake-uuid',
-                 'address': 'DC:AD:BE:FF:EF:01'},
+                 'uuid': uuids.vifs_1,
+                 'address': 'DC:AD:BE:FF:EF:01',
+                 'tag': 'fake-tag1'},
                 {'id': 1,
                  'created_at': None,
                  'updated_at': None,
                  'deleted_at': None,
                  'deleted': 0,
-                 'instance_uuid': '00000000-0000-0000-0000-000000000020',
+                 'instance_uuid': uuids.instance_2,
                  'network_id': 21,
-                 'uuid': 'fake-uuid2',
-                 'address': 'DC:AD:BE:FF:EF:02'},
+                 'uuid': uuids.vifs_2,
+                 'address': 'DC:AD:BE:FF:EF:02',
+                 'tag': 'fake-tag2'},
                 {'id': 2,
                  'created_at': None,
                  'updated_at': None,
                  'deleted_at': None,
                  'deleted': 0,
-                 'instance_uuid': '00000000-0000-0000-0000-000000000030',
+                 'instance_uuid': uuids.instance_1,
                  'network_id': 31,
-                 'uuid': 'fake-uuid3',
-                 'address': 'DC:AD:BE:FF:EF:03'}]
+                 'uuid': uuids.vifs_3,
+                 'address': 'DC:AD:BE:FF:EF:03',
+                 'tag': None}]
 
         floating_ips = [dict(address='172.16.1.1',
                              fixed_ip_id=100),
@@ -165,7 +169,7 @@ def fake_network(network_id, ipv6=None):
     if ipv6 is None:
         ipv6 = CONF.use_ipv6
     fake_network = {'id': network_id,
-             'uuid': '00000000-0000-0000-0000-00000000000000%02d' % network_id,
+             'uuid': getattr(uuids, 'network%i' % network_id),
              'label': 'test%d' % network_id,
              'injected': False,
              'multi_host': False,
@@ -183,7 +187,7 @@ def fake_network(network_id, ipv6=None):
              'dns3': '192.168.%d.3' % network_id,
              'vlan': None,
              'host': None,
-             'project_id': 'fake_project',
+             'project_id': uuids.project,
              'vpn_public_address': '192.168.%d.2' % network_id,
              'vpn_public_port': None,
              'vpn_private_address': None,
@@ -208,25 +212,31 @@ def fake_network(network_id, ipv6=None):
     return fake_network
 
 
+def fake_network_obj(context, network_id=1, ipv6=None):
+    return network_obj.Network._from_db_object(
+        context, network_obj.Network(), fake_network(network_id, ipv6))
+
+
 def fake_vif(x):
-    return{'id': x,
-           'created_at': None,
-           'updated_at': None,
-           'deleted_at': None,
-           'deleted': 0,
-           'address': 'DE:AD:BE:EF:00:%02x' % x,
-           'uuid': '00000000-0000-0000-0000-00000000000000%02d' % x,
-           'network_id': x,
-           'instance_uuid': 'fake-uuid'}
+    return {'id': x,
+            'created_at': None,
+            'updated_at': None,
+            'deleted_at': None,
+            'deleted': 0,
+            'address': 'DE:AD:BE:EF:00:%02x' % x,
+            'uuid': getattr(uuids, 'vif%i' % x),
+            'network_id': x,
+            'instance_uuid': uuids.vifs_1,
+            'tag': 'fake-tag'}
 
 
 def floating_ip_ids():
-    for i in xrange(1, 100):
+    for i in range(1, 100):
         yield i
 
 
 def fixed_ip_ids():
-    for i in xrange(1, 100):
+    for i in range(1, 100):
         yield i
 
 
@@ -235,13 +245,13 @@ fixed_ip_id = fixed_ip_ids()
 
 
 def next_fixed_ip(network_id, num_floating_ips=0):
-    next_id = fixed_ip_id.next()
+    next_id = next(fixed_ip_id)
     f_ips = [FakeModel(**next_floating_ip(next_id))
-             for i in xrange(num_floating_ips)]
+             for i in range(num_floating_ips)]
     return {'id': next_id,
             'network_id': network_id,
             'address': '192.168.%d.%03d' % (network_id, (next_id + 99)),
-            'instance_uuid': 1,
+            'instance_uuid': uuids.fixed_ip,
             'allocated': False,
             'reserved': False,
             'created_at': None,
@@ -258,7 +268,7 @@ def next_fixed_ip(network_id, num_floating_ips=0):
 
 
 def next_floating_ip(fixed_ip_id):
-    next_id = floating_ip_id.next()
+    next_id = next(floating_ip_id)
     return {'id': next_id,
             'address': '10.10.10.%03d' % (next_id + 99),
             'fixed_ip_id': fixed_ip_id,
@@ -278,9 +288,9 @@ def ipv4_like(ip, match_string):
     return True
 
 
-def fake_get_instance_nw_info(stubs, num_networks=1, ips_per_vif=2,
+def fake_get_instance_nw_info(test, num_networks=1, ips_per_vif=2,
                               floating_ips_per_fixed_ip=0):
-    # stubs is the self.stubs from the test
+    # test is an instance of nova.test.TestCase
     # ips_per_vif is the number of ips each vif will have
     # num_floating_ips is number of float ips for each fixed ip
     network = network_manager.FlatManager(host=HOST)
@@ -295,16 +305,24 @@ def fake_get_instance_nw_info(stubs, num_networks=1, ips_per_vif=2,
     def fixed_ips_fake(*args, **kwargs):
         global fixed_ips
         ips = [next_fixed_ip(i, floating_ips_per_fixed_ip)
-               for i in xrange(1, num_networks + 1)
-               for j in xrange(ips_per_vif)]
+               for i in range(1, num_networks + 1)
+               for j in range(ips_per_vif)]
         fixed_ips = ips
         return ips
 
     def update_cache_fake(*args, **kwargs):
-        pass
+        fake_info_cache = {
+            'created_at': None,
+            'updated_at': None,
+            'deleted_at': None,
+            'deleted': False,
+            'instance_uuid': uuids.vifs_1,
+            'network_info': '[]',
+            }
+        return fake_info_cache
 
-    stubs.Set(db, 'fixed_ip_get_by_instance', fixed_ips_fake)
-    stubs.Set(db, 'instance_info_cache_update', update_cache_fake)
+    test.stub_out('nova.db.api.fixed_ip_get_by_instance', fixed_ips_fake)
+    test.stub_out('nova.db.api.instance_info_cache_update', update_cache_fake)
 
     class FakeContext(nova.context.RequestContext):
         def is_admin(self):
@@ -316,35 +334,29 @@ def fake_get_instance_nw_info(stubs, num_networks=1, ips_per_vif=2,
     return nw_model
 
 
-def stub_out_nw_api_get_instance_nw_info(stubs, func=None,
+def stub_out_nw_api_get_instance_nw_info(test, func=None,
                                          num_networks=1,
                                          ips_per_vif=1,
                                          floating_ips_per_fixed_ip=0):
 
     def get_instance_nw_info(self, context, instance, conductor_api=None):
-        return fake_get_instance_nw_info(stubs, num_networks=num_networks,
+        return fake_get_instance_nw_info(test, num_networks=num_networks,
                         ips_per_vif=ips_per_vif,
                         floating_ips_per_fixed_ip=floating_ips_per_fixed_ip)
 
     if func is None:
         func = get_instance_nw_info
-    stubs.Set(network_api.API, 'get_instance_nw_info', func)
-
-
-def stub_out_network_cleanup(stubs):
-    stubs.Set(network_api.API, 'deallocate_for_instance',
-              lambda *args, **kwargs: None)
+    test.stub_out('nova.network.api.API.get_instance_nw_info', func)
 
 
 _real_functions = {}
 
 
-def set_stub_network_methods(stubs):
+def set_stub_network_methods(test):
     global _real_functions
     cm = compute_manager.ComputeManager
     if not _real_functions:
         _real_functions = {
-                '_get_instance_nw_info': cm._get_instance_nw_info,
                 '_allocate_network': cm._allocate_network,
                 '_deallocate_network': cm._deallocate_network}
 
@@ -354,20 +366,21 @@ def set_stub_network_methods(stubs):
     def fake_async_networkinfo(*args, **kwargs):
         return network_model.NetworkInfoAsyncWrapper(fake_networkinfo)
 
-    stubs.Set(cm, '_get_instance_nw_info', fake_networkinfo)
-    stubs.Set(cm, '_allocate_network', fake_async_networkinfo)
-    stubs.Set(cm, '_deallocate_network', lambda *args, **kwargs: None)
+    test.stub_out('nova.compute.manager.ComputeManager._allocate_network',
+                  fake_async_networkinfo)
+    test.stub_out('nova.compute.manager.ComputeManager._deallocate_network',
+                  lambda *args, **kwargs: None)
 
 
-def unset_stub_network_methods(stubs):
+def unset_stub_network_methods(test):
     global _real_functions
     if _real_functions:
-        cm = compute_manager.ComputeManager
         for name in _real_functions:
-            stubs.Set(cm, name, _real_functions[name])
+            test.stub_out('nova.compute.manager.ComputeManager.' + name,
+                          _real_functions[name])
 
 
-def stub_compute_with_ips(stubs):
+def stub_compute_with_ips(test):
     orig_get = compute_api.API.get
     orig_get_all = compute_api.API.get_all
     orig_create = compute_api.API.create
@@ -384,10 +397,11 @@ def stub_compute_with_ips(stubs):
     def fake_pci_device_get_by_addr(context, node_id, dev_addr):
         return test_pci_device.fake_db_dev
 
-    stubs.Set(db, 'pci_device_get_by_addr', fake_pci_device_get_by_addr)
-    stubs.Set(compute_api.API, 'get', fake_get)
-    stubs.Set(compute_api.API, 'get_all', fake_get_all)
-    stubs.Set(compute_api.API, 'create', fake_create)
+    test.stub_out('nova.db.api.pci_device_get_by_addr',
+                  fake_pci_device_get_by_addr)
+    test.stub_out('nova.compute.api.API.get', fake_get)
+    test.stub_out('nova.compute.api.API.get_all', fake_get_all)
+    test.stub_out('nova.compute.api.API.create', fake_create)
 
 
 def _get_fake_cache():
@@ -400,7 +414,7 @@ def _get_fake_cache():
         return ip_dict
 
     info = [{'address': 'aa:bb:cc:dd:ee:ff',
-             'id': 1,
+             'id': utils.FAKE_NETWORK_UUID,
              'network': {'bridge': 'br0',
                          'id': 1,
                          'label': 'private',
@@ -435,12 +449,12 @@ def _get_instances_with_cached_ips(orig_func, *args, **kwargs):
     if isinstance(instances, (list, obj_base.ObjectListBase)):
         for instance in instances:
             _info_cache_for(instance)
-            pci_device.claim(fake_device, instance)
-            pci_device.allocate(fake_device, instance)
+            fake_device.claim(instance.uuid)
+            fake_device.allocate(instance)
     else:
         _info_cache_for(instances)
-        pci_device.claim(fake_device, instances)
-        pci_device.allocate(fake_device, instances)
+        fake_device.claim(instances.uuid)
+        fake_device.allocate(instances)
     return instances
 
 
@@ -451,7 +465,7 @@ def _create_instances_with_cached_ips(orig_func, *args, **kwargs):
     instances, reservation_id = orig_func(*args, **kwargs)
     fake_cache = _get_fake_cache()
     for instance in instances:
-        instance['info_cache']['network_info'] = fake_cache
+        instance['info_cache'].network_info = fake_cache
         db.instance_info_cache_update(args[1], instance['uuid'],
                                       {'network_info': fake_cache})
     return (instances, reservation_id)

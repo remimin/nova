@@ -27,30 +27,37 @@ the raw libvirt API. These APIs are then used by all
 the other libvirt related classes
 """
 
+from collections import defaultdict
+import operator
 import os
 import socket
+import sys
 import threading
+import traceback
 
-import eventlet
 from eventlet import greenio
 from eventlet import greenthread
 from eventlet import patcher
 from eventlet import tpool
-from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_utils import encodeutils
 from oslo_utils import excutils
+from oslo_utils import importutils
+from oslo_utils import units
+from oslo_utils import versionutils
+import six
 
+from nova.compute import utils as compute_utils
+import nova.conf
 from nova import context as nova_context
 from nova import exception
 from nova.i18n import _
-from nova.i18n import _LE
-from nova.i18n import _LI
-from nova.i18n import _LW
 from nova import rpc
 from nova import utils
 from nova.virt import event as virtevent
-from nova.virt.libvirt import compat
 from nova.virt.libvirt import config as vconfig
+from nova.virt.libvirt import guest as libvirt_guest
+from nova.virt.libvirt import utils as libvirt_utils
 
 libvirt = None
 
@@ -58,126 +65,15 @@ LOG = logging.getLogger(__name__)
 
 native_socket = patcher.original('socket')
 native_threading = patcher.original("threading")
-native_Queue = patcher.original("Queue")
+native_Queue = patcher.original("Queue" if six.PY2 else "queue")
 
-CONF = cfg.CONF
-CONF.import_opt('host', 'nova.netconf')
-CONF.import_opt('my_ip', 'nova.netconf')
+CONF = nova.conf.CONF
 
 
-class DomainJobInfo(object):
-    """Information about libvirt background jobs
-
-    This class encapsulates information about libvirt
-    background jobs. It provides a mapping from either
-    the old virDomainGetJobInfo API which returned a
-    fixed list of fields, or the modern virDomainGetJobStats
-    which returns an extendable dict of fields.
-    """
-
-    _have_job_stats = True
-
-    def __init__(self, **kwargs):
-
-        self.type = kwargs.get("type", libvirt.VIR_DOMAIN_JOB_NONE)
-        self.time_elapsed = kwargs.get("time_elapsed", 0)
-        self.time_remaining = kwargs.get("time_remaining", 0)
-        self.downtime = kwargs.get("downtime", 0)
-        self.setup_time = kwargs.get("setup_time", 0)
-        self.data_total = kwargs.get("data_total", 0)
-        self.data_processed = kwargs.get("data_processed", 0)
-        self.data_remaining = kwargs.get("data_remaining", 0)
-        self.memory_total = kwargs.get("memory_total", 0)
-        self.memory_processed = kwargs.get("memory_processed", 0)
-        self.memory_remaining = kwargs.get("memory_remaining", 0)
-        self.memory_constant = kwargs.get("memory_constant", 0)
-        self.memory_normal = kwargs.get("memory_normal", 0)
-        self.memory_normal_bytes = kwargs.get("memory_normal_bytes", 0)
-        self.memory_bps = kwargs.get("memory_bps", 0)
-        self.disk_total = kwargs.get("disk_total", 0)
-        self.disk_processed = kwargs.get("disk_processed", 0)
-        self.disk_remaining = kwargs.get("disk_remaining", 0)
-        self.disk_bps = kwargs.get("disk_bps", 0)
-        self.comp_cache = kwargs.get("compression_cache", 0)
-        self.comp_bytes = kwargs.get("compression_bytes", 0)
-        self.comp_pages = kwargs.get("compression_pages", 0)
-        self.comp_cache_misses = kwargs.get("compression_cache_misses", 0)
-        self.comp_overflow = kwargs.get("compression_overflow", 0)
-
-    @classmethod
-    def _get_job_stats_compat(cls, dom):
-        # Make the old virDomainGetJobInfo method look similar to the
-        # modern virDomainGetJobStats method
-        try:
-            info = dom.jobInfo()
-        except libvirt.libvirtError as ex:
-            # When migration of a transient guest completes, the guest
-            # goes away so we'll see NO_DOMAIN error code
-            #
-            # When migration of a persistent guest completes, the guest
-            # merely shuts off, but libvirt unhelpfully raises an
-            # OPERATION_INVALID error code
-            #
-            # Lets pretend both of these mean success
-            if ex.get_error_code() in (libvirt.VIR_ERR_NO_DOMAIN,
-                                       libvirt.VIR_ERR_OPERATION_INVALID):
-                LOG.debug("Domain has shutdown/gone away: %s", ex)
-                return cls(type=libvirt.VIR_DOMAIN_JOB_COMPLETED)
-            else:
-                LOG.debug("Failed to get job info: %s", ex)
-                raise
-
-        return cls(
-            type=info[0],
-            time_elapsed=info[1],
-            time_remaining=info[2],
-            data_total=info[3],
-            data_processed=info[4],
-            data_remaining=info[5],
-            memory_total=info[6],
-            memory_processed=info[7],
-            memory_remaining=info[8],
-            disk_total=info[9],
-            disk_processed=info[10],
-            disk_remaining=info[11])
-
-    @classmethod
-    def for_domain(cls, dom):
-        '''Get job info for the domain
-
-        Query the libvirt job info for the domain (ie progress
-        of migration, or snapshot operation)
-
-        Returns: a DomainJobInfo instance
-        '''
-
-        if cls._have_job_stats:
-            try:
-                stats = dom.jobStats()
-                return cls(**stats)
-            except libvirt.libvirtError as ex:
-                if ex.get_error_code() == libvirt.VIR_ERR_NO_SUPPORT:
-                    # Remote libvirt doesn't support new API
-                    LOG.debug("Missing remote virDomainGetJobStats: %s", ex)
-                    cls._have_job_stats = False
-                    return cls._get_job_stats_compat(dom)
-                elif ex.get_error_code() in (
-                        libvirt.VIR_ERR_NO_DOMAIN,
-                        libvirt.VIR_ERR_OPERATION_INVALID):
-                    # Transient guest finished migration, so it has gone
-                    # away completely
-                    LOG.debug("Domain has shutdown/gone away: %s", ex)
-                    return cls(type=libvirt.VIR_DOMAIN_JOB_COMPLETED)
-                else:
-                    LOG.debug("Failed to get job stats: %s", ex)
-                    raise
-            except AttributeError as ex:
-                # Local python binding doesn't support new API
-                LOG.debug("Missing local virDomainGetJobStats: %s", ex)
-                cls._have_job_stats = False
-                return cls._get_job_stats_compat(dom)
-        else:
-            return cls._get_job_stats_compat(dom)
+# This list is for libvirt hypervisor drivers that need special handling.
+# This is *not* the complete list of supported hypervisor drivers.
+HV_DRIVER_QEMU = "QEMU"
+HV_DRIVER_XEN = "Xen"
 
 
 class Host(object):
@@ -188,14 +84,16 @@ class Host(object):
 
         global libvirt
         if libvirt is None:
-            libvirt = __import__('libvirt')
+            libvirt = importutils.import_module('libvirt')
 
         self._uri = uri
         self._read_only = read_only
+        self._initial_connection = True
         self._conn_event_handler = conn_event_handler
+        self._conn_event_handler_queue = six.moves.queue.Queue()
         self._lifecycle_event_handler = lifecycle_event_handler
-        self._skip_list_all_domains = False
         self._caps = None
+        self._domain_caps = None
         self._hostname = None
 
         self._wrapped_conn = None
@@ -203,14 +101,13 @@ class Host(object):
         self._event_queue = None
 
         self._events_delayed = {}
-        # Note(toabctl): During a reboot of a Xen domain, STOPPED and
+        # Note(toabctl): During a reboot of a domain, STOPPED and
         #                STARTED events are sent. To prevent shutting
         #                down the domain during a reboot, delay the
         #                STOPPED lifecycle event some seconds.
-        if uri.find("xen://") != -1:
-            self._lifecycle_delay = 15
-        else:
-            self._lifecycle_delay = 0
+        self._lifecycle_delay = 15
+
+        self._initialized = False
 
     def _native_thread(self):
         """Receives async events coming in from libvirtd.
@@ -239,6 +136,26 @@ class Host(object):
         while True:
             self._dispatch_events()
 
+    def _conn_event_thread(self):
+        """Dispatches async connection events"""
+        # NOTE(mdbooth): This thread doesn't need to jump through the same
+        # hoops as _dispatch_thread because it doesn't interact directly
+        # with the libvirt native thread.
+        while True:
+            self._dispatch_conn_event()
+
+    def _dispatch_conn_event(self):
+        # NOTE(mdbooth): Splitting out this loop looks redundant, but it
+        # means we can easily dispatch events synchronously from tests and
+        # it isn't completely awful.
+        handler = self._conn_event_handler_queue.get()
+        try:
+            handler()
+        except Exception:
+            LOG.exception(_('Exception handling connection event'))
+        finally:
+            self._conn_event_handler_queue.task_done()
+
     @staticmethod
     def _event_lifecycle_callback(conn, dom, event, detail, opaque):
         """Receives lifecycle events from libvirt.
@@ -258,7 +175,16 @@ class Host(object):
         elif event == libvirt.VIR_DOMAIN_EVENT_STARTED:
             transition = virtevent.EVENT_LIFECYCLE_STARTED
         elif event == libvirt.VIR_DOMAIN_EVENT_SUSPENDED:
-            transition = virtevent.EVENT_LIFECYCLE_PAUSED
+            if detail == libvirt.VIR_DOMAIN_EVENT_SUSPENDED_POSTCOPY:
+                transition = virtevent.EVENT_LIFECYCLE_POSTCOPY_STARTED
+            # FIXME(mriedem): VIR_DOMAIN_EVENT_SUSPENDED_MIGRATED is also sent
+            # when live migration of the guest fails, so we cannot simply rely
+            # on the event itself but need to check if the job itself was
+            # successful.
+            # elif detail == libvirt.VIR_DOMAIN_EVENT_SUSPENDED_MIGRATED:
+            #     transition = virtevent.EVENT_LIFECYCLE_MIGRATION_COMPLETED
+            else:
+                transition = virtevent.EVENT_LIFECYCLE_PAUSED
         elif event == libvirt.VIR_DOMAIN_EVENT_RESUMED:
             transition = virtevent.EVENT_LIFECYCLE_RESUMED
 
@@ -287,7 +213,7 @@ class Host(object):
     def _connect_auth_cb(creds, opaque):
         if len(creds) == 0:
             return 0
-        raise exception.NovaException(
+        raise exception.InternalError(
             _("Can not handle authentication request for %d credentials")
             % len(creds))
 
@@ -370,38 +296,34 @@ class Host(object):
                 reason = str(last_close_event['reason'])
                 msg = _("Connection to libvirt lost: %s") % reason
                 self._wrapped_conn = None
-                if self._conn_event_handler is not None:
-                    self._conn_event_handler(False, msg)
+                self._queue_conn_event_handler(False, msg)
 
     def _event_emit_delayed(self, event):
         """Emit events - possibly delayed."""
         def event_cleanup(gt, *args, **kwargs):
             """Callback function for greenthread. Called
-            to cleanup the _events_delayed dictionary when a event
+            to cleanup the _events_delayed dictionary when an event
             was called.
             """
             event = args[0]
             self._events_delayed.pop(event.uuid, None)
 
-        if self._lifecycle_delay > 0:
-            # Cleanup possible delayed stop events.
-            if event.uuid in self._events_delayed.keys():
-                self._events_delayed[event.uuid].cancel()
-                self._events_delayed.pop(event.uuid, None)
-                LOG.debug("Removed pending event for %s due to "
-                          "lifecycle event", event.uuid)
+        # Cleanup possible delayed stop events.
+        if event.uuid in self._events_delayed.keys():
+            self._events_delayed[event.uuid].cancel()
+            self._events_delayed.pop(event.uuid, None)
+            LOG.debug("Removed pending event for %s due to "
+                      "lifecycle event", event.uuid)
 
-            if event.transition == virtevent.EVENT_LIFECYCLE_STOPPED:
-                # Delay STOPPED event, as they may be followed by a STARTED
-                # event in case the instance is rebooting, when runned with Xen
-                id_ = greenthread.spawn_after(self._lifecycle_delay,
-                                              self._event_emit, event)
-                self._events_delayed[event.uuid] = id_
-                # add callback to cleanup self._events_delayed dict after
-                # event was called
-                id_.link(event_cleanup, event)
-            else:
-                self._event_emit(event)
+        if event.transition == virtevent.EVENT_LIFECYCLE_STOPPED:
+            # Delay STOPPED event, as they may be followed by a STARTED
+            # event in case the instance is rebooting
+            id_ = greenthread.spawn_after(self._lifecycle_delay,
+                                          self._event_emit, event)
+            self._events_delayed[event.uuid] = id_
+            # add callback to cleanup self._events_delayed dict after
+            # event was called
+            id_.link(event_cleanup, event)
         else:
             self._event_emit(event)
 
@@ -451,26 +373,14 @@ class Host(object):
         self._event_thread.start()
 
         LOG.debug("Starting green dispatch thread")
-        eventlet.spawn(self._dispatch_thread)
+        utils.spawn(self._dispatch_thread)
 
     def _get_new_connection(self):
         # call with _wrapped_conn_lock held
         LOG.debug('Connecting to libvirt: %s', self._uri)
-        wrapped_conn = None
 
-        try:
-            wrapped_conn = self._connect(self._uri, self._read_only)
-        finally:
-            # Enabling the compute service, in case it was disabled
-            # since the connection was successful.
-            disable_reason = None
-            if not wrapped_conn:
-                disable_reason = 'Failed to connect to libvirt'
-
-            if self._conn_event_handler is not None:
-                self._conn_event_handler(bool(wrapped_conn), disable_reason)
-
-        self._wrapped_conn = wrapped_conn
+        # This will raise an exception on failure
+        wrapped_conn = self._connect(self._uri, self._read_only)
 
         try:
             LOG.debug("Registering for lifecycle events %s", self)
@@ -480,36 +390,60 @@ class Host(object):
                 self._event_lifecycle_callback,
                 self)
         except Exception as e:
-            LOG.warn(_LW("URI %(uri)s does not support events: %(error)s"),
-                     {'uri': self._uri, 'error': e})
+            LOG.warning("URI %(uri)s does not support events: %(error)s",
+                        {'uri': self._uri, 'error': e})
 
         try:
             LOG.debug("Registering for connection events: %s", str(self))
             wrapped_conn.registerCloseCallback(self._close_callback, None)
-        except (TypeError, AttributeError) as e:
-            # NOTE: The registerCloseCallback of python-libvirt 1.0.1+
-            # is defined with 3 arguments, and the above registerClose-
-            # Callback succeeds. However, the one of python-libvirt 1.0.0
-            # is defined with 4 arguments and TypeError happens here.
-            # Then python-libvirt 0.9 does not define a method register-
-            # CloseCallback.
-            LOG.debug("The version of python-libvirt does not support "
-                      "registerCloseCallback or is too old: %s", e)
         except libvirt.libvirtError as e:
-            LOG.warn(_LW("URI %(uri)s does not support connection"
-                         " events: %(error)s"),
-                     {'uri': self._uri, 'error': e})
+            LOG.warning("URI %(uri)s does not support connection"
+                        " events: %(error)s",
+                        {'uri': self._uri, 'error': e})
 
         return wrapped_conn
+
+    def _queue_conn_event_handler(self, *args, **kwargs):
+        if self._conn_event_handler is None:
+            return
+
+        def handler():
+            return self._conn_event_handler(*args, **kwargs)
+
+        self._conn_event_handler_queue.put(handler)
 
     def _get_connection(self):
         # multiple concurrent connections are protected by _wrapped_conn_lock
         with self._wrapped_conn_lock:
-            wrapped_conn = self._wrapped_conn
-            if not wrapped_conn or not self._test_connection(wrapped_conn):
-                wrapped_conn = self._get_new_connection()
+            # Drop the existing connection if it is not usable
+            if (self._wrapped_conn is not None and
+                    not self._test_connection(self._wrapped_conn)):
+                self._wrapped_conn = None
+                # Connection was previously up, and went down
+                self._queue_conn_event_handler(
+                    False, _('Connection to libvirt lost'))
 
-        return wrapped_conn
+            if self._wrapped_conn is None:
+                try:
+                    # This will raise if it fails to get a connection
+                    self._wrapped_conn = self._get_new_connection()
+                except Exception as ex:
+                    with excutils.save_and_reraise_exception():
+                        # If we previously had a connection and it went down,
+                        # we generated a down event for that above.
+                        # We also want to generate a down event for an initial
+                        # failure, which won't be handled above.
+                        if self._initial_connection:
+                            self._queue_conn_event_handler(
+                                False,
+                                _('Failed to connect to libvirt: %(msg)s') %
+                                {'msg': ex})
+                finally:
+                    self._initial_connection = False
+
+                self._queue_conn_event_handler(True, None)
+
+        return self._wrapped_conn
 
     def get_connection(self):
         """Returns a connection to the hypervisor
@@ -522,13 +456,16 @@ class Host(object):
         try:
             conn = self._get_connection()
         except libvirt.libvirtError as ex:
-            LOG.exception(_LE("Connection to libvirt failed: %s"), ex)
+            LOG.exception(_("Connection to libvirt failed: %s"), ex)
             payload = dict(ip=CONF.my_ip,
                            method='_connect',
                            reason=ex)
-            rpc.get_notifier('compute').error(nova_context.get_admin_context(),
+            ctxt = nova_context.get_admin_context()
+            rpc.get_notifier('compute').error(ctxt,
                                               'compute.libvirt.error',
                                               payload)
+            compute_utils.notify_about_libvirt_connect_error(
+                ctxt, ip=CONF.my_ip, exception=ex, tb=traceback.format_exc())
             raise exception.HypervisorUnavailable(host=CONF.host)
 
         return conn
@@ -539,6 +476,9 @@ class Host(object):
         pass
 
     def initialize(self):
+        if self._initialized:
+            return
+
         # NOTE(dkliban): Error handler needs to be registered before libvirt
         #                connection is used for the first time.  Otherwise, the
         #                handler does not get registered.
@@ -546,18 +486,29 @@ class Host(object):
         libvirt.virEventRegisterDefaultImpl()
         self._init_events()
 
-    def has_min_version(self, lv_ver=None, hv_ver=None, hv_type=None):
+        LOG.debug("Starting connection event dispatch thread")
+        utils.spawn(self._conn_event_thread)
+
+        self._initialized = True
+
+    def _version_check(self, lv_ver=None, hv_ver=None, hv_type=None,
+                       op=operator.lt):
+        """Check libvirt version, hypervisor version, and hypervisor type
+
+        :param hv_type: hypervisor driver from the top of this file.
+        """
         conn = self.get_connection()
         try:
             if lv_ver is not None:
                 libvirt_version = conn.getLibVersion()
-
-                if libvirt_version < utils.convert_version_to_int(lv_ver):
+                if op(libvirt_version,
+                      versionutils.convert_version_to_int(lv_ver)):
                     return False
 
             if hv_ver is not None:
                 hypervisor_version = conn.getVersion()
-                if hypervisor_version < utils.convert_version_to_int(hv_ver):
+                if op(hypervisor_version,
+                      versionutils.convert_version_to_int(hv_ver)):
                     return False
 
             if hv_type is not None:
@@ -569,99 +520,67 @@ class Host(object):
         except Exception:
             return False
 
-    def get_domain(self, instance):
+    def has_min_version(self, lv_ver=None, hv_ver=None, hv_type=None):
+        return self._version_check(
+            lv_ver=lv_ver, hv_ver=hv_ver, hv_type=hv_type, op=operator.lt)
+
+    def has_version(self, lv_ver=None, hv_ver=None, hv_type=None):
+        return self._version_check(
+            lv_ver=lv_ver, hv_ver=hv_ver, hv_type=hv_type, op=operator.ne)
+
+    def get_guest(self, instance):
+        """Retrieve libvirt guest object for an instance.
+
+        All libvirt error handling should be handled in this method and
+        relevant nova exceptions should be raised in response.
+
+        :param instance: a nova.objects.Instance object
+
+        :returns: a nova.virt.libvirt.Guest object
+        :raises exception.InstanceNotFound: The domain was not found
+        :raises exception.InternalError: A libvirt error occurred
+        """
+        return libvirt_guest.Guest(self._get_domain(instance))
+
+    def _get_domain(self, instance):
         """Retrieve libvirt domain object for an instance.
 
-        :param instance: an nova.objects.Instance object
+        All libvirt error handling should be handled in this method and
+        relevant nova exceptions should be raised in response.
 
-        Attempt to lookup the libvirt domain objects
-        corresponding to the Nova instance, based on
-        its name. If not found it will raise an
-        exception.InstanceNotFound exception. On other
-        errors, it will raise a exception.NovaException
-        exception.
+        :param instance: a nova.objects.Instance object
 
         :returns: a libvirt.Domain object
-        """
-        return self._get_domain_by_name(instance.name)
-
-    def _get_domain_by_id(self, instance_id):
-        """Retrieve libvirt domain object given an instance id.
-
-        All libvirt error handling should be handled in this method and
-        relevant nova exceptions should be raised in response.
-
+        :raises exception.InstanceNotFound: The domain was not found
+        :raises exception.InternalError: A libvirt error occurred
         """
         try:
             conn = self.get_connection()
-            return conn.lookupByID(instance_id)
+            return conn.lookupByUUIDString(instance.uuid)
         except libvirt.libvirtError as ex:
             error_code = ex.get_error_code()
             if error_code == libvirt.VIR_ERR_NO_DOMAIN:
-                raise exception.InstanceNotFound(instance_id=instance_id)
-
-            msg = (_("Error from libvirt while looking up %(instance_id)s: "
-                     "[Error Code %(error_code)s] %(ex)s")
-                   % {'instance_id': instance_id,
-                      'error_code': error_code,
-                      'ex': ex})
-            raise exception.NovaException(msg)
-
-    def _get_domain_by_name(self, instance_name):
-        """Retrieve libvirt domain object given an instance name.
-
-        All libvirt error handling should be handled in this method and
-        relevant nova exceptions should be raised in response.
-
-        """
-        try:
-            conn = self.get_connection()
-            return conn.lookupByName(instance_name)
-        except libvirt.libvirtError as ex:
-            error_code = ex.get_error_code()
-            if error_code == libvirt.VIR_ERR_NO_DOMAIN:
-                raise exception.InstanceNotFound(instance_id=instance_name)
+                raise exception.InstanceNotFound(instance_id=instance.uuid)
 
             msg = (_('Error from libvirt while looking up %(instance_name)s: '
                      '[Error Code %(error_code)s] %(ex)s') %
-                   {'instance_name': instance_name,
+                   {'instance_name': instance.name,
                     'error_code': error_code,
                     'ex': ex})
-            raise exception.NovaException(msg)
+            raise exception.InternalError(msg)
 
-    def _list_instance_domains_fast(self, only_running=True):
-        # The modern (>= 0.9.13) fast way - 1 single API call for all domains
-        flags = libvirt.VIR_CONNECT_LIST_DOMAINS_ACTIVE
-        if not only_running:
-            flags = flags | libvirt.VIR_CONNECT_LIST_DOMAINS_INACTIVE
-        return self.get_connection().listAllDomains(flags)
+    def list_guests(self, only_running=True, only_guests=True):
+        """Get a list of Guest objects for nova instances
 
-    def _list_instance_domains_slow(self, only_running=True):
-        # The legacy (< 0.9.13) slow way - O(n) API call for n domains
-        uuids = []
-        doms = []
-        # Redundant numOfDomains check is for libvirt bz #836647
-        if self.get_connection().numOfDomains() > 0:
-            for id in self.get_connection().listDomainsID():
-                try:
-                    dom = self._get_domain_by_id(id)
-                    doms.append(dom)
-                    uuids.append(dom.UUIDString())
-                except exception.InstanceNotFound:
-                    continue
+        :param only_running: True to only return running instances
+        :param only_guests: True to filter out any host domain (eg Dom-0)
 
-        if only_running:
-            return doms
+        See method "list_instance_domains" for more information.
 
-        for name in self.get_connection().listDefinedDomains():
-            try:
-                dom = self._get_domain_by_name(name)
-                if dom.UUIDString() not in uuids:
-                    doms.append(dom)
-            except exception.InstanceNotFound:
-                continue
-
-        return doms
+        :returns: list of Guest objects
+        """
+        return [libvirt_guest.Guest(dom) for dom in self.list_instance_domains(
+            only_running=only_running, only_guests=only_guests)]
 
     def list_instance_domains(self, only_running=True, only_guests=True):
         """Get a list of libvirt.Domain objects for nova instances
@@ -678,20 +597,10 @@ class Host(object):
 
         :returns: list of libvirt.Domain objects
         """
-
-        if not self._skip_list_all_domains:
-            try:
-                alldoms = self._list_instance_domains_fast(only_running)
-            except (libvirt.libvirtError, AttributeError) as ex:
-                LOG.info(_LI("Unable to use bulk domain list APIs, "
-                             "falling back to slow code path: %(ex)s"),
-                         {'ex': ex})
-                self._skip_list_all_domains = True
-
-        if self._skip_list_all_domains:
-            # Old libvirt, or a libvirt driver which doesn't
-            # implement the new API
-            alldoms = self._list_instance_domains_slow(only_running)
+        flags = libvirt.VIR_CONNECT_LIST_DOMAINS_ACTIVE
+        if not only_running:
+            flags = flags | libvirt.VIR_CONNECT_LIST_DOMAINS_INACTIVE
+        alldoms = self.get_connection().listAllDomains(flags)
 
         doms = []
         for dom in alldoms:
@@ -733,31 +642,145 @@ class Host(object):
         """
         if not self._caps:
             xmlstr = self.get_connection().getCapabilities()
-            LOG.info(_LI("Libvirt host capabilities %s"), xmlstr)
+            LOG.info("Libvirt host capabilities %s", xmlstr)
             self._caps = vconfig.LibvirtConfigCaps()
             self._caps.parse_str(xmlstr)
-            if hasattr(libvirt, 'VIR_CONNECT_BASELINE_CPU_EXPAND_FEATURES'):
+            # NOTE(mriedem): Don't attempt to get baseline CPU features
+            # if libvirt can't determine the host cpu model.
+            if (hasattr(libvirt,
+                        'VIR_CONNECT_BASELINE_CPU_EXPAND_FEATURES') and
+                    self._caps.host.cpu.model is not None):
                 try:
+                    xml_str = self._caps.host.cpu.to_xml()
+                    if six.PY3 and isinstance(xml_str, six.binary_type):
+                        xml_str = xml_str.decode('utf-8')
                     features = self.get_connection().baselineCPU(
-                        [self._caps.host.cpu.to_xml()],
+                        [xml_str],
                         libvirt.VIR_CONNECT_BASELINE_CPU_EXPAND_FEATURES)
-                    # FIXME(wangpan): the return value of baselineCPU should be
-                    #                 None or xml string, but libvirt has a bug
-                    #                 of it from 1.1.2 which is fixed in 1.2.0,
-                    #                 this -1 checking should be removed later.
-                    if features and features != -1:
+                    if features:
                         cpu = vconfig.LibvirtConfigCPU()
                         cpu.parse_str(features)
                         self._caps.host.cpu.features = cpu.features
                 except libvirt.libvirtError as ex:
                     error_code = ex.get_error_code()
                     if error_code == libvirt.VIR_ERR_NO_SUPPORT:
-                        LOG.warn(_LW("URI %(uri)s does not support full set"
-                                     " of host capabilities: " "%(error)s"),
+                        LOG.warning("URI %(uri)s does not support full set"
+                                    " of host capabilities: %(error)s",
                                      {'uri': self._uri, 'error': ex})
                     else:
                         raise
         return self._caps
+
+    def get_domain_capabilities(self):
+        """Returns the capabilities you can request when creating a
+        domain (VM) with that hypervisor, for various combinations of
+        architecture and machine type.
+
+        In this context the fuzzy word "hypervisor" implies QEMU
+        binary, libvirt itself and the host config.  libvirt provides
+        this in order that callers can determine what the underlying
+        emulator and/or libvirt is capable of, prior to creating a domain
+        (for instance via virDomainCreateXML or virDomainDefineXML).
+        However nova needs to know the capabilities much earlier, when
+        the host's compute service is first initialised, in order that
+        placement decisions can be made across many compute hosts.
+        Therefore this is expected to be called during the init_host()
+        phase of the driver lifecycle rather than just before booting
+        an instance.
+
+        This causes an additional complication since the Python
+        binding for this libvirt API call requires the architecture
+        and machine type to be provided.  So in order to gain a full
+        picture of the hypervisor's capabilities, technically we need
+        to call it with the right parameters, once for each
+        (architecture, machine_type) combination which we care about.
+        However the libvirt experts have advised us that in practice
+        the domain capabilities do not (yet, at least) vary enough
+        across machine types to justify the cost of calling
+        getDomainCapabilities() once for every single (architecture,
+        machine_type) combination.  In particular, SEV support isn't
+        reported per-machine type, and since there are usually many
+        machine types, we follow the advice of the experts that for
+        now it's sufficient to call it once per host architecture:
+
+            https://bugzilla.redhat.com/show_bug.cgi?id=1683471#c7
+
+        However, future domain capabilities might report SEV in a more
+        fine-grained manner, and we also expect to use this method to
+        detect other features, such as for gracefully handling machine
+        types and potentially for detecting OVMF binaries.  Therefore
+        we memoize the results of the API calls in a nested dict where
+        the top-level keys are architectures, and second-level keys
+        are machine types, in order to allow easy expansion later.
+
+        Whenever libvirt/QEMU are updated, cached domCapabilities
+        would get outdated (because QEMU will contain new features and
+        the capabilities will vary).  However, this should not be a
+        problem here, because when libvirt/QEMU gets updated, the
+        nova-compute agent also needs restarting, at which point the
+        memoization will vanish because it's not persisted to disk.
+
+        Note: The result is cached in the member attribute
+        _domain_caps.
+
+        :returns: a nested dict of dicts which maps architectures to
+        machine types to instances of config.LibvirtConfigDomainCaps
+        representing the domain capabilities of the host for that arch
+        and machine type:
+
+        { arch:
+          { machine_type: LibvirtConfigDomainCaps }
+        }
+        """
+        if self._domain_caps:
+            return self._domain_caps
+
+        domain_caps = defaultdict(dict)
+        caps = self.get_capabilities()
+        virt_type = CONF.libvirt.virt_type
+
+        for guest in caps.guests:
+            arch = guest.arch
+            machine_type = \
+                libvirt_utils.get_default_machine_type(arch) or 'q35'
+
+            emulator_bin = guest.emulator
+            if virt_type in guest.domemulator:
+                emulator_bin = guest.domemulator[virt_type]
+
+            # It is expected that each <guest> will have a different
+            # architecture, but it doesn't hurt to add a safety net to
+            # avoid needlessly calling libvirt's API more times than
+            # we need.
+            if machine_type in domain_caps[arch]:
+                continue
+
+            domain_caps[arch][machine_type] = \
+                self._get_domain_capabilities(emulator_bin, arch,
+                                              machine_type, virt_type)
+
+        # NOTE(aspiers): Use a temporary variable to update the
+        # instance variable atomically, otherwise if some API
+        # calls succeeded and then one failed, we might
+        # accidentally memoize a partial result.
+        self._domain_caps = domain_caps
+
+        return self._domain_caps
+
+    def _get_domain_capabilities(self, emulator_bin, arch, machine_type,
+                                 virt_type, flags=0):
+        xmlstr = self.get_connection().getDomainCapabilities(
+            emulator_bin,
+            arch,
+            machine_type,
+            virt_type,
+            flags
+        )
+        LOG.debug("Libvirt host hypervisor capabilities for arch=%s and "
+                  "machine_type=%s:\n%s", arch, machine_type, xmlstr)
+        caps = vconfig.LibvirtConfigDomainCaps()
+        caps.parse_str(xmlstr)
+        return caps
 
     def get_driver_type(self):
         """Get hypervisor type.
@@ -783,10 +806,9 @@ class Host(object):
         if self._hostname is None:
             self._hostname = hostname
         elif hostname != self._hostname:
-            LOG.error(_LE('Hostname has changed from %(old)s '
-                          'to %(new)s. A restart is required to take effect.'),
-                          {'old': self._hostname,
-                           'new': hostname})
+            LOG.error('Hostname has changed from %(old)s '
+                      'to %(new)s. A restart is required to take effect.',
+                      {'old': self._hostname, 'new': hostname})
         return self._hostname
 
     def find_secret(self, usage_type, usage_id):
@@ -803,7 +825,7 @@ class Host(object):
             usage_type_const = libvirt.VIR_SECRET_USAGE_TYPE_VOLUME
         else:
             msg = _("Invalid usage_type: %s")
-            raise exception.NovaException(msg % usage_type)
+            raise exception.InternalError(msg % usage_type)
 
         try:
             conn = self.get_connection()
@@ -815,9 +837,10 @@ class Host(object):
     def create_secret(self, usage_type, usage_id, password=None):
         """Create a secret.
 
-        usage_type: one of 'iscsi', 'ceph', 'rbd' or 'volume'
+        :param usage_type: one of 'iscsi', 'ceph', 'rbd' or 'volume'
                            'rbd' will be converted to 'ceph'.
-        usage_id: name of resource in secret
+        :param usage_id: name of resource in secret
+        :param password: optional secret value to set
         """
         secret_conf = vconfig.LibvirtConfigSecret()
         secret_conf.ephemeral = False
@@ -831,11 +854,11 @@ class Host(object):
             secret_conf.usage_type = 'volume'
         else:
             msg = _("Invalid usage_type: %s")
-            raise exception.NovaException(msg % usage_type)
+            raise exception.InternalError(msg % usage_type)
 
         xml = secret_conf.to_xml()
         try:
-            LOG.debug('Secret XML: %s' % xml)
+            LOG.debug('Secret XML: %s', xml)
             conn = self.get_connection()
             secret = conn.secretDefineXML(xml)
             if password is not None:
@@ -843,7 +866,7 @@ class Host(object):
             return secret
         except libvirt.libvirtError:
             with excutils.save_and_reraise_exception():
-                LOG.error(_LE('Error defining a secret with XML: %s') % xml)
+                LOG.error('Error defining a secret with XML: %s', xml)
 
     def delete_secret(self, usage_type, usage_id):
         """Delete a secret.
@@ -855,5 +878,168 @@ class Host(object):
         if secret is not None:
             secret.undefine()
 
-    def get_domain_info(self, virt_dom):
-        return compat.get_domain_info(libvirt, self, virt_dom)
+    def _get_hardware_info(self):
+        """Returns hardware information about the Node.
+
+        Note that the memory size is reported in MiB instead of KiB.
+        """
+        return self.get_connection().getInfo()
+
+    def get_cpu_count(self):
+        """Returns the total numbers of cpu in the host."""
+        return self._get_hardware_info()[2]
+
+    def get_memory_mb_total(self):
+        """Get the total memory size(MB) of physical computer.
+
+        :returns: the total amount of memory(MB).
+        """
+        if CONF.libvirt.file_backed_memory > 0:
+            return CONF.libvirt.file_backed_memory
+        else:
+            return self._get_hardware_info()[1]
+
+    def _sum_domain_memory_mb(self, include_host=True):
+        """Get the total memory consumed by guest domains
+
+        If include_host is True, subtract available host memory from guest 0
+        to get real used memory within dom0 within xen
+        """
+        used = 0
+        for guest in self.list_guests(only_guests=False):
+            try:
+                # TODO(sahid): Use get_info...
+                dom_mem = int(guest._get_domain_info(self)[2])
+            except libvirt.libvirtError as e:
+                LOG.warning("couldn't obtain the memory from domain:"
+                            " %(uuid)s, exception: %(ex)s",
+                            {"uuid": guest.uuid, "ex": e})
+                continue
+            if include_host and guest.id == 0:
+                # Memory usage for the host domain (dom0 in xen) is the
+                # reported memory minus available memory
+                used += (dom_mem - self._get_avail_memory_kb())
+            else:
+                used += dom_mem
+        # Convert it to MB
+        return used // units.Ki
+
+    @staticmethod
+    def _get_avail_memory_kb():
+        with open('/proc/meminfo') as fp:
+            m = fp.read().split()
+        idx1 = m.index('MemFree:')
+        idx2 = m.index('Buffers:')
+        idx3 = m.index('Cached:')
+
+        avail = int(m[idx1 + 1]) + int(m[idx2 + 1]) + int(m[idx3 + 1])
+
+        return avail
+
+    def get_memory_mb_used(self):
+        """Get the used memory size(MB) of physical computer.
+
+        :returns: the total usage of memory(MB).
+        """
+        if sys.platform.upper() not in ['LINUX2', 'LINUX3']:
+            return 0
+
+        if CONF.libvirt.virt_type == 'xen':
+            # For xen, report the sum of all domains, with
+            return self._sum_domain_memory_mb(include_host=True)
+        elif CONF.libvirt.file_backed_memory > 0:
+            # For file_backed_memory, report the total usage of guests,
+            # ignoring host memory
+            return self._sum_domain_memory_mb(include_host=False)
+        else:
+            return (self.get_memory_mb_total() -
+                   (self._get_avail_memory_kb() // units.Ki))
+
+    def get_cpu_stats(self):
+        """Returns the current CPU state of the host with frequency."""
+        stats = self.get_connection().getCPUStats(
+            libvirt.VIR_NODE_CPU_STATS_ALL_CPUS, 0)
+        # getInfo() returns various information about the host node
+        # No. 3 is the expected CPU frequency.
+        stats["frequency"] = self._get_hardware_info()[3]
+        return stats
+
+    def write_instance_config(self, xml):
+        """Defines a domain, but does not start it.
+
+        :param xml: XML domain definition of the guest.
+
+        :returns: an instance of Guest
+        """
+        if six.PY2:
+            xml = encodeutils.safe_encode(xml)
+        domain = self.get_connection().defineXML(xml)
+        return libvirt_guest.Guest(domain)
+
+    def device_lookup_by_name(self, name):
+        """Lookup a node device by its name.
+
+
+        :returns: a virNodeDevice instance
+        """
+        return self.get_connection().nodeDeviceLookupByName(name)
+
+    def list_pci_devices(self, flags=0):
+        """Lookup pci devices.
+
+        :returns: a list of virNodeDevice instance
+        """
+        # TODO(sbauza): Replace that call by a generic _list_devices("pci")
+        return self.get_connection().listDevices("pci", flags)
+
+    def list_mdev_capable_devices(self, flags=0):
+        """Lookup devices supporting mdev capabilities.
+
+        :returns: a list of virNodeDevice instance
+        """
+        return self._list_devices("mdev_types", flags=flags)
+
+    def list_mediated_devices(self, flags=0):
+        """Lookup mediated devices.
+
+        :returns: a list of virNodeDevice instance
+        """
+        return self._list_devices("mdev", flags=flags)
+
+    def _list_devices(self, cap, flags=0):
+        """Lookup devices.
+
+        :returns: a list of virNodeDevice instance
+        """
+        try:
+            return self.get_connection().listDevices(cap, flags)
+        except libvirt.libvirtError as ex:
+            error_code = ex.get_error_code()
+            if error_code == libvirt.VIR_ERR_NO_SUPPORT:
+                LOG.warning("URI %(uri)s does not support "
+                            "listDevices: %(error)s",
+                            {'uri': self._uri, 'error': ex})
+                return []
+            else:
+                raise
+
+    def compare_cpu(self, xmlDesc, flags=0):
+        """Compares the given CPU description with the host CPU."""
+        return self.get_connection().compareCPU(xmlDesc, flags)
+
+    def is_cpu_control_policy_capable(self):
+        """Returns whether kernel configuration CGROUP_SCHED is enabled
+
+        CONFIG_CGROUP_SCHED may be disabled in some kernel configs to
+        improve scheduler latency.
+        """
+        try:
+            with open("/proc/self/mounts", "r") as fd:
+                for line in fd.readlines():
+                    # mount options and split options
+                    bits = line.split()[3].split(",")
+                    if "cpu" in bits:
+                        return True
+                return False
+        except IOError:
+            return False

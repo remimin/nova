@@ -14,10 +14,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo_utils import timeutils
+from oslo_utils import strutils
 
 from nova.api.openstack import common
 from nova.image import glance
+from nova import utils
 
 
 class ViewBuilder(common.ViewBuilder):
@@ -48,6 +49,7 @@ class ViewBuilder(common.ViewBuilder):
             "updated": self._format_date(image.get("updated_at")),
             "status": self._get_status(image),
             "progress": self._get_progress(image),
+            "OS-EXT-IMG-SIZE:size": image.get("size"),
             "links": self._get_links(request,
                                      image["id"],
                                      self._collection_name),
@@ -70,6 +72,12 @@ class ViewBuilder(common.ViewBuilder):
                                                     'servers'),
                 }],
             }
+
+        auto_disk_config = image_dict['metadata'].get("auto_disk_config", None)
+        if auto_disk_config is not None:
+            value = strutils.bool_from_string(auto_disk_config)
+            image_dict["OS-DCF:diskConfig"] = (
+                'AUTO' if value else 'MANUAL')
 
         return dict(image=image_dict)
 
@@ -125,7 +133,8 @@ class ViewBuilder(common.ViewBuilder):
 
     def _get_alternate_link(self, request, identifier):
         """Create an alternate link for a specific image id."""
-        glance_url = glance.generate_glance_url()
+        glance_url = glance.generate_glance_url(
+            request.environ['nova.context'])
         glance_url = self._update_glance_link_prefix(glance_url)
         return '/'.join([glance_url,
                          self._collection_name,
@@ -135,7 +144,7 @@ class ViewBuilder(common.ViewBuilder):
     def _format_date(dt):
         """Return standard format for a given datetime object."""
         if dt is not None:
-            return timeutils.isotime(dt)
+            return utils.isotime(dt)
 
     @staticmethod
     def _get_status(image):

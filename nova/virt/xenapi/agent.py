@@ -13,25 +13,29 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import base64
 import binascii
 from distutils import version
 import os
 import sys
 import time
-import uuid
 
-from oslo_config import cfg
+from os_xenapi.client import host_agent
+from os_xenapi.client import XenAPI
+from oslo_concurrency import processutils
 from oslo_log import log as logging
+from oslo_serialization import base64
 from oslo_serialization import jsonutils
+from oslo_utils import encodeutils
 from oslo_utils import strutils
+from oslo_utils import uuidutils
 
 from nova.api.metadata import password
 from nova.compute import utils as compute_utils
+import nova.conf
 from nova import context
 from nova import crypto
 from nova import exception
-from nova.i18n import _, _LE, _LI, _LW
+from nova.i18n import _
 from nova import objects
 from nova import utils
 
@@ -45,43 +49,7 @@ SKIP_FILES_AT_BOOT_SM_KEY = utils.SM_IMAGE_PROP_PREFIX \
                                         + SKIP_FILES_AT_BOOT_KEY
 
 LOG = logging.getLogger(__name__)
-
-xenapi_agent_opts = [
-    cfg.IntOpt('agent_timeout',
-               default=30,
-               help='Number of seconds to wait for agent reply'),
-    cfg.IntOpt('agent_version_timeout',
-               default=300,
-               help='Number of seconds to wait for agent '
-                    'to be fully operational'),
-    cfg.IntOpt('agent_resetnetwork_timeout',
-               default=60,
-               help='Number of seconds to wait for agent reply '
-                    'to resetnetwork request'),
-    cfg.StrOpt('agent_path',
-               default='usr/sbin/xe-update-networking',
-               help='Specifies the path in which the XenAPI guest agent '
-                    'should be located. If the agent is present, network '
-                    'configuration is not injected into the image. '
-                    'Used if compute_driver=xenapi.XenAPIDriver and '
-                    'flat_injected=True'),
-    cfg.BoolOpt('disable_agent',
-                default=False,
-                help='Disables the use of the XenAPI agent in any image '
-                     'regardless of what image properties are present.'),
-    cfg.BoolOpt('use_agent_default',
-                default=False,
-                help='Determines if the XenAPI agent should be used when '
-                     'the image used does not contain a hint to declare if '
-                     'the agent is present or not. '
-                     'The hint is a glance property "' + USE_AGENT_KEY + '" '
-                     'that has the value "True" or "False". '
-                     'Note that waiting for the agent when it is not present '
-                     'will significantly increase server boot times.'),
-]
-
-CONF = cfg.CONF
-CONF.register_opts(xenapi_agent_opts, 'xenserver')
+CONF = nova.conf.CONF
 
 
 def _call_agent(session, instance, vm_ref, method, addl_args=None,
@@ -96,23 +64,22 @@ def _call_agent(session, instance, vm_ref, method, addl_args=None,
 
     # always fetch domid because VM may have rebooted
     dom_id = session.VM.get_domid(vm_ref)
-
+    uuid = uuidutils.generate_uuid()
     args = {
-        'id': str(uuid.uuid4()),
+        'id': uuid,
         'dom_id': str(dom_id),
         'timeout': str(timeout),
     }
-    args.update(addl_args)
 
     try:
-        ret = session.call_plugin('agent', method, args)
-    except session.XenAPI.Failure as e:
+        ret = method(session, uuid, dom_id, timeout, **addl_args)
+    except XenAPI.Failure as e:
         err_msg = e.details[-1].splitlines()[-1]
         if 'TIMEOUT:' in err_msg:
-            LOG.error(_LE('TIMEOUT: The call to %(method)s timed out. '
-                          'args=%(args)r'),
+            LOG.error('TIMEOUT: The call to %(method)s timed out. '
+                      'args=%(args)r',
                       {'method': method, 'args': args}, instance=instance)
-            raise exception.AgentTimeout(method=method)
+            raise exception.AgentTimeout(method=method.__name__)
         elif 'REBOOT:' in err_msg:
             LOG.debug('REBOOT: The call to %(method)s detected a reboot. '
                       'args=%(args)r',
@@ -121,33 +88,33 @@ def _call_agent(session, instance, vm_ref, method, addl_args=None,
             return _call_agent(session, instance, vm_ref, method,
                                addl_args, timeout, success_codes)
         elif 'NOT IMPLEMENTED:' in err_msg:
-            LOG.error(_LE('NOT IMPLEMENTED: The call to %(method)s is not '
-                          'supported by the agent. args=%(args)r'),
+            LOG.error('NOT IMPLEMENTED: The call to %(method)s is not '
+                      'supported by the agent. args=%(args)r',
                       {'method': method, 'args': args}, instance=instance)
-            raise exception.AgentNotImplemented(method=method)
+            raise exception.AgentNotImplemented(method=method.__name__)
         else:
-            LOG.error(_LE('The call to %(method)s returned an error: %(e)s. '
-                          'args=%(args)r'),
+            LOG.error('The call to %(method)s returned an error: %(e)s. '
+                      'args=%(args)r',
                       {'method': method, 'args': args, 'e': e},
                       instance=instance)
-            raise exception.AgentError(method=method)
+            raise exception.AgentError(method=method.__name__)
 
     if not isinstance(ret, dict):
         try:
             ret = jsonutils.loads(ret)
         except TypeError:
-            LOG.error(_LE('The agent call to %(method)s returned an invalid '
-                          'response: %(ret)r. args=%(args)r'),
+            LOG.error('The agent call to %(method)s returned an invalid '
+                      'response: %(ret)r. args=%(args)r',
                       {'method': method, 'ret': ret, 'args': args},
                       instance=instance)
-            raise exception.AgentError(method=method)
+            raise exception.AgentError(method=method.__name__)
 
     if ret['returncode'] not in success_codes:
-        LOG.error(_LE('The agent call to %(method)s returned an '
-                      'an error: %(ret)r. args=%(args)r'),
+        LOG.error('The agent call to %(method)s returned '
+                  'an error: %(ret)r. args=%(args)r',
                   {'method': method, 'ret': ret, 'args': args},
                   instance=instance)
-        raise exception.AgentError(method=method)
+        raise exception.AgentError(method=method.__name__)
 
     LOG.debug('The agent call to %(method)s was successful: '
               '%(ret)r. args=%(args)r',
@@ -164,13 +131,13 @@ def _wait_for_new_dom_id(session, vm_ref, old_dom_id, method):
     while True:
         dom_id = session.VM.get_domid(vm_ref)
 
-        if dom_id and dom_id != -1 and dom_id != old_dom_id:
-            LOG.debug("Found new dom_id %s" % dom_id)
+        if dom_id and dom_id != "-1" and dom_id != old_dom_id:
+            LOG.debug("Found new dom_id %s", dom_id)
             return
 
         if time.time() > expiration:
-            LOG.debug("Timed out waiting for new dom_id %s" % dom_id)
-            raise exception.AgentTimeout(method=method)
+            LOG.debug("Timed out waiting for new dom_id %s", dom_id)
+            raise exception.AgentTimeout(method=method.__name__)
 
         time.sleep(1)
 
@@ -191,9 +158,8 @@ class XenAPIBasedAgent(object):
         self.vm_ref = vm_ref
 
     def _add_instance_fault(self, error, exc_info):
-        LOG.warning(_LW("Ignoring error while configuring instance with "
-                        "agent: %s"), error,
-                    instance=self.instance, exc_info=True)
+        LOG.warning("Ignoring error while configuring instance with agent: %s",
+                    error, instance=self.instance, exc_info=True)
         try:
             ctxt = context.get_admin_context()
             compute_utils.add_instance_fault_from_exc(
@@ -225,7 +191,8 @@ class XenAPIBasedAgent(object):
                 # NOTE(johngarbutt): we can't use the xapi plugin
                 # timeout, because the domid may change when
                 # the server is rebooted
-                return self._call_agent('version', ignore_errors=False)
+                return self._call_agent(host_agent.version,
+                                        ignore_errors=False)
             except exception.AgentError as error:
                 if time.time() > expiration:
                     self._add_instance_fault(error, sys.exc_info())
@@ -254,28 +221,27 @@ class XenAPIBasedAgent(object):
     def update_if_needed(self, version):
         agent_build = self._get_expected_build()
         if version and agent_build and \
-                is_upgrade_required(version, agent_build['version']):
-            LOG.debug('Updating agent to %s', agent_build['version'],
+                is_upgrade_required(version, agent_build.version):
+            LOG.debug('Updating agent to %s', agent_build.version,
                       instance=self.instance)
             self._perform_update(agent_build)
         else:
             LOG.debug('Skipping agent update.', instance=self.instance)
 
     def _perform_update(self, agent_build):
-        args = {'url': agent_build['url'], 'md5sum': agent_build['md5hash']}
+        args = {'url': agent_build.url, 'md5sum': agent_build.md5hash}
         try:
-            self._call_agent('agentupdate', args)
+            self._call_agent(host_agent.agent_update, args)
         except exception.AgentError as exc:
             # Silently fail for agent upgrades
-            LOG.warning(_LW("Unable to update the agent due "
-                            "to: %(exc)s"), dict(exc=exc),
-                        instance=self.instance)
+            LOG.warning("Unable to update the agent due to: %(exc)s",
+                        dict(exc=exc), instance=self.instance)
 
     def _exchange_key_with_agent(self):
         dh = SimpleDH()
         args = {'pub': str(dh.get_public())}
-        resp = self._call_agent('key_init', args, success_codes=['D0'],
-                                ignore_errors=False)
+        resp = self._call_agent(host_agent.key_init, args,
+                                success_codes=['D0'], ignore_errors=False)
         agent_pub = int(resp)
         dh.compute_shared(agent_pub)
         return dh
@@ -286,7 +252,7 @@ class XenAPIBasedAgent(object):
             ctxt = context.get_admin_context()
             enc = crypto.ssh_encrypt_text(sshkey, new_pass)
             self.instance.system_metadata.update(
-                password.convert_password(ctxt, base64.b64encode(enc)))
+                password.convert_password(ctxt, base64.encode_as_text(enc)))
             self.instance.save()
 
     def set_admin_password(self, new_pass):
@@ -311,7 +277,7 @@ class XenAPIBasedAgent(object):
         enc_pass = dh.encrypt(new_pass + '\n')
 
         args = {'enc_pass': enc_pass}
-        self._call_agent('password', args)
+        self._call_agent(host_agent.password, args)
         self._save_instance_password_if_sshkey_present(new_pass)
 
     def inject_ssh_key(self):
@@ -352,17 +318,17 @@ class XenAPIBasedAgent(object):
         LOG.debug('Injecting file path: %r', path, instance=self.instance)
 
         # Files/paths must be base64-encoded for transmission to agent
-        b64_path = base64.b64encode(path)
-        b64_contents = base64.b64encode(contents)
+        b64_path = base64.encode_as_bytes(path)
+        b64_contents = base64.encode_as_bytes(contents)
 
         args = {'b64_path': b64_path, 'b64_contents': b64_contents}
-        return self._call_agent('inject_file', args)
+        return self._call_agent(host_agent.inject_file, args)
 
     def resetnetwork(self):
         LOG.debug('Resetting network', instance=self.instance)
 
         # NOTE(johngarbutt) old FreeBSD and Gentoo agents return 500 on success
-        return self._call_agent('resetnetwork',
+        return self._call_agent(host_agent.reset_network,
                             timeout=CONF.xenserver.agent_resetnetwork_timeout,
                             success_codes=['0', '500'])
 
@@ -393,20 +359,18 @@ def find_guest_agent(base_dir):
         # reconfigure the network from xenstore data,
         # so manipulation of files in /etc is not
         # required
-        LOG.info(_LI('XenServer tools installed in this '
-                     'image are capable of network injection.  '
-                     'Networking files will not be'
-                     'manipulated'))
+        LOG.info('XenServer tools installed in this '
+                 'image are capable of network injection.  '
+                 'Networking files will not be manipulated')
         return True
     xe_daemon_filename = os.path.join(base_dir,
         'usr', 'sbin', 'xe-daemon')
     if os.path.isfile(xe_daemon_filename):
-        LOG.info(_LI('XenServer tools are present '
-                     'in this image but are not capable '
-                     'of network injection'))
+        LOG.info('XenServer tools are present '
+                 'in this image but are not capable '
+                 'of network injection')
     else:
-        LOG.info(_LI('XenServer tools are not '
-                     'installed in this image'))
+        LOG.info('XenServer tools are not installed in this image')
     return False
 
 
@@ -419,8 +383,8 @@ def should_use_agent(instance):
         try:
             return strutils.bool_from_string(use_agent_raw, strict=True)
         except ValueError:
-            LOG.warning(_LW("Invalid 'agent_present' value. "
-                            "Falling back to the default."),
+            LOG.warning("Invalid 'agent_present' value. "
+                        "Falling back to the default.",
                         instance=instance)
             return CONF.xenserver.use_agent_default
 
@@ -458,10 +422,18 @@ class SimpleDH(object):
                'pass:%s' % self._shared, '-nosalt']
         if decrypt:
             cmd.append('-d')
-        out, err = utils.execute(*cmd, process_input=text)
-        if err:
-            raise RuntimeError(_('OpenSSL error: %s') % err)
-        return out
+        try:
+            out, err = processutils.execute(
+                *cmd,
+                process_input=encodeutils.safe_encode(text),
+                check_exit_code=True)
+            if err:
+                LOG.warning("OpenSSL stderr: %s", err)
+            return out
+        except processutils.ProcessExecutionError as e:
+            raise RuntimeError(
+                _('OpenSSL errored with exit code %(exit_code)d: %(stderr)s') %
+                 {'exit_code': e.exit_code, 'stderr': e.stderr})
 
     def encrypt(self, text):
         return self._run_ssl(text).strip('\n')

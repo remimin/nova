@@ -1,5 +1,3 @@
-# coding=utf-8
-#
 # Copyright 2014 Hewlett-Packard Development Company, L.P.
 # Copyright 2014 Red Hat, Inc.
 # All Rights Reserved.
@@ -20,25 +18,21 @@
 Helper classes for Ironic HTTP PATCH creation.
 """
 
-from oslo_config import cfg
 from oslo_serialization import jsonutils
-import six
 
-CONF = cfg.CONF
-CONF.import_opt('default_ephemeral_format', 'nova.virt.driver')
+
+import nova.conf
+
+CONF = nova.conf.CONF
 
 
 def create(node):
     """Create an instance of the appropriate DriverFields class.
 
     :param node: a node object returned from ironicclient
-    :returns: GenericDriverFields or a subclass thereof, as appropriate
-              for the supplied node.
+    :returns: A GenericDriverFields instance.
     """
-    if 'pxe' in node.driver:
-        return PXEDriverFields(node)
-    else:
-        return GenericDriverFields(node)
+    return GenericDriverFields(node)
 
 
 class GenericDriverFields(object):
@@ -47,30 +41,42 @@ class GenericDriverFields(object):
         self.node = node
 
     def get_deploy_patch(self, instance, image_meta, flavor,
-                         preserve_ephemeral=None):
+                         preserve_ephemeral=None, boot_from_volume=False):
         """Build a patch to add the required fields to deploy a node.
 
         :param instance: the instance object.
-        :param image_meta: the metadata associated with the instance
-                           image.
+        :param image_meta: the nova.objects.ImageMeta object instance
         :param flavor: the flavor object.
         :param preserve_ephemeral: preserve_ephemeral status (bool) to be
                                    specified during rebuild.
+        :param boot_from_volume: True if node boots from volume. Then,
+                                 image_source is not passed to ironic.
         :returns: a json-patch with the fields that needs to be updated.
 
         """
         patch = []
-        patch.append({'path': '/instance_info/image_source', 'op': 'add',
-                      'value': image_meta['id']})
+        if not boot_from_volume:
+            patch.append({'path': '/instance_info/image_source', 'op': 'add',
+                          'value': image_meta.id})
         patch.append({'path': '/instance_info/root_gb', 'op': 'add',
-                      'value': str(instance.root_gb)})
+                      'value': str(instance.flavor.root_gb)})
         patch.append({'path': '/instance_info/swap_mb', 'op': 'add',
                       'value': str(flavor['swap'])})
+        patch.append({'path': '/instance_info/display_name',
+                      'op': 'add', 'value': instance.display_name})
+        patch.append({'path': '/instance_info/vcpus', 'op': 'add',
+                      'value': str(instance.flavor.vcpus)})
+        patch.append({'path': '/instance_info/nova_host_id', 'op': 'add',
+                      'value': instance.get('host')})
+        patch.append({'path': '/instance_info/memory_mb', 'op': 'add',
+                      'value': str(instance.flavor.memory_mb)})
+        patch.append({'path': '/instance_info/local_gb', 'op': 'add',
+                      'value': str(self.node.properties.get('local_gb', 0))})
 
-        if instance.ephemeral_gb:
+        if instance.flavor.ephemeral_gb:
             patch.append({'path': '/instance_info/ephemeral_gb',
                           'op': 'add',
-                          'value': str(instance.ephemeral_gb)})
+                          'value': str(instance.flavor.ephemeral_gb)})
             if CONF.default_ephemeral_format:
                 patch.append({'path': '/instance_info/ephemeral_format',
                               'op': 'add',
@@ -80,112 +86,37 @@ class GenericDriverFields(object):
             patch.append({'path': '/instance_info/preserve_ephemeral',
                           'op': 'add', 'value': str(preserve_ephemeral)})
 
-        capabilities = {}
-
         # read the flavor and get the extra_specs value.
         extra_specs = flavor.get('extra_specs')
 
         # scan through the extra_specs values and ignore the keys
-        # not starting with keyword 'capabilities'.
-
-        for key, val in six.iteritems(extra_specs):
-            if not key.startswith('capabilities:'):
-                continue
-
-            # split the extra_spec key to remove the keyword
-            # 'capabilities' and get the actual key.
-
-            capabilities_string, capabilities_key = key.split(':', 1)
-            if capabilities_key:
-                capabilities[capabilities_key] = val
-
+        # not starting with keyword 'capabilities' and 'trait'
+        capabilities = {}
+        traits = []
+        for key, val in extra_specs.items():
+            # NOTE(mgoddard): For traits we need to support granular resource
+            # request syntax, where the 'trait' prefix may be followed by a
+            # numeric suffix: trait$N. For ironic we do not care about the
+            # group number.
+            if key.startswith('capabilities:') or key.startswith('trait'):
+                # get the actual key.
+                prefix, parsed_key = key.split(':', 1)
+                if prefix == "capabilities":
+                    capabilities[parsed_key] = val
+                else:
+                    # NOTE(mgoddard): Currently, the value must be 'required'.
+                    # We do not need to pass the value to ironic. When the
+                    # value can be something other than 'required', we may need
+                    # to filter out traits not supported by the node.
+                    if val == 'required':
+                        traits.append(parsed_key)
+        traits.extend(image_meta.properties.get('traits_required', []))
         if capabilities:
             patch.append({'path': '/instance_info/capabilities',
                           'op': 'add', 'value': jsonutils.dumps(capabilities)})
-        return patch
-
-    def get_cleanup_patch(self, instance, network_info, flavor):
-        """Build a patch to clean up the fields.
-
-        :param instance: the instance object.
-        :param network_info: the instance network information.
-        :param flavor: the flavor object.
-        :returns: a json-patch with the fields that needs to be updated.
-
-        """
-        return []
-
-
-class PXEDriverFields(GenericDriverFields):
-
-    def _get_kernel_ramdisk_dict(self, flavor):
-        """Get the deploy ramdisk and kernel IDs from the flavor.
-
-        :param flavor: the flavor object.
-        :returns: a dict with the pxe options for the deploy ramdisk and
-            kernel if the IDs were found in the flavor, otherwise an empty
-            dict is returned.
-
-        """
-        extra_specs = flavor['extra_specs']
-        deploy_kernel = extra_specs.get('baremetal:deploy_kernel_id')
-        deploy_ramdisk = extra_specs.get('baremetal:deploy_ramdisk_id')
-        deploy_ids = {}
-        if deploy_kernel and deploy_ramdisk:
-            deploy_ids['pxe_deploy_kernel'] = deploy_kernel
-            deploy_ids['pxe_deploy_ramdisk'] = deploy_ramdisk
-        return deploy_ids
-
-    def get_deploy_patch(self, instance, image_meta, flavor,
-                         preserve_ephemeral=None):
-        """Build a patch to add the required fields to deploy a node.
-
-        Build a json-patch to add the required fields to deploy a node
-        using the PXE driver.
-
-        :param instance: the instance object.
-        :param image_meta: the metadata associated with the instance
-                           image.
-        :param flavor: the flavor object.
-        :param preserve_ephemeral: preserve_ephemeral status (bool) to be
-                                   specified during rebuild.
-        :returns: a json-patch with the fields that needs to be updated.
-
-        """
-        patch = super(PXEDriverFields, self).get_deploy_patch(
-                    instance, image_meta, flavor, preserve_ephemeral)
-
-        # TODO(lucasagomes): Remove it in Kilo. This is for backwards
-        # compatibility with Icehouse. If flavor contains both ramdisk
-        # and kernel ids, use them.
-        for key, value in self._get_kernel_ramdisk_dict(flavor).items():
-            patch.append({'path': '/driver_info/%s' % key,
-                          'op': 'add', 'value': value})
-
-        return patch
-
-    def get_cleanup_patch(self, instance, network_info, flavor):
-        """Build a patch to clean up the fields.
-
-        Build a json-patch to remove the fields used to deploy a node
-        using the PXE driver. Note that the fields added to the Node's
-        instance_info don't need to be removed because they are purged
-        during the Node's tear down.
-
-        :param instance: the instance object.
-        :param network_info: the instance network information.
-        :param flavor: the flavor object.
-        :returns: a json-patch with the fields that needs to be updated.
-
-        """
-        patch = super(PXEDriverFields, self).get_cleanup_patch(
-                    instance, network_info, flavor)
-
-        # TODO(lucasagomes): Remove it in Kilo. This is for backwards
-        # compatibility with Icehouse. If flavor contains a ramdisk and
-        # kernel id remove it from nodes as part of the tear down process
-        for key in self._get_kernel_ramdisk_dict(flavor):
-            if key in self.node.driver_info:
-                patch.append({'op': 'remove',
-                              'path': '/driver_info/%s' % key})
+        if traits:
+            # NOTE(mgoddard): Don't JSON encode the traits list - ironic
+            # expects instance_info.traits to be a list.
+            patch.append({'path': '/instance_info/traits',
+                          'op': 'add', 'value': traits})
         return patch

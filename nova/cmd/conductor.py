@@ -17,31 +17,31 @@
 import sys
 
 from oslo_concurrency import processutils
-from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_reports import guru_meditation_report as gmr
+from oslo_reports import opts as gmr_opts
 
+from nova.conductor import rpcapi
+import nova.conf
 from nova import config
 from nova import objects
-from nova.openstack.common.report import guru_meditation_report as gmr
 from nova import service
-from nova import utils
 from nova import version
 
-CONF = cfg.CONF
-CONF.import_opt('topic', 'nova.conductor.api', group='conductor')
+CONF = nova.conf.CONF
 
 
 def main():
     config.parse_args(sys.argv)
     logging.setup(CONF, "nova")
-    utils.monkey_patch()
     objects.register_all()
+    gmr_opts.set_defaults(CONF)
+    objects.Service.enable_min_version_cache()
 
-    gmr.TextGuruMeditation.setup_autorun(version)
+    gmr.TextGuruMeditation.setup_autorun(version, conf=CONF)
 
     server = service.Service.create(binary='nova-conductor',
-                                    topic=CONF.conductor.topic,
-                                    manager=CONF.conductor.manager)
+                                    topic=rpcapi.RPC_TOPIC)
     workers = CONF.conductor.workers or processutils.get_worker_count()
     service.serve(server, workers=workers)
     service.wait()

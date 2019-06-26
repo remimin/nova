@@ -14,7 +14,7 @@
 
 import mock
 
-from nova import db
+from nova.db import api as db
 from nova.objects import dns_domain
 from nova.tests.unit.objects import test_objects
 
@@ -35,7 +35,7 @@ class _TestDNSDomain(object):
     @staticmethod
     def _compare(test, db, obj):
         for field, value in db.items():
-            test.assertEqual(db[field], obj[field])
+            test.assertEqual(db[field], getattr(obj, field))
 
     def test_get_by_domain(self):
         with mock.patch.object(db, 'dnsdomain_get') as get:

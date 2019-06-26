@@ -13,86 +13,178 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 #
-from mox3 import mox
+import mock
 from neutronclient.common import exceptions as n_exc
+from neutronclient.neutron import v2_0 as neutronv20
 from neutronclient.v2_0 import client
+from oslo_utils.fixture import uuidsentinel as uuids
+from six.moves import range
 
 from nova import context
 from nova import exception
-from nova.network.neutronv2 import api as neutronapi
 from nova.network.security_group import neutron_driver
+from nova import objects
 from nova import test
 
 
 class TestNeutronDriver(test.NoDBTestCase):
     def setUp(self):
         super(TestNeutronDriver, self).setUp()
-        self.mox.StubOutWithMock(neutronapi, 'get_client')
-        self.moxed_client = self.mox.CreateMock(client.Client)
-        neutronapi.get_client(mox.IgnoreArg()).MultipleTimes().AndReturn(
-            self.moxed_client)
         self.context = context.RequestContext('userid', 'my_tenantid')
         setattr(self.context,
                 'auth_token',
                 'bff4a5a6b9eb4ea2a6efec6eefb77936')
+        self.mocked_client = mock.Mock(spec=client.Client)
+        self.stub_out('nova.network.neutronv2.api.get_client',
+                      lambda context: self.mocked_client)
 
     def test_list_with_project(self):
         project_id = '0af70a4d22cf4652824ddc1f2435dd85'
         security_groups_list = {'security_groups': []}
-        self.moxed_client.list_security_groups(tenant_id=project_id).AndReturn(
-            security_groups_list)
-        self.mox.ReplayAll()
 
+        self.mocked_client.list_security_groups.return_value = (
+            security_groups_list)
         sg_api = neutron_driver.SecurityGroupAPI()
         sg_api.list(self.context, project=project_id)
+
+        self.mocked_client.list_security_groups.assert_called_once_with(
+            tenant_id = project_id)
+
+    def test_list_with_all_tenants_and_admin_context(self):
+        project_id = '0af70a4d22cf4652824ddc1f2435dd85'
+        search_opts = {'all_tenants': 1}
+        security_groups_list = {'security_groups': []}
+        admin_context = context.RequestContext('user1', project_id, True)
+
+        with mock.patch.object(
+                self.mocked_client,
+                'list_security_groups',
+                return_value=security_groups_list) as mock_list_secgroup:
+            sg_api = neutron_driver.SecurityGroupAPI()
+            sg_api.list(admin_context,
+                        project=project_id,
+                        search_opts=search_opts)
+
+            mock_list_secgroup.assert_called_once_with()
+
+    def test_list_without_all_tenants_and_admin_context(self):
+        project_id = '0af70a4d22cf4652824ddc1f2435dd85'
+        security_groups_list = {'security_groups': []}
+        admin_context = context.RequestContext('user1', project_id, True)
+
+        with mock.patch.object(
+                self.mocked_client,
+                'list_security_groups',
+                return_value=security_groups_list) as mock_list_secgroup:
+            sg_api = neutron_driver.SecurityGroupAPI()
+            sg_api.list(admin_context, project=project_id)
+
+            mock_list_secgroup.assert_called_once_with(tenant_id=project_id)
+
+    def test_list_with_all_tenants_sec_name_and_admin_context(self):
+        project_id = '0af70a4d22cf4652824ddc1f2435dd85'
+        search_opts = {'all_tenants': 1}
+        security_group_names = ['secgroup_ssh']
+        security_groups_list = {'security_groups': []}
+        admin_context = context.RequestContext('user1', project_id, True)
+
+        with mock.patch.object(
+                self.mocked_client,
+                'list_security_groups',
+                return_value=security_groups_list) as mock_list_secgroup:
+            sg_api = neutron_driver.SecurityGroupAPI()
+            sg_api.list(admin_context, project=project_id,
+                        names=security_group_names,
+                        search_opts=search_opts)
+
+            mock_list_secgroup.assert_called_once_with(
+                name=security_group_names,
+                tenant_id=project_id)
+
+    def test_list_with_all_tenants_sec_name_ids_and_admin_context(self):
+        project_id = '0af70a4d22cf4652824ddc1f2435dd85'
+        search_opts = {'all_tenants': 1}
+        security_group_names = ['secgroup_ssh']
+        security_group_ids = ['id1']
+        security_groups_list = {'security_groups': []}
+        admin_context = context.RequestContext('user1', project_id, True)
+
+        with mock.patch.object(
+                self.mocked_client,
+                'list_security_groups',
+                return_value=security_groups_list) as mock_list_secgroup:
+            sg_api = neutron_driver.SecurityGroupAPI()
+            sg_api.list(admin_context, project=project_id,
+                        names=security_group_names,
+                        ids=security_group_ids,
+                        search_opts=search_opts)
+
+            mock_list_secgroup.assert_called_once_with(
+                name=security_group_names,
+                id=security_group_ids,
+                tenant_id=project_id)
+
+    def test_list_with_all_tenants_not_admin(self):
+        search_opts = {'all_tenants': 1}
+        security_groups_list = {'security_groups': []}
+
+        with mock.patch.object(
+                self.mocked_client,
+                'list_security_groups',
+                return_value=security_groups_list) as mock_list_secgroup:
+            sg_api = neutron_driver.SecurityGroupAPI()
+            sg_api.list(self.context, project=self.context.project_id,
+                        search_opts=search_opts)
+
+            mock_list_secgroup.assert_called_once_with(
+                tenant_id=self.context.project_id)
 
     def test_get_with_name_duplicated(self):
         sg_name = 'web_server'
         expected_sg_id = '85cc3048-abc3-43cc-89b3-377341426ac5'
-        list_security_groups = {'security_groups':
-                                [{'name': sg_name,
-                                  'id': expected_sg_id,
-                                  'tenant_id': self.context.tenant,
-                                  'description': 'server',
-                                  'rules': []}
-                                ]}
-        self.moxed_client.list_security_groups(name=sg_name, fields='id',
-            tenant_id=self.context.tenant).AndReturn(list_security_groups)
-
         expected_sg = {'security_group': {'name': sg_name,
                                  'id': expected_sg_id,
-                                 'tenant_id': self.context.tenant,
+                                 'tenant_id': self.context.project_id,
                                  'description': 'server', 'rules': []}}
-        self.moxed_client.show_security_group(expected_sg_id).AndReturn(
-            expected_sg)
-        self.mox.ReplayAll()
+        self.mocked_client.show_security_group.return_value = expected_sg
 
         sg_api = neutron_driver.SecurityGroupAPI()
-        observed_sg = sg_api.get(self.context, name=sg_name)
-        expected_sg['security_group']['project_id'] = self.context.tenant
+        with mock.patch.object(neutronv20, 'find_resourceid_by_name_or_id',
+                               return_value=expected_sg_id):
+            observed_sg = sg_api.get(self.context, name=sg_name)
+        expected_sg['security_group']['project_id'] = self.context.project_id
         del expected_sg['security_group']['tenant_id']
         self.assertEqual(expected_sg['security_group'], observed_sg)
+        self.mocked_client.show_security_group.assert_called_once_with(
+            expected_sg_id)
 
     def test_get_with_invalid_name(self):
         sg_name = 'invalid_name'
         expected_sg_id = '85cc3048-abc3-43cc-89b3-377341426ac5'
-        list_security_groups = {'security_groups':
-                                [{'name': sg_name,
-                                  'id': expected_sg_id,
-                                  'tenant_id': self.context.tenant,
-                                  'description': 'server',
-                                  'rules': []}
-                                ]}
-        self.moxed_client.list_security_groups(name=sg_name, fields='id',
-            tenant_id=self.context.tenant).AndReturn(list_security_groups)
+        self.mocked_client.show_security_group.side_effect = TypeError
 
-        self.moxed_client.show_security_group(expected_sg_id).AndRaise(
-            TypeError)
-        self.mox.ReplayAll()
+        with mock.patch.object(neutronv20, 'find_resourceid_by_name_or_id',
+                               return_value=expected_sg_id):
+            sg_api = neutron_driver.SecurityGroupAPI()
+            self.assertRaises(exception.SecurityGroupNotFound,
+                              sg_api.get, self.context, name=sg_name)
+        self.mocked_client.show_security_group.assert_called_once_with(
+            expected_sg_id)
+
+    def test_create_security_group_with_bad_request(self):
+        name = 'test-security-group'
+        description = None
+        body = {'security_group': {'name': name,
+                                   'description': description}}
+        message = "Invalid input. Reason: 'None' is not a valid string."
+        self.mocked_client.create_security_group.side_effect = (
+            n_exc.BadRequest(message=message))
 
         sg_api = neutron_driver.SecurityGroupAPI()
-        self.assertRaises(exception.SecurityGroupNotFound,
-                          sg_api.get, self.context, name=sg_name)
+        self.assertRaises(exception.Invalid,
+                          sg_api.create_security_group, self.context, name,
+                          description)
+        self.mocked_client.create_security_group.assert_called_once_with(body)
 
     def test_create_security_group_exceed_quota(self):
         name = 'test-security-group'
@@ -100,14 +192,13 @@ class TestNeutronDriver(test.NoDBTestCase):
         body = {'security_group': {'name': name,
                                    'description': description}}
         message = "Quota exceeded for resources: ['security_group']"
-        self.moxed_client.create_security_group(
-            body).AndRaise(n_exc.NeutronClientException(status_code=409,
-                                                        message=message))
-        self.mox.ReplayAll()
+        self.mocked_client.create_security_group.side_effect = (
+            n_exc.NeutronClientException(status_code=409, message=message))
         sg_api = neutron_driver.SecurityGroupAPI()
         self.assertRaises(exception.SecurityGroupLimitExceeded,
                           sg_api.create_security_group, self.context, name,
                           description)
+        self.mocked_client.create_security_group.assert_called_once_with(body)
 
     def test_create_security_group_rules_exceed_quota(self):
         vals = {'protocol': 'tcp', 'cidr': '0.0.0.0/0',
@@ -120,13 +211,13 @@ class TestNeutronDriver(test.NoDBTestCase):
                 'remote_ip_prefix': '0.0.0.0/0'}]}
         name = 'test-security-group'
         message = "Quota exceeded for resources: ['security_group_rule']"
-        self.moxed_client.create_security_group_rule(
-            body).AndRaise(n_exc.NeutronClientException(status_code=409,
-                                                        message=message))
-        self.mox.ReplayAll()
+        self.mocked_client.create_security_group_rule.side_effect = (
+            n_exc.NeutronClientException(status_code=409, message=message))
         sg_api = neutron_driver.SecurityGroupAPI()
         self.assertRaises(exception.SecurityGroupLimitExceeded,
                           sg_api.add_rules, self.context, None, name, [vals])
+        self.mocked_client.create_security_group_rule.assert_called_once_with(
+            body)
 
     def test_create_security_group_rules_bad_request(self):
         vals = {'protocol': 'icmp', 'cidr': '0.0.0.0/0',
@@ -140,13 +231,13 @@ class TestNeutronDriver(test.NoDBTestCase):
         name = 'test-security-group'
         message = "ICMP code (port-range-max) 255 is provided but ICMP type" \
                   " (port-range-min) is missing"
-        self.moxed_client.create_security_group_rule(
-            body).AndRaise(n_exc.NeutronClientException(status_code=400,
-                                                        message=message))
-        self.mox.ReplayAll()
+        self.mocked_client.create_security_group_rule.side_effect = (
+            n_exc.NeutronClientException(status_code=400, message=message))
         sg_api = neutron_driver.SecurityGroupAPI()
         self.assertRaises(exception.Invalid, sg_api.add_rules,
                           self.context, None, name, [vals])
+        self.mocked_client.create_security_group_rule.assert_called_once_with(
+            body)
 
     def test_list_security_group_with_no_port_range_and_not_tcp_udp_icmp(self):
         sg1 = {'description': 'default',
@@ -166,9 +257,8 @@ class TestNeutronDriver(test.NoDBTestCase):
                            '07f1362f-34f6-4136-819a-2dcde112269e',
                       'tenant_id': 'c166d9316f814891bcb66b96c4c891d6'}]}
 
-        self.moxed_client.list_security_groups().AndReturn(
+        self.mocked_client.list_security_groups.return_value = (
             {'security_groups': [sg1]})
-        self.mox.ReplayAll()
         sg_api = neutron_driver.SecurityGroupAPI()
         result = sg_api.list(self.context)
         expected = [{'rules':
@@ -180,6 +270,7 @@ class TestNeutronDriver(test.NoDBTestCase):
             'id': '07f1362f-34f6-4136-819a-2dcde112269e',
             'name': 'default', 'description': 'default'}]
         self.assertEqual(expected, result)
+        self.mocked_client.list_security_groups.assert_called_once_with()
 
     def test_instances_security_group_bindings(self):
         server_id = 'c5a20e8d-c4b0-47cf-9dca-ebe4f758acb1'
@@ -199,16 +290,33 @@ class TestNeutronDriver(test.NoDBTestCase):
 
         sg_bindings = {server_id: [{'name': 'wol'}, {'name': 'eor'}]}
 
-        self.moxed_client.list_ports(device_id=[server_id]).AndReturn(
-            port_list)
-        self.moxed_client.list_security_groups(id=[sg2_id, sg1_id]).AndReturn(
+        self.mocked_client.list_ports.return_value = port_list
+        self.mocked_client.list_security_groups.return_value = (
             security_groups_list)
-        self.mox.ReplayAll()
 
         sg_api = neutron_driver.SecurityGroupAPI()
         result = sg_api.get_instances_security_groups_bindings(
                                   self.context, servers)
-        self.assertEqual(result, sg_bindings)
+        self.assertEqual(sg_bindings, result)
+        self.mocked_client.list_ports.assert_called_once_with(
+            device_id=[server_id])
+        self.mocked_client.list_security_groups.assert_called_once_with(
+            id=mock.ANY)
+        self.assertEqual(sorted([sg1_id, sg2_id]),
+            sorted(self.mocked_client.list_security_groups.call_args[1]['id']))
+
+    def test_instances_security_group_bindings_port_not_found(self):
+        server_id = 'c5a20e8d-c4b0-47cf-9dca-ebe4f758acb1'
+        servers = [{'id': server_id}]
+
+        self.mocked_client.list_ports.side_effect = n_exc.PortNotFoundClient()
+
+        sg_api = neutron_driver.SecurityGroupAPI()
+        result = sg_api.get_instances_security_groups_bindings(
+                                  self.context, servers)
+        self.mocked_client.list_ports.assert_called_once_with(
+            device_id=[server_id])
+        self.assertEqual({}, result)
 
     def _test_instances_security_group_bindings_scale(self, num_servers):
         max_query = 150
@@ -221,7 +329,7 @@ class TestNeutronDriver(test.NoDBTestCase):
         device_ids = []
         ports = []
         sg_bindings = {}
-        for i in xrange(0, num_servers):
+        for i in range(0, num_servers):
             server_id = "server-%d" % i
             port_id = "port-%d" % i
             servers.append({'id': server_id})
@@ -231,19 +339,27 @@ class TestNeutronDriver(test.NoDBTestCase):
                           'security_groups': [sg1_id, sg2_id]})
             sg_bindings[server_id] = [{'name': 'wol'}, {'name': 'eor'}]
 
-        for x in xrange(0, num_servers, max_query):
-            self.moxed_client.list_ports(
-                       device_id=device_ids[x:x + max_query]).\
-                       AndReturn({'ports': ports[x:x + max_query]})
+        expected_args = []
+        return_values = []
+        for x in range(0, num_servers, max_query):
+            expected_args.append(
+                mock.call(device_id=device_ids[x:x + max_query]))
+            return_values.append({'ports': ports[x:x + max_query]})
 
-        self.moxed_client.list_security_groups(id=[sg2_id, sg1_id]).AndReturn(
+        self.mocked_client.list_security_groups.return_value = (
             security_groups_list)
-        self.mox.ReplayAll()
+        self.mocked_client.list_ports.side_effect = return_values
 
         sg_api = neutron_driver.SecurityGroupAPI()
         result = sg_api.get_instances_security_groups_bindings(
                                   self.context, servers)
-        self.assertEqual(result, sg_bindings)
+        self.assertEqual(sg_bindings, result)
+        self.mocked_client.list_security_groups.assert_called_once_with(
+            id=mock.ANY)
+        self.assertEqual(sorted([sg1_id, sg2_id]),
+            sorted(self.mocked_client.list_security_groups.call_args[1]['id']))
+        self.assertEqual(expected_args,
+            self.mocked_client.list_ports.call_args_list)
 
     def test_instances_security_group_bindings_less_than_max(self):
         self._test_instances_security_group_bindings_scale(100)
@@ -265,24 +381,89 @@ class TestNeutronDriver(test.NoDBTestCase):
 
         sg_bindings = {'dev_1': [{'name': 'wol'}]}
 
-        self.moxed_client.list_ports(device_id=['server_1']).AndReturn(
-            port_list)
-        self.moxed_client.\
-            list_security_groups(id=mox.SameElementsAs(['1', '2'])).AndReturn(
-                security_groups_list)
-        self.mox.ReplayAll()
+        self.mocked_client.list_ports.return_value = port_list
+        self.mocked_client.list_security_groups.return_value = (
+            security_groups_list)
 
         sg_api = neutron_driver.SecurityGroupAPI()
         result = sg_api.get_instances_security_groups_bindings(
                                   self.context, servers)
-        self.assertEqual(result, sg_bindings)
+        self.assertEqual(sg_bindings, result)
+        self.mocked_client.list_ports.assert_called_once_with(
+            device_id=['server_1'])
+        self.mocked_client.list_security_groups.assert_called_once_with(
+            id=mock.ANY)
+        self.assertEqual(['1', '2'],
+            sorted(self.mocked_client.list_security_groups.call_args[1]['id']))
 
     def test_instance_empty_security_groups(self):
 
-        port_list = {'ports': [{'id': 1, 'device_id': '1',
+        port_list = {'ports': [{'id': 1, 'device_id': uuids.instance,
                      'security_groups': []}]}
-        self.moxed_client.list_ports(device_id=['1']).AndReturn(port_list)
-        self.mox.ReplayAll()
+        self.mocked_client.list_ports.return_value = port_list
         sg_api = neutron_driver.SecurityGroupAPI()
-        result = sg_api.get_instance_security_groups(self.context, '1')
+        result = sg_api.get_instance_security_groups(
+            self.context, objects.Instance(uuid=uuids.instance))
         self.assertEqual([], result)
+        self.mocked_client.list_ports.assert_called_once_with(
+            device_id=[uuids.instance])
+
+    def test_add_to_instance(self):
+        sg_name = 'web_server'
+        sg_id = '85cc3048-abc3-43cc-89b3-377341426ac5'
+        port_id = 1
+        port_list = {'ports': [{'id': port_id, 'device_id': uuids.instance,
+                     'fixed_ips': [{'ip_address': '10.0.0.1'}],
+                     'port_security_enabled': True, 'security_groups': []}]}
+        self.mocked_client.list_ports.return_value = port_list
+        sg_api = neutron_driver.SecurityGroupAPI()
+        with mock.patch.object(neutronv20, 'find_resourceid_by_name_or_id',
+                               return_value=sg_id):
+            sg_api.add_to_instance(
+                self.context, objects.Instance(uuid=uuids.instance), sg_name)
+        self.mocked_client.list_ports.assert_called_once_with(
+            device_id=uuids.instance)
+        self.mocked_client.update_port.assert_called_once_with(
+            port_id, {'port': {'security_groups': [sg_id]}})
+
+    def test_add_to_instance_with_bad_request(self):
+        sg_name = 'web_server'
+        sg_id = '85cc3048-abc3-43cc-89b3-377341426ac5'
+        port_id = 1
+        port_list = {'ports': [{'id': port_id, 'device_id': uuids.instance,
+                     'fixed_ips': [{'ip_address': '10.0.0.1'}],
+                     'port_security_enabled': True, 'security_groups': []}]}
+        self.mocked_client.list_ports.return_value = port_list
+        sg_api = neutron_driver.SecurityGroupAPI()
+        self.mocked_client.update_port.side_effect = (
+            n_exc.BadRequest(message='error'))
+        with mock.patch.object(neutronv20, 'find_resourceid_by_name_or_id',
+                               return_value=sg_id):
+            self.assertRaises(exception.SecurityGroupCannotBeApplied,
+                              sg_api.add_to_instance, self.context,
+                              objects.Instance(uuid=uuids.instance), sg_name)
+        self.mocked_client.list_ports.assert_called_once_with(
+            device_id=uuids.instance)
+        self.mocked_client.update_port.assert_called_once_with(
+            port_id, {'port': {'security_groups': [sg_id]}})
+
+
+class TestNeutronDriverWithoutMock(test.NoDBTestCase):
+
+    def test_validate_property(self):
+        sg_api = neutron_driver.SecurityGroupAPI()
+
+        sg_api.validate_property('foo', 'name', None)
+        sg_api.validate_property('', 'name', None)
+        self.assertRaises(exception.Invalid, sg_api.validate_property,
+                          'a' * 256, 'name', None)
+        self.assertRaises(exception.Invalid, sg_api.validate_property,
+                          None, 'name', None)
+
+    def test_populate_security_groups(self):
+        sg_api = neutron_driver.SecurityGroupAPI()
+        r = sg_api.populate_security_groups(['default', uuids.secgroup_uuid])
+        self.assertIsInstance(r, objects.SecurityGroupList)
+        self.assertEqual(2, len(r))
+        self.assertEqual('default', r[0].name)
+        self.assertEqual(uuids.secgroup_uuid, r[1].uuid)

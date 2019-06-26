@@ -21,8 +21,6 @@ from sqlalchemy import ForeignKey, Index, Integer, MetaData, String, Table
 from sqlalchemy import Text
 from sqlalchemy.types import NullType
 
-from nova.i18n import _LE
-
 LOG = logging.getLogger(__name__)
 
 
@@ -50,7 +48,7 @@ def InetSmall():
 def _create_shadow_tables(migrate_engine):
     meta = MetaData(migrate_engine)
     meta.reflect(migrate_engine)
-    table_names = meta.tables.keys()
+    table_names = list(meta.tables.keys())
 
     meta.bind = migrate_engine
 
@@ -81,35 +79,8 @@ def _create_shadow_tables(migrate_engine):
             shadow_table.create()
         except Exception:
             LOG.info(repr(shadow_table))
-            LOG.exception(_LE('Exception while creating table.'))
+            LOG.exception('Exception while creating table.')
             raise
-
-
-def _populate_instance_types(instance_types_table):
-    default_inst_types = {
-        'm1.tiny': dict(mem=512, vcpus=1, root_gb=1, eph_gb=0, flavid=1),
-        'm1.small': dict(mem=2048, vcpus=1, root_gb=20, eph_gb=0, flavid=2),
-        'm1.medium': dict(mem=4096, vcpus=2, root_gb=40, eph_gb=0, flavid=3),
-        'm1.large': dict(mem=8192, vcpus=4, root_gb=80, eph_gb=0, flavid=4),
-        'm1.xlarge': dict(mem=16384, vcpus=8, root_gb=160, eph_gb=0, flavid=5)
-        }
-
-    try:
-        i = instance_types_table.insert()
-        for name, values in default_inst_types.iteritems():
-            i.execute({'name': name, 'memory_mb': values["mem"],
-                        'vcpus': values["vcpus"], 'deleted': 0,
-                        'root_gb': values["root_gb"],
-                        'ephemeral_gb': values["eph_gb"],
-                        'rxtx_factor': 1,
-                        'swap': 0,
-                        'flavorid': values["flavid"],
-                        'disabled': False,
-                        'is_public': True})
-    except Exception:
-        LOG.info(repr(instance_types_table))
-        LOG.exception(_LE('Exception while seeding instance_types table'))
-        raise
 
 
 # NOTE(dprince): we add these here so our schema contains dump tables
@@ -328,6 +299,10 @@ def upgrade(migrate_engine):
         mysql_charset='utf8'
     )
 
+    consoles_instance_uuid_column_args = ['instance_uuid', String(length=36)]
+    consoles_instance_uuid_column_args.append(
+        ForeignKey('instances.uuid', name='consoles_instance_uuid_fkey'))
+
     consoles = Table('consoles', meta,
         Column('created_at', DateTime),
         Column('updated_at', DateTime),
@@ -337,9 +312,7 @@ def upgrade(migrate_engine):
         Column('password', String(length=255)),
         Column('port', Integer),
         Column('pool_id', Integer, ForeignKey('console_pools.id')),
-        Column('instance_uuid', String(length=36),
-               ForeignKey('instances.uuid',
-                          name='consoles_instance_uuid_fkey')),
+        Column(*consoles_instance_uuid_column_args),
         Column('deleted', Integer),
         mysql_engine='InnoDB',
         mysql_charset='utf8'
@@ -1100,7 +1073,7 @@ def upgrade(migrate_engine):
             table.create()
         except Exception:
             LOG.info(repr(table))
-            LOG.exception(_LE('Exception while creating table.'))
+            LOG.exception('Exception while creating table.')
             raise
 
     # task log unique constraint
@@ -1121,7 +1094,7 @@ def upgrade(migrate_engine):
     UniqueConstraint('flavorid', 'deleted', table=instance_types,
                      name='uniq_instance_types0flavorid0deleted').create()
 
-    # keypair contraint
+    # keypair constraint
     UniqueConstraint('user_id', 'name', 'deleted', table=key_pairs,
                      name='uniq_key_pairs0user_id0name0deleted').create()
 
@@ -1461,18 +1434,45 @@ def upgrade(migrate_engine):
     ]
 
     for index in common_indexes:
-        if migrate_engine.name == 'postgresql' and \
-            index.name in POSTGRES_INDEX_SKIPS:
-            continue
-        if migrate_engine.name == 'mysql' and \
-            index.name in MYSQL_INDEX_SKIPS:
+        if ((migrate_engine.name == 'postgresql' and
+                index.name in POSTGRES_INDEX_SKIPS) or
+            (migrate_engine.name == 'mysql' and
+                index.name in MYSQL_INDEX_SKIPS)):
             continue
         else:
             index.create(migrate_engine)
 
     Index('project_id', dns_domains.c.project_id).drop
 
+    # Common foreign keys
     fkeys = [
+
+              [[instance_type_projects.c.instance_type_id],
+                  [instance_types.c.id],
+                  'instance_type_projects_ibfk_1'],
+              [[iscsi_targets.c.volume_id],
+                  [volumes.c.id],
+                  'iscsi_targets_volume_id_fkey'],
+              [[reservations.c.usage_id],
+                  [quota_usages.c.id],
+                  'reservations_ibfk_1'],
+              [[security_group_instance_association.c.security_group_id],
+                  [security_groups.c.id],
+                  'security_group_instance_association_ibfk_1'],
+              [[compute_node_stats.c.compute_node_id],
+                  [compute_nodes.c.id],
+                  'fk_compute_node_stats_compute_node_id'],
+              [[compute_nodes.c.service_id],
+                  [services.c.id],
+                  'fk_compute_nodes_service_id'],
+
+            ]
+
+    secgroup_instance_association_instance_uuid_fkey = (
+                'security_group_instance_association_instance_uuid_fkey')
+    fkeys.extend(
+            [
+
               [[fixed_ips.c.instance_uuid],
                   [instances.c.uuid],
                   'fixed_ips_instance_uuid_fkey'],
@@ -1488,30 +1488,12 @@ def upgrade(migrate_engine):
               [[instance_system_metadata.c.instance_uuid],
                   [instances.c.uuid],
                   'instance_system_metadata_ibfk_1'],
-              [[instance_type_projects.c.instance_type_id],
-                  [instance_types.c.id],
-                  'instance_type_projects_ibfk_1'],
-              [[iscsi_targets.c.volume_id],
-                  [volumes.c.id],
-                  'iscsi_targets_volume_id_fkey'],
-              [[reservations.c.usage_id],
-                  [quota_usages.c.id],
-                  'reservations_ibfk_1'],
               [[security_group_instance_association.c.instance_uuid],
                   [instances.c.uuid],
-                  'security_group_instance_association_instance_uuid_fkey'],
-              [[security_group_instance_association.c.security_group_id],
-                  [security_groups.c.id],
-                  'security_group_instance_association_ibfk_1'],
+                  secgroup_instance_association_instance_uuid_fkey],
               [[virtual_interfaces.c.instance_uuid],
                   [instances.c.uuid],
                   'virtual_interfaces_instance_uuid_fkey'],
-              [[compute_node_stats.c.compute_node_id],
-                  [compute_nodes.c.id],
-                  'fk_compute_node_stats_compute_node_id'],
-              [[compute_nodes.c.service_id],
-                  [services.c.id],
-                  'fk_compute_nodes_service_id'],
               [[instance_actions.c.instance_uuid],
                   [instances.c.uuid],
                   'fk_instance_actions_instance_uuid'],
@@ -1520,12 +1502,14 @@ def upgrade(migrate_engine):
                   'fk_instance_faults_instance_uuid'],
               [[migrations.c.instance_uuid],
                   [instances.c.uuid],
-                  'fk_migrations_instance_uuid'],
-            ]
+                  'fk_migrations_instance_uuid']
+
+            ])
 
     for fkey_pair in fkeys:
         if migrate_engine.name == 'mysql':
-            # For MySQL we name our fkeys explicitly so they match Havana
+            # For MySQL we name our fkeys explicitly
+            # so they match Havana
             fkey = ForeignKeyConstraint(columns=fkey_pair[0],
                                    refcolumns=fkey_pair[1],
                                    name=fkey_pair[2])
@@ -1547,11 +1531,4 @@ def upgrade(migrate_engine):
 
     _create_shadow_tables(migrate_engine)
 
-    # populate initial instance types
-    _populate_instance_types(instance_types)
-
     _create_dump_tables(migrate_engine)
-
-
-def downgrade(migrate_engine):
-    raise NotImplementedError('Downgrade from Havana is unsupported.')

@@ -16,6 +16,7 @@
 from oslo_log import log as logging
 
 from nova.network import linux_net
+import nova.privsep.linux_net
 from nova import utils
 
 LOG = logging.getLogger(__name__)
@@ -31,11 +32,11 @@ class L3Driver(object):
         """Set up basic L3 networking functionality."""
         raise NotImplementedError()
 
-    def initialize_network(self, network):
+    def initialize_network(self, cidr, is_external):
         """Enable rules for a specific network."""
         raise NotImplementedError()
 
-    def initialize_gateway(self, network):
+    def initialize_gateway(self, network_ref):
         """Set up a gateway on this network."""
         raise NotImplementedError()
 
@@ -117,10 +118,10 @@ class LinuxNetL3(L3Driver):
 
     def remove_floating_ip(self, floating_ip, fixed_ip, l3_interface_id,
                            network=None):
-        linux_net.unbind_floating_ip(floating_ip, l3_interface_id)
+        nova.privsep.linux_net.unbind_ip(l3_interface_id, floating_ip)
         linux_net.remove_floating_forward(floating_ip, fixed_ip,
                                           l3_interface_id, network)
-        linux_net.clean_conntrack(fixed_ip)
+        nova.privsep.linux_net.clean_conntrack(fixed_ip)
 
     def add_vpn(self, public_ip, port, private_ip):
         linux_net.ensure_vpn_forward(public_ip, port, private_ip)
@@ -148,7 +149,7 @@ class NullL3(L3Driver):
     def is_initialized(self):
         return True
 
-    def initialize_network(self, cidr):
+    def initialize_network(self, cidr, is_external):
         pass
 
     def initialize_gateway(self, network_ref):

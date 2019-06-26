@@ -19,44 +19,50 @@ and storage repositories
 """
 
 import re
-import string
+import uuid
 
 from eventlet import greenthread
-from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_utils import excutils
+from oslo_utils import strutils
+from oslo_utils import versionutils
+import six
 
+import nova.conf
 from nova import exception
-from nova.i18n import _, _LE, _LW
+from nova.i18n import _
 
-xenapi_volume_utils_opts = [
-    cfg.IntOpt('introduce_vdi_retry_wait',
-               default=20,
-               help='Number of seconds to wait for an SR to settle '
-                    'if the VDI does not exist when first introduced'),
-    ]
 
-CONF = cfg.CONF
-CONF.register_opts(xenapi_volume_utils_opts, 'xenserver')
+CONF = nova.conf.CONF
 
 LOG = logging.getLogger(__name__)
 
+# Namespace for SRs so we can reliably generate a UUID
+# Generated from uuid.uuid5(uuid.UUID(int=0), 'volume_utils-SR_UUID')
+SR_NAMESPACE = uuid.UUID("3cca4135-a809-5bb3-af62-275fbfe87178")
+
 
 def parse_sr_info(connection_data, description=''):
-    label = connection_data.pop('name_label',
-                                'tempSR-%s' % connection_data.get('volume_id'))
     params = {}
     if 'sr_uuid' not in connection_data:
         params = _parse_volume_info(connection_data)
-        # This magic label sounds a lot like 'False Disc' in leet-speak
-        uuid = "FA15E-D15C-" + str(params['id'])
+        sr_identity = "%s/%s/%s" % (params['target'], params['port'],
+                                    params['targetIQN'])
+        # PY2 can only support taking an ascii string to uuid5
+        if six.PY2 and isinstance(sr_identity, six.text_type):
+            sr_identity = sr_identity.encode('utf-8')
+        sr_uuid = str(uuid.uuid5(SR_NAMESPACE, sr_identity))
     else:
-        uuid = connection_data['sr_uuid']
+        sr_uuid = connection_data['sr_uuid']
         for k in connection_data.get('introduce_sr_keys', {}):
             params[k] = connection_data[k]
+
+    label = connection_data.pop('name_label',
+                                'tempSR-%s' % sr_uuid)
     params['name_description'] = connection_data.get('name_description',
                                                      description)
 
-    return (uuid, label, params)
+    return (sr_uuid, label, params)
 
 
 def _parse_volume_info(connection_data):
@@ -84,7 +90,7 @@ def _parse_volume_info(connection_data):
             target_iqn is None):
         raise exception.StorageError(
                 reason=_('Unable to obtain target information %s') %
-                        connection_data)
+                        strutils.mask_password(connection_data))
     volume_info = {}
     volume_info['id'] = volume_id
     volume_info['target'] = target_host
@@ -120,6 +126,9 @@ def introduce_sr(session, sr_uuid, label, params):
 
     sr_type, sr_desc = _handle_sr_params(params)
 
+    if _requires_backend_kind(session.product_version) and sr_type == 'iscsi':
+        params['backend-kind'] = 'vbd'
+
     sr_ref = session.call_xenapi('SR.introduce', sr_uuid, label, sr_desc,
             sr_type, '', False, params)
 
@@ -131,6 +140,12 @@ def introduce_sr(session, sr_uuid, label, params):
 
     session.call_xenapi("SR.scan", sr_ref)
     return sr_ref
+
+
+def _requires_backend_kind(version):
+    # Fix for Bug #1502929
+    version_as_string = '.'.join(str(v) for v in version)
+    return (versionutils.is_compatible('6.5', version_as_string))
 
 
 def _handle_sr_params(params):
@@ -160,7 +175,7 @@ def introduce_vdi(session, sr_ref, vdi_uuid=None, target_lun=None):
             session.call_xenapi("SR.scan", sr_ref)
             vdi_ref = _get_vdi_ref(session, sr_ref, vdi_uuid, target_lun)
     except session.XenAPI.Failure:
-        LOG.exception(_LE('Unable to introduce VDI on SR'))
+        LOG.exception(_('Unable to introduce VDI on SR'))
         raise exception.StorageError(
                 reason=_('Unable to introduce VDI on SR %s') % sr_ref)
 
@@ -175,7 +190,7 @@ def introduce_vdi(session, sr_ref, vdi_uuid=None, target_lun=None):
         vdi_rec = session.call_xenapi("VDI.get_record", vdi_ref)
         LOG.debug(vdi_rec)
     except session.XenAPI.Failure:
-        LOG.exception(_LE('Unable to get record of VDI'))
+        LOG.exception(_('Unable to get record of VDI'))
         raise exception.StorageError(
                 reason=_('Unable to get record of VDI %s on') % vdi_ref)
 
@@ -197,14 +212,14 @@ def introduce_vdi(session, sr_ref, vdi_uuid=None, target_lun=None):
                                     vdi_rec['xenstore_data'],
                                     vdi_rec['sm_config'])
     except session.XenAPI.Failure:
-        LOG.exception(_LE('Unable to introduce VDI for SR'))
+        LOG.exception(_('Unable to introduce VDI for SR'))
         raise exception.StorageError(
                 reason=_('Unable to introduce VDI for SR %s') % sr_ref)
 
 
 def _get_vdi_ref(session, sr_ref, vdi_uuid, target_lun):
     if vdi_uuid:
-        LOG.debug("vdi_uuid: %s" % vdi_uuid)
+        LOG.debug("vdi_uuid: %s", vdi_uuid)
         return session.call_xenapi("VDI.get_by_uuid", vdi_uuid)
     elif target_lun:
         vdi_refs = session.call_xenapi("SR.get_VDIs", sr_ref)
@@ -226,7 +241,7 @@ def purge_sr(session, sr_ref):
     for vdi_ref in vdi_refs:
         vbd_refs = session.call_xenapi("VDI.get_VBDs", vdi_ref)
         if vbd_refs:
-            LOG.warning(_LW('Cannot purge SR with referenced VDIs'))
+            LOG.warning('Cannot purge SR with referenced VDIs')
             return
 
     forget_sr(session, sr_ref)
@@ -243,16 +258,16 @@ def _unplug_pbds(session, sr_ref):
     try:
         pbds = session.call_xenapi("SR.get_PBDs", sr_ref)
     except session.XenAPI.Failure as exc:
-        LOG.warning(_LW('Ignoring exception %(exc)s when getting PBDs'
-                        ' for %(sr_ref)s'), {'exc': exc, 'sr_ref': sr_ref})
+        LOG.warning('Ignoring exception %(exc)s when getting PBDs'
+                    ' for %(sr_ref)s', {'exc': exc, 'sr_ref': sr_ref})
         return
 
     for pbd in pbds:
         try:
             session.call_xenapi("PBD.unplug", pbd)
         except session.XenAPI.Failure as exc:
-            LOG.warning(_LW('Ignoring exception %(exc)s when unplugging'
-                            ' PBD %(pbd)s'), {'exc': exc, 'pbd': pbd})
+            LOG.warning('Ignoring exception %(exc)s when unplugging'
+                        ' PBD %(pbd)s', {'exc': exc, 'pbd': pbd})
 
 
 def get_device_number(mountpoint):
@@ -273,9 +288,9 @@ def _mountpoint_to_number(mountpoint):
     elif re.match('^x?vd[a-p]$', mountpoint):
         return (ord(mountpoint[-1]) - ord('a'))
     elif re.match('^[0-9]+$', mountpoint):
-        return string.atoi(mountpoint, 10)
+        return int(mountpoint, 10)
     else:
-        LOG.warning(_LW('Mountpoint cannot be translated: %s'), mountpoint)
+        LOG.warning('Mountpoint cannot be translated: %s', mountpoint)
         return -1
 
 
@@ -295,7 +310,7 @@ def find_sr_from_vbd(session, vbd_ref):
         vdi_ref = session.call_xenapi("VBD.get_VDI", vbd_ref)
         sr_ref = session.call_xenapi("VDI.get_SR", vdi_ref)
     except session.XenAPI.Failure:
-        LOG.exception(_LE('Unable to find SR from VBD'))
+        LOG.exception(_('Unable to find SR from VBD'))
         raise exception.StorageError(
                 reason=_('Unable to find SR from VBD %s') % vbd_ref)
     return sr_ref
@@ -306,7 +321,7 @@ def find_sr_from_vdi(session, vdi_ref):
     try:
         sr_ref = session.call_xenapi("VDI.get_SR", vdi_ref)
     except session.XenAPI.Failure:
-        LOG.exception(_LE('Unable to find SR from VDI'))
+        LOG.exception(_('Unable to find SR from VDI'))
         raise exception.StorageError(
                 reason=_('Unable to find SR from VDI %s') % vdi_ref)
     return sr_ref
@@ -327,10 +342,57 @@ def find_vbd_by_number(session, vm_ref, dev_number):
                 LOG.debug(msg, exc_info=True)
 
 
-def is_booted_from_volume(session, vm_ref):
+def is_booted_from_volume(session, vm_ref, user_device=0):
     """Determine if the root device is a volume."""
-    vbd_ref = find_vbd_by_number(session, vm_ref, 0)
+    # TODO(bkaminski):  We have opened the scope of this method to accept
+    # userdevice.  We should rename this method and its references for clarity.
+    vbd_ref = find_vbd_by_number(session, vm_ref, user_device)
     vbd_other_config = session.VBD.get_other_config(vbd_ref)
     if vbd_other_config.get('osvol', False):
         return True
     return False
+
+
+def _get_vdi_import_path(session, task_ref, vdi_ref, disk_format):
+    session_id = session.get_session_id()
+    str_fmt = '/import_raw_vdi?session_id={}&task_id={}&vdi={}&format={}'
+    return str_fmt.format(session_id, task_ref, vdi_ref, disk_format)
+
+
+def _stream_to_vdi(conn, vdi_import_path, file_size, file_obj):
+    headers = {'Content-Type': 'application/octet-stream',
+               'Content-Length': '%s' % file_size}
+
+    CHUNK_SIZE = 16 * 1024
+    LOG.debug('Initialising PUT request to %s (Headers: %s)',
+              vdi_import_path, headers)
+    conn.request('PUT', vdi_import_path, headers=headers)
+    remain_size = file_size
+    while remain_size >= CHUNK_SIZE:
+        trunk = file_obj.read(CHUNK_SIZE)
+        remain_size -= CHUNK_SIZE
+        conn.send(trunk)
+    if remain_size != 0:
+        trunk = file_obj.read(remain_size)
+        conn.send(trunk)
+    resp = conn.getresponse()
+    LOG.debug("Connection response status:reason is "
+              "%(status)s:%(reason)s",
+              {'status': resp.status, 'reason': resp.reason})
+
+
+def stream_to_vdi(session, instance, disk_format,
+                  file_obj, file_size, vdi_ref):
+
+    task_name_label = 'VDI_IMPORT_for_' + instance['name']
+    with session.custom_task(task_name_label) as task_ref:
+        vdi_import_path = _get_vdi_import_path(session, task_ref, vdi_ref,
+                                               disk_format)
+
+        with session.http_connection() as conn:
+            try:
+                _stream_to_vdi(conn, vdi_import_path, file_size, file_obj)
+            except Exception as e:
+                with excutils.save_and_reraise_exception():
+                    LOG.error('Streaming disk to VDI failed with error: %s',
+                              e, instance=instance)

@@ -100,6 +100,13 @@ represented in target_provision_state.
 CLEANING = 'cleaning'
 """ Node is being automatically cleaned to prepare it for provisioning. """
 
+CLEANWAIT = 'clean wait'
+""" Node is waiting for a clean step to be finished.
+
+This will be the node's `provision_state` while the node is waiting for
+the driver to finish a cleaning step.
+"""
+
 CLEANFAIL = 'clean failed'
 """ Node failed cleaning. This requires operator intervention to resolve. """
 
@@ -121,10 +128,35 @@ This is the provision state used when inspection is started. A successfully
 inspected node shall transition to MANAGEABLE status.
 """
 
-
 INSPECTFAIL = 'inspect failed'
 """ Node inspection failed. """
 
+
+RESCUE = 'rescue'
+""" Node is in rescue mode.
+This is also used as a "verb" when changing the node's provision_state via the
+REST API"""
+
+RESCUEFAIL = 'rescue failed'
+""" Node rescue failed. """
+
+RESCUEWAIT = 'rescue wait'
+""" Node is waiting for rescue callback. """
+
+RESCUING = 'rescuing'
+""" Node is waiting to be rescued. """
+
+UNRESCUE = 'unrescue'
+""" Node is to be unrescued.
+This is not used as a state, but rather as a "verb" when changing the node's
+provision_state via the REST API.
+"""
+
+UNRESCUEFAIL = 'unrescue failed'
+""" Node unrescue failed. """
+
+UNRESCUING = "unrescuing"
+""" Node is unrescuing. """
 
 ##############
 # Power states
@@ -138,3 +170,13 @@ POWER_OFF = 'power off'
 
 REBOOT = 'rebooting'
 """ Node is rebooting. """
+
+##################
+# Helper constants
+##################
+
+PROVISION_STATE_LIST = (NOSTATE, MANAGEABLE, AVAILABLE, ACTIVE, DEPLOYWAIT,
+                        DEPLOYING, DEPLOYFAIL, DEPLOYDONE, DELETING, DELETED,
+                        CLEANING, CLEANWAIT, CLEANFAIL, ERROR, REBUILD,
+                        INSPECTING, INSPECTFAIL)
+""" A list of all provision states. """

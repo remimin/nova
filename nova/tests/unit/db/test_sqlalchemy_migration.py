@@ -12,17 +12,24 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+import importlib
 
 from migrate import exceptions as versioning_exceptions
 from migrate import UniqueConstraint
 from migrate.versioning import api as versioning_api
+import mock
 from oslo_db.sqlalchemy import utils as db_utils
+from oslo_utils.fixture import uuidsentinel
 import sqlalchemy
 
+from nova import context
 from nova.db.sqlalchemy import api as db_api
 from nova.db.sqlalchemy import migration
+from nova.db.sqlalchemy import models
+from nova import exception
+from nova import objects
 from nova import test
+from nova.tests import fixtures as nova_fixtures
 
 
 class TestNullInstanceUuidScanDB(test.TestCase):
@@ -101,9 +108,9 @@ class TestDbSync(test.NoDBTestCase):
             mock_find_repo, mock_version):
         database = 'fake'
         migration.db_sync(database=database)
-        mock_version.assert_called_once_with(database)
+        mock_version.assert_called_once_with(database, context=None)
         mock_find_repo.assert_called_once_with(database)
-        mock_get_engine.assert_called_once_with(database)
+        mock_get_engine.assert_called_once_with(database, context=None)
         mock_upgrade.assert_called_once_with('engine', 'repo', None)
         self.assertFalse(mock_downgrade.called)
 
@@ -111,9 +118,9 @@ class TestDbSync(test.NoDBTestCase):
             mock_find_repo, mock_version):
         database = 'fake'
         migration.db_sync(1, database=database)
-        mock_version.assert_called_once_with(database)
+        mock_version.assert_called_once_with(database, context=None)
         mock_find_repo.assert_called_once_with(database)
-        mock_get_engine.assert_called_once_with(database)
+        mock_get_engine.assert_called_once_with(database, context=None)
         mock_downgrade.assert_called_once_with('engine', 'repo', 1)
         self.assertFalse(mock_upgrade.called)
 
@@ -143,10 +150,12 @@ class TestDbVersion(test.NoDBTestCase):
                 metadata), mock.patch.object(migration,
                         'db_version_control') as mock_version_control:
             migration.db_version(database)
-            mock_version_control.assert_called_once_with(0, database)
+            mock_version_control.assert_called_once_with(0,
+                                                         database,
+                                                         context=None)
             db_version_calls = [mock.call('engine', 'repo')] * 2
             self.assertEqual(db_version_calls, mock_db_version.call_args_list)
-        engine_calls = [mock.call(database)] * 3
+        engine_calls = [mock.call(database, context=None)] * 3
         self.assertEqual(engine_calls, mock_get_engine.call_args_list)
 
 
@@ -170,7 +179,7 @@ class TestGetEngine(test.NoDBTestCase):
                 return_value='engine') as mock_get_engine:
             engine = migration.get_engine()
             self.assertEqual('engine', engine)
-            mock_get_engine.assert_called_once_with()
+            mock_get_engine.assert_called_once_with(context=None)
 
     def test_get_api_engine(self):
         with mock.patch.object(db_api, 'get_api_engine',
@@ -178,3 +187,261 @@ class TestGetEngine(test.NoDBTestCase):
             engine = migration.get_engine('api')
             self.assertEqual('api_engine', engine)
             mock_get_engine.assert_called_once_with()
+
+
+class TestFlavorCheck(test.TestCase):
+    def setUp(self):
+        super(TestFlavorCheck, self).setUp()
+        self.context = context.get_admin_context()
+        self.migration = importlib.import_module(
+            'nova.db.sqlalchemy.migrate_repo.versions.'
+            '291_enforce_flavors_migrated')
+        self.engine = db_api.get_engine()
+
+    def test_upgrade_clean(self):
+        inst = objects.Instance(context=self.context,
+                                uuid=uuidsentinel.fake,
+                                user_id=self.context.user_id,
+                                project_id=self.context.project_id,
+                                system_metadata={'foo': 'bar'})
+        inst.create()
+        self.migration.upgrade(self.engine)
+
+    def test_upgrade_dirty(self):
+        inst = objects.Instance(context=self.context,
+                                uuid=uuidsentinel.fake,
+                                user_id=self.context.user_id,
+                                project_id=self.context.project_id,
+                                system_metadata={'foo': 'bar',
+                                                 'instance_type_id': 'foo'})
+        inst.create()
+        self.assertRaises(exception.ValidationError,
+                          self.migration.upgrade, self.engine)
+
+    def test_upgrade_flavor_deleted_instances(self):
+        inst = objects.Instance(context=self.context,
+                                uuid=uuidsentinel.fake,
+                                user_id=self.context.user_id,
+                                project_id=self.context.project_id,
+                                system_metadata={'foo': 'bar',
+                                                 'instance_type_id': 'foo'})
+        inst.create()
+        inst.destroy()
+        self.migration.upgrade(self.engine)
+
+
+class TestNewtonCheck(test.TestCase):
+    def setUp(self):
+        super(TestNewtonCheck, self).setUp()
+        self.useFixture(nova_fixtures.DatabaseAtVersion(329))
+        self.context = context.get_admin_context()
+        self.migration = importlib.import_module(
+            'nova.db.sqlalchemy.migrate_repo.versions.'
+            '330_enforce_mitaka_online_migrations')
+        self.engine = db_api.get_engine()
+
+    def setup_pci_device(self, dev_type):
+        # NOTE(jaypipes): We cannot use db_api.pci_device_update() here because
+        # newer models of PciDevice contain fields (uuid) that are not present
+        # in the older Newton DB schema and pci_device_update() uses the
+        # SQLAlchemy ORM model_query().update() form which will produce an
+        # UPDATE SQL statement that contains those new fields, resulting in an
+        # OperationalError about table pci_devices has no such column uuid.
+        engine = db_api.get_engine()
+        tbl = models.PciDevice.__table__
+        with engine.connect() as conn:
+            ins_stmt = tbl.insert().values(
+                address='foo:bar',
+                compute_node_id=1,
+                parent_addr=None,
+                vendor_id='123',
+                product_id='456',
+                dev_type=dev_type,
+                label='foobar',
+                status='whatisthis?',
+            )
+            conn.execute(ins_stmt)
+
+    def test_pci_device_type_vf_not_migrated(self):
+        self.setup_pci_device('type-VF')
+        # type-VF devices should have a parent_addr
+        self.assertRaises(exception.ValidationError,
+                          self.migration.upgrade, self.engine)
+
+    def test_pci_device_type_pf_not_migrated(self):
+        self.setup_pci_device('type-PF')
+        # blocker should not block on type-PF devices
+        self.migration.upgrade(self.engine)
+
+    def test_pci_device_type_pci_not_migrated(self):
+        self.setup_pci_device('type-PCI')
+        # blocker should not block on type-PCI devices
+        self.migration.upgrade(self.engine)
+
+
+class TestOcataCheck(test.TestCase):
+    def setUp(self):
+        super(TestOcataCheck, self).setUp()
+        self.context = context.get_admin_context()
+        self.migration = importlib.import_module(
+            'nova.db.sqlalchemy.migrate_repo.versions.'
+            '345_require_online_migration_completion')
+        self.engine = db_api.get_engine()
+        self.flavor_values = {
+            'name': 'foo',
+            'memory_mb': 256,
+            'vcpus': 1,
+            'root_gb': 10,
+            'ephemeral_gb': 100,
+            'flavorid': 'bar',
+            'swap': 1,
+            'rxtx_factor': 1.0,
+            'vcpu_weight': 1,
+            'disabled': False,
+            'is_public': True,
+            'deleted': 0
+        }
+        self.keypair_values = {
+            'name': 'foo',
+            'user_ud': 'bar',
+            'fingerprint': 'baz',
+            'public_key': 'bat',
+            'type': 'ssh',
+        }
+        self.aggregate_values = {
+            'uuid': uuidsentinel.agg,
+            'name': 'foo',
+        }
+        self.ig_values = {
+            'user_id': 'foo',
+            'project_id': 'bar',
+            'uuid': uuidsentinel.ig,
+            'name': 'baz',
+            'deleted': 0
+        }
+
+    def test_upgrade_clean(self):
+        self.migration.upgrade(self.engine)
+
+    def test_upgrade_dirty_flavors(self):
+        flavors = db_utils.get_table(self.engine, 'instance_types')
+        flavors.insert().execute(self.flavor_values)
+        self.assertRaises(exception.ValidationError,
+                          self.migration.upgrade, self.engine)
+
+    def test_upgrade_dirty_keypairs(self):
+        db_api.key_pair_create(self.context, self.keypair_values)
+        self.assertRaises(exception.ValidationError,
+                          self.migration.upgrade, self.engine)
+
+    def test_upgrade_with_deleted_keypairs(self):
+        keypair = db_api.key_pair_create(self.context, self.keypair_values)
+        db_api.key_pair_destroy(self.context,
+                                keypair['user_id'], keypair['name'])
+        self.migration.upgrade(self.engine)
+
+    def test_upgrade_dirty_instance_groups(self):
+        igs = db_utils.get_table(self.engine, 'instance_groups')
+        igs.insert().execute(self.ig_values)
+        self.assertRaises(exception.ValidationError,
+                          self.migration.upgrade, self.engine)
+
+    def test_upgrade_with_deleted_instance_groups(self):
+        igs = db_utils.get_table(self.engine, 'instance_groups')
+        group_id = igs.insert().execute(self.ig_values).inserted_primary_key[0]
+        igs.update().where(igs.c.id == group_id).values(
+            deleted=group_id).execute()
+        self.migration.upgrade(self.engine)
+
+
+class TestNewtonCellsCheck(test.NoDBTestCase):
+    USES_DB_SELF = True
+
+    def setUp(self):
+        super(TestNewtonCellsCheck, self).setUp()
+        self.useFixture(nova_fixtures.DatabaseAtVersion(28, 'api'))
+        self.context = context.get_admin_context()
+        self.migration = importlib.import_module(
+            'nova.db.sqlalchemy.api_migrations.migrate_repo.versions.'
+            '030_require_cell_setup')
+        self.engine = db_api.get_api_engine()
+
+    def _flavor_me(self):
+        # We can't use the Flavor object or model to create the flavor because
+        # the model and object have the description field now but at this point
+        # we have not run the migration schema to add the description column.
+        flavors = db_utils.get_table(self.engine, 'flavors')
+        values = dict(name='foo', memory_mb=123,
+                      vcpus=1, root_gb=1,
+                      flavorid='m1.foo', swap=0)
+        flavors.insert().execute(values)
+
+    def _create_cell_mapping(self, **values):
+        mappings = db_utils.get_table(self.engine, 'cell_mappings')
+        return mappings.insert().execute(**values).inserted_primary_key[0]
+
+    def _create_host_mapping(self, **values):
+        mappings = db_utils.get_table(self.engine, 'host_mappings')
+        return mappings.insert().execute(**values).inserted_primary_key[0]
+
+    def test_upgrade_with_no_cell_mappings(self):
+        self._flavor_me()
+        self.assertRaisesRegex(exception.ValidationError,
+                               'Cell mappings',
+                               self.migration.upgrade, self.engine)
+
+    def test_upgrade_with_only_cell0(self):
+        self._flavor_me()
+        self._create_cell_mapping(uuid=objects.CellMapping.CELL0_UUID,
+                                  name='cell0',
+                                  transport_url='fake',
+                                  database_connection='fake')
+        self.assertRaisesRegex(exception.ValidationError,
+                               'Cell mappings',
+                               self.migration.upgrade, self.engine)
+
+    def test_upgrade_without_cell0(self):
+        self._flavor_me()
+        self._create_cell_mapping(uuid=uuidsentinel.cell1,
+                                  name='cell1',
+                                  transport_url='fake',
+                                  database_connection='fake')
+        self._create_cell_mapping(uuid=uuidsentinel.cell2,
+                                  name='cell2',
+                                  transport_url='fake',
+                                  database_connection='fake')
+        self.assertRaisesRegex(exception.ValidationError,
+                               'Cell0',
+                               self.migration.upgrade, self.engine)
+
+    def test_upgrade_with_no_host_mappings(self):
+        self._flavor_me()
+        self._create_cell_mapping(uuid=objects.CellMapping.CELL0_UUID,
+                                  name='cell0',
+                                  transport_url='fake',
+                                  database_connection='fake')
+        self._create_cell_mapping(uuid=uuidsentinel.cell1,
+                                  name='cell1',
+                                  transport_url='fake',
+                                  database_connection='fake')
+
+        with mock.patch.object(self.migration, 'LOG') as log:
+            self.migration.upgrade(self.engine)
+            self.assertTrue(log.warning.called)
+
+    def test_upgrade_with_required_mappings(self):
+        self._flavor_me()
+        self._create_cell_mapping(uuid=objects.CellMapping.CELL0_UUID,
+                                  name='cell0',
+                                  transport_url='fake',
+                                  database_connection='fake')
+        cell1_id = self._create_cell_mapping(uuid=uuidsentinel.cell1,
+                                             name='cell1',
+                                             transport_url='fake',
+                                             database_connection='fake')
+        self._create_host_mapping(cell_id=cell1_id, host='foo')
+
+        self.migration.upgrade(self.engine)
+
+    def test_upgrade_new_deploy(self):
+        self.migration.upgrade(self.engine)

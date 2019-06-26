@@ -17,15 +17,12 @@
 Stubouts for the test suite
 """
 
-import contextlib
-
-import mock
 from oslo_vmware import exceptions as vexc
 
+import nova.conf
 from nova.tests.unit.virt.vmwareapi import fake
-from nova.virt.vmwareapi import driver
-from nova.virt.vmwareapi import images
-from nova.virt.vmwareapi import network_util
+
+CONF = nova.conf.CONF
 
 
 def fake_get_vim_object(arg):
@@ -68,49 +65,20 @@ def fake_session_permission_exception():
     raise vexc.VimFaultException(fault_list, fault_string, details=details)
 
 
-def set_stubs(stubs):
+def set_stubs(test):
     """Set the stubs."""
-    stubs.Set(network_util, 'get_network_with_the_name',
-              fake.fake_get_network)
-    stubs.Set(images, 'upload_image_stream_optimized', fake.fake_upload_image)
-    stubs.Set(images, 'fetch_image', fake.fake_fetch_image)
-    stubs.Set(driver.VMwareAPISession, "vim", fake_vim_prop)
-    stubs.Set(driver.VMwareAPISession, "_is_vim_object",
-              fake_is_vim_object)
 
-
-def fake_suds_context(calls=None):
-    """Generate a suds client which automatically mocks all SOAP method calls.
-
-    Calls are stored in <calls>, indexed by the name of the call. If you need
-    to mock the behaviour of specific API calls you can pre-populate <calls>
-    with appropriate Mock objects.
-    """
-
-    calls = calls or {}
-
-    class fake_factory(object):
-        def create(self, name):
-            return mock.NonCallableMagicMock(name=name)
-
-    class fake_service(object):
-        def __getattr__(self, attr_name):
-            if attr_name in calls:
-                return calls[attr_name]
-
-            mock_call = mock.MagicMock(name=attr_name)
-            calls[attr_name] = mock_call
-            return mock_call
-
-    class fake_client(object):
-        def __init__(self, wdsl_url, **kwargs):
-            self.service = fake_service()
-            self.factory = fake_factory()
-
-    return contextlib.nested(
-        mock.patch('suds.client.Client', fake_client),
-
-        # As we're not connecting to a real host there's no need to wait
-        # between retries
-        mock.patch.object(driver, 'TIME_BETWEEN_API_CALL_RETRIES', 0)
-    )
+    test.stub_out('nova.virt.vmwareapi.network_util.get_network_with_the_name',
+                  fake.fake_get_network)
+    test.stub_out('nova.virt.vmwareapi.images.upload_image_stream_optimized',
+                  fake.fake_upload_image)
+    test.stub_out('nova.virt.vmwareapi.images.fetch_image',
+                  fake.fake_fetch_image)
+    test.stub_out('nova.virt.vmwareapi.driver.VMwareAPISession.vim',
+                  fake_vim_prop)
+    test.stub_out('nova.virt.vmwareapi.driver.VMwareAPISession._is_vim_object',
+                  fake_is_vim_object)
+    if CONF.use_neutron:
+        test.stub_out(
+            'nova.network.neutronv2.api.API.update_instance_vnic_index',
+            lambda *args, **kwargs: None)

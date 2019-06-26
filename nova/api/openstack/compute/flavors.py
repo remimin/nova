@@ -16,41 +16,65 @@
 from oslo_utils import strutils
 import webob
 
+from nova.api.openstack import api_version_request
 from nova.api.openstack import common
+from nova.api.openstack.compute.schemas import flavors as schema
 from nova.api.openstack.compute.views import flavors as flavors_view
 from nova.api.openstack import wsgi
+from nova.api import validation
 from nova.compute import flavors
 from nova import exception
 from nova.i18n import _
+from nova import objects
+from nova.policies import flavor_extra_specs as fes_policies
 from nova import utils
 
 
-class Controller(wsgi.Controller):
+class FlavorsController(wsgi.Controller):
     """Flavor controller for the OpenStack API."""
 
     _view_builder_class = flavors_view.ViewBuilder
 
+    @validation.query_schema(schema.index_query)
+    @wsgi.expected_errors(400)
     def index(self, req):
         """Return all flavors in brief."""
         limited_flavors = self._get_flavors(req)
         return self._view_builder.index(req, limited_flavors)
 
+    @validation.query_schema(schema.index_query)
+    @wsgi.expected_errors(400)
     def detail(self, req):
         """Return all flavors in detail."""
+        context = req.environ['nova.context']
         limited_flavors = self._get_flavors(req)
-        req.cache_db_flavors(limited_flavors)
-        return self._view_builder.detail(req, limited_flavors)
+        include_extra_specs = False
+        if api_version_request.is_supported(
+                req, flavors_view.FLAVOR_EXTRA_SPECS_MICROVERSION):
+            include_extra_specs = context.can(
+                fes_policies.POLICY_ROOT % 'index', fatal=False)
+        return self._view_builder.detail(
+            req, limited_flavors, include_extra_specs=include_extra_specs)
 
+    @wsgi.expected_errors(404)
     def show(self, req, id):
         """Return data about the given flavor id."""
+        context = req.environ['nova.context']
         try:
-            context = req.environ['nova.context']
             flavor = flavors.get_flavor_by_flavor_id(id, ctxt=context)
-            req.cache_db_flavor(flavor)
-        except exception.NotFound:
-            raise webob.exc.HTTPNotFound()
+        except exception.FlavorNotFound as e:
+            raise webob.exc.HTTPNotFound(explanation=e.format_message())
 
-        return self._view_builder.show(req, flavor)
+        include_extra_specs = False
+        if api_version_request.is_supported(
+                req, flavors_view.FLAVOR_EXTRA_SPECS_MICROVERSION):
+            include_extra_specs = context.can(
+                fes_policies.POLICY_ROOT % 'index', fatal=False)
+        include_description = api_version_request.is_supported(
+            req, flavors_view.FLAVOR_DESCRIPTION_MICROVERSION)
+        return self._view_builder.show(
+            req, flavor, include_description=include_description,
+            include_extra_specs=include_extra_specs)
 
     def _parse_is_public(self, is_public):
         """Parse is_public into something usable."""
@@ -94,11 +118,12 @@ class Controller(wsgi.Controller):
             try:
                 filters['min_root_gb'] = int(req.params['minDisk'])
             except ValueError:
-                msg = _('Invalid minDisk filter [%s]') % req.params['minDisk']
+                msg = (_('Invalid minDisk filter [%s]') %
+                       req.params['minDisk'])
                 raise webob.exc.HTTPBadRequest(explanation=msg)
 
         try:
-            limited_flavors = flavors.get_all_flavors_sorted_list(context,
+            limited_flavors = objects.FlavorList.get_all(context,
                 filters=filters, sort_key=sort_key, sort_dir=sort_dir,
                 limit=limit, marker=marker)
         except exception.MarkerNotFound:
@@ -106,7 +131,3 @@ class Controller(wsgi.Controller):
             raise webob.exc.HTTPBadRequest(explanation=msg)
 
         return limited_flavors
-
-
-def create_resource():
-    return wsgi.Resource(Controller())

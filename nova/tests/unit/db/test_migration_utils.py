@@ -13,11 +13,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import uuid
-
+from oslo_db.sqlalchemy.compat import utils as compat_utils
+from oslo_db.sqlalchemy import enginefacade
 from oslo_db.sqlalchemy import test_base
+from oslo_db.sqlalchemy import test_fixtures
 from oslo_db.sqlalchemy import utils as oslodbutils
-import sqlalchemy
+from oslo_utils import uuidutils
 from sqlalchemy import Integer, String
 from sqlalchemy import MetaData, Table, Column
 from sqlalchemy.exc import NoSuchTableError
@@ -27,9 +28,10 @@ from sqlalchemy.types import UserDefinedType
 from nova.db.sqlalchemy import api as db
 from nova.db.sqlalchemy import utils
 from nova import exception
+from nova import test
+from nova.tests import fixtures as nova_fixtures
 
-
-SA_VERSION = tuple(map(int, sqlalchemy.__version__.split('.')))
+SA_VERSION = compat_utils.SQLA_VERSION
 
 
 class CustomType(UserDefinedType):
@@ -37,19 +39,33 @@ class CustomType(UserDefinedType):
     def get_col_spec(self):
         return "CustomType"
 
+# TODO(sdague): no tests in the nova/tests tree should inherit from
+# base test classes in another library. This causes all kinds of havoc
+# in these doing things incorrectly for what we need in subunit
+# reporting. This is a long unwind, but should be done in the future
+# and any code needed out of oslo_db should be exported / accessed as
+# a fixture.
 
-class TestMigrationUtilsSQLite(test_base.DbTestCase):
+
+class TestMigrationUtilsSQLite(
+        test_fixtures.OpportunisticDBTestMixin, test.NoDBTestCase):
     """Class for testing utils that are used in db migrations."""
 
     def setUp(self):
+        # NOTE(sdague): the oslo_db base test case completely
+        # invalidates our logging setup, we actually have to do that
+        # before it is called to keep this from vomitting all over our
+        # test output.
+        self.useFixture(nova_fixtures.StandardLogging())
         super(TestMigrationUtilsSQLite, self).setUp()
+        self.engine = enginefacade.writer.get_engine()
         self.meta = MetaData(bind=self.engine)
 
     def test_delete_from_select(self):
         table_name = "__test_deletefromselect_table__"
         uuidstrs = []
         for unused in range(10):
-            uuidstrs.append(uuid.uuid4().hex)
+            uuidstrs.append(uuidutils.generate_uuid(dashed=False))
 
         conn = self.engine.connect()
         test_table = Table(table_name, self.meta,
@@ -66,8 +82,8 @@ class TestMigrationUtilsSQLite(test_base.DbTestCase):
         column = test_table.c.id
         query_delete = sql.select([column],
                                   test_table.c.id < 5).order_by(column)
-        delete_statement = utils.DeleteFromSelect(test_table,
-                                                  query_delete, column)
+        delete_statement = db.DeleteFromSelect(test_table,
+                                               query_delete, column)
         result_delete = conn.execute(delete_statement)
         # Verify we delete 4 rows
         self.assertEqual(result_delete.rowcount, 4)
@@ -210,11 +226,9 @@ class TestMigrationUtilsSQLite(test_base.DbTestCase):
                           self.engine, table_name=table_name)
 
 
-class TestMigrationUtilsPostgreSQL(TestMigrationUtilsSQLite,
-                                   test_base.PostgreSQLOpportunisticTestCase):
-    pass
+class TestMigrationUtilsPostgreSQL(TestMigrationUtilsSQLite):
+    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
 
 
-class TestMigrationUtilsMySQL(TestMigrationUtilsSQLite,
-                              test_base.MySQLOpportunisticTestCase):
-    pass
+class TestMigrationUtilsMySQL(TestMigrationUtilsSQLite):
+    FIXTURE = test_fixtures.MySQLOpportunisticFixture

@@ -18,35 +18,31 @@
 
 import sys
 
-from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_reports import guru_meditation_report as gmr
+from oslo_reports import opts as gmr_opts
 
 from nova.conductor import rpcapi as conductor_rpcapi
+import nova.conf
 from nova import config
 from nova import objects
 from nova.objects import base as objects_base
-from nova.openstack.common.report import guru_meditation_report as gmr
 from nova import service
-from nova import utils
 from nova import version
 
 
-CONF = cfg.CONF
-CONF.import_opt('enabled_ssl_apis', 'nova.service')
-CONF.import_opt('use_local', 'nova.conductor.api', group='conductor')
+CONF = nova.conf.CONF
 
 
 def main():
     config.parse_args(sys.argv)
     logging.setup(CONF, "nova")
-    utils.monkey_patch()
     objects.register_all()
+    gmr_opts.set_defaults(CONF)
 
-    gmr.TextGuruMeditation.setup_autorun(version)
+    gmr.TextGuruMeditation.setup_autorun(version, conf=CONF)
 
-    if not CONF.conductor.use_local:
-        objects_base.NovaObject.indirection_api = \
-            conductor_rpcapi.ConductorAPI()
+    objects_base.NovaObject.indirection_api = conductor_rpcapi.ConductorAPI()
 
     should_use_ssl = 'metadata' in CONF.enabled_ssl_apis
     server = service.WSGIService('metadata', use_ssl=should_use_ssl)

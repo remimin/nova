@@ -12,15 +12,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from nova import db
+from nova.db import api as db
 from nova import objects
 from nova.objects import base
 from nova.objects import fields
 
 
-# TODO(berrange): Remove NovaObjectDictCompat
-class DNSDomain(base.NovaPersistentObject, base.NovaObject,
-                base.NovaObjectDictCompat):
+@base.NovaObjectRegistry.register
+class DNSDomain(base.NovaPersistentObject, base.NovaObject):
     # Version 1.0: Initial version
     VERSION = '1.0'
 
@@ -34,7 +33,7 @@ class DNSDomain(base.NovaPersistentObject, base.NovaObject,
     @staticmethod
     def _from_db_object(context, vif, db_vif):
         for field in vif.fields:
-            vif[field] = db_vif[field]
+            setattr(vif, field, db_vif[field])
         vif._context = context
         vif.obj_reset_changes()
         return vif
@@ -58,14 +57,12 @@ class DNSDomain(base.NovaPersistentObject, base.NovaObject,
         db.dnsdomain_unregister(context, domain)
 
 
+@base.NovaObjectRegistry.register
 class DNSDomainList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
     VERSION = '1.0'
     fields = {
         'objects': fields.ListOfObjectsField('DNSDomain'),
-    }
-    child_versions = {
-        '1.0': '1.0',
     }
 
     @base.remotable_classmethod

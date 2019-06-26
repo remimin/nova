@@ -14,14 +14,14 @@
 
 import datetime
 
-from nova import db
-
 
 FAKE_UUID = 'b48316c5-71e8-45e4-9884-6c78055b9b13'
 FAKE_REQUEST_ID1 = 'req-3293a3f1-b44c-4609-b8d2-d81b105636b8'
 FAKE_REQUEST_ID2 = 'req-25517360-b757-47d3-be45-0e8d2a01b36a'
 FAKE_ACTION_ID1 = 123
 FAKE_ACTION_ID2 = 456
+FAKE_HOST_ID1 = '74824069503a752aaa3abf194f73200fcdd117ef70ab28b576e5bf7a'
+FAKE_HOST_ID2 = '858f5ed465b4967dd1306a38078e9b83b8705bdedfa7f16f898119b4'
 
 FAKE_ACTIONS = {
     FAKE_UUID: {
@@ -72,6 +72,8 @@ FAKE_EVENTS = {
                        'updated_at': None,
                        'deleted_at': None,
                        'deleted': False,
+                       'host': 'host1',
+                       'hostId': FAKE_HOST_ID1
                       },
                       {'id': 2,
                        'action_id': FAKE_ACTION_ID1,
@@ -86,6 +88,8 @@ FAKE_EVENTS = {
                        'updated_at': None,
                        'deleted_at': None,
                        'deleted': False,
+                       'host': 'host1',
+                       'hostId': FAKE_HOST_ID1
                        }
     ],
     FAKE_ACTION_ID2: [{'id': 3,
@@ -101,6 +105,8 @@ FAKE_EVENTS = {
                        'updated_at': None,
                        'deleted_at': None,
                        'deleted': False,
+                       'host': 'host2',
+                       'hostId': FAKE_HOST_ID2
                        }
    ]
 }
@@ -114,6 +120,6 @@ def fake_action_event_finish(*args):
     return FAKE_EVENTS[FAKE_ACTION_ID1][0]
 
 
-def stub_out_action_events(stubs):
-    stubs.Set(db, 'action_event_start', fake_action_event_start)
-    stubs.Set(db, 'action_event_finish', fake_action_event_finish)
+def stub_out_action_events(test):
+    test.stub_out('nova.db.api.action_event_start', fake_action_event_start)
+    test.stub_out('nova.db.api.action_event_finish', fake_action_event_finish)

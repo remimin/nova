@@ -13,40 +13,58 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo_config import cfg
 from oslo_log import log as logging
 
-from nova.i18n import _LW
 from nova.scheduler import filters
 from nova.scheduler.filters import utils
 
 LOG = logging.getLogger(__name__)
 
-disk_allocation_ratio_opt = cfg.FloatOpt("disk_allocation_ratio", default=1.0,
-                         help="Virtual disk to physical disk allocation ratio")
-
-CONF = cfg.CONF
-CONF.register_opt(disk_allocation_ratio_opt)
-
 
 class DiskFilter(filters.BaseHostFilter):
-    """Disk Filter with over subscription flag."""
+    """DEPRECATED: Disk Filter with over subscription flag."""
 
-    def _get_disk_allocation_ratio(self, host_state, filter_properties):
-        return CONF.disk_allocation_ratio
+    RUN_ON_REBUILD = False
+    DEPRECATED = True
 
-    def host_passes(self, host_state, filter_properties):
+    def __init__(self):
+        super(DiskFilter, self).__init__()
+        if self.DEPRECATED:
+            LOG.warning('The DiskFilter is deprecated since the 19.0.0 Stein '
+                        'release. DISK_GB filtering is performed natively '
+                        'using the Placement service when using the '
+                        'filter_scheduler driver. Furthermore, enabling '
+                        'DiskFilter may incorrectly filter out baremetal '
+                        'nodes which must be scheduled using custom resource '
+                        'classes.')
+
+    def _get_disk_allocation_ratio(self, host_state, spec_obj):
+        return host_state.disk_allocation_ratio
+
+    def host_passes(self, host_state, spec_obj):
         """Filter based on disk usage."""
-        instance_type = filter_properties.get('instance_type')
-        requested_disk = (1024 * (instance_type['root_gb'] +
-                                 instance_type['ephemeral_gb']) +
-                         instance_type['swap'])
+        requested_disk = (1024 * (spec_obj.root_gb +
+                                  spec_obj.ephemeral_gb) +
+                          spec_obj.swap)
 
         free_disk_mb = host_state.free_disk_mb
         total_usable_disk_mb = host_state.total_usable_disk_gb * 1024
 
+        # Do not allow an instance to overcommit against itself, only against
+        # other instances.  In other words, if there isn't room for even just
+        # this one instance in total_usable_disk space, consider the host full.
+        if total_usable_disk_mb < requested_disk:
+            LOG.debug("%(host_state)s does not have %(requested_disk)s "
+                      "MB usable disk space before overcommit, it only "
+                      "has %(physical_disk_size)s MB.",
+                      {'host_state': host_state,
+                       'requested_disk': requested_disk,
+                       'physical_disk_size':
+                           total_usable_disk_mb})
+            return False
+
         disk_allocation_ratio = self._get_disk_allocation_ratio(
-            host_state, filter_properties)
+            host_state, spec_obj)
 
         disk_mb_limit = total_usable_disk_mb * disk_allocation_ratio
         used_disk_mb = total_usable_disk_mb - free_disk_mb
@@ -54,10 +72,10 @@ class DiskFilter(filters.BaseHostFilter):
 
         if not usable_disk_mb >= requested_disk:
             LOG.debug("%(host_state)s does not have %(requested_disk)s MB "
-                    "usable disk, it only has %(usable_disk_mb)s MB usable "
-                    "disk.", {'host_state': host_state,
-                               'requested_disk': requested_disk,
-                               'usable_disk_mb': usable_disk_mb})
+                      "usable disk, it only has %(usable_disk_mb)s MB usable "
+                      "disk.", {'host_state': host_state,
+                                'requested_disk': requested_disk,
+                                'usable_disk_mb': usable_disk_mb})
             return False
 
         disk_gb_limit = disk_mb_limit / 1024
@@ -72,15 +90,19 @@ class AggregateDiskFilter(DiskFilter):
     found.
     """
 
-    def _get_disk_allocation_ratio(self, host_state, filter_properties):
+    RUN_ON_REBUILD = False
+    DEPRECATED = False
+
+    def _get_disk_allocation_ratio(self, host_state, spec_obj):
         aggregate_vals = utils.aggregate_values_from_key(
             host_state,
             'disk_allocation_ratio')
         try:
             ratio = utils.validate_num_values(
-                aggregate_vals, CONF.disk_allocation_ratio, cast_to=float)
+                aggregate_vals, host_state.disk_allocation_ratio,
+                cast_to=float)
         except ValueError as e:
-            LOG.warning(_LW("Could not decode disk_allocation_ratio: '%s'"), e)
-            ratio = CONF.disk_allocation_ratio
+            LOG.warning("Could not decode disk_allocation_ratio: '%s'", e)
+            ratio = host_state.disk_allocation_ratio
 
         return ratio

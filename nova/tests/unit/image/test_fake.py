@@ -13,7 +13,8 @@
 #    under the License.
 
 import datetime
-import StringIO
+
+from six.moves import StringIO
 
 from nova import context
 from nova import exception
@@ -39,7 +40,8 @@ class FakeImageServiceTestCase(test.NoDBTestCase):
                                         'updated_at', 'deleted_at', 'deleted',
                                         'status', 'is_public', 'properties',
                                         'disk_format', 'container_format',
-                                        'size']))
+                                        'size', 'min_disk', 'min_ram',
+                                        'protected', 'tags', 'visibility']))
             self.assertIsInstance(image['created_at'], datetime.datetime)
             self.assertIsInstance(image['updated_at'], datetime.datetime)
 
@@ -108,10 +110,10 @@ class FakeImageServiceTestCase(test.NoDBTestCase):
 
     def test_create_then_get(self):
         blob = 'some data'
-        s1 = StringIO.StringIO(blob)
+        s1 = StringIO(blob)
         self.image_service.create(self.context,
                                   {'id': '32', 'foo': 'bar'},
                                   data=s1)
-        s2 = StringIO.StringIO()
+        s2 = StringIO()
         self.image_service.download(self.context, '32', data=s2)
         self.assertEqual(s2.getvalue(), blob, 'Did not get blob back intact')

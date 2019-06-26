@@ -17,31 +17,31 @@
 Management class for host operations.
 """
 import datetime
-import os
 import platform
 import time
 
-from oslo_config import cfg
+from os_win import constants as os_win_const
+from os_win import utilsfactory
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import units
 
-from nova.compute import arch
-from nova.compute import hv_type
-from nova.compute import vm_mode
+import nova.conf
 from nova.i18n import _
+from nova import objects
+from nova.objects import fields as obj_fields
 from nova.virt.hyperv import constants
-from nova.virt.hyperv import utilsfactory
+from nova.virt.hyperv import pathutils
 
-CONF = cfg.CONF
-CONF.import_opt('my_ip', 'nova.netconf')
+CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
 
 
 class HostOps(object):
     def __init__(self):
+        self._diskutils = utilsfactory.get_diskutils()
         self._hostutils = utilsfactory.get_hostutils()
-        self._pathutils = utilsfactory.get_pathutils()
+        self._pathutils = pathutils.PathUtils()
 
     def _get_cpu_info(self):
         """Get the CPU information.
@@ -61,12 +61,12 @@ class HostOps(object):
         topology = dict()
         topology['sockets'] = len(processors)
         topology['cores'] = processors[0]['NumberOfCores']
-        topology['threads'] = (processors[0]['NumberOfLogicalProcessors'] /
+        topology['threads'] = (processors[0]['NumberOfLogicalProcessors'] //
                                processors[0]['NumberOfCores'])
         cpu_info['topology'] = topology
 
         features = list()
-        for fkey, fname in constants.PROCESSOR_FEATURE.items():
+        for fkey, fname in os_win_const.PROCESSOR_FEATURE.items():
             if self._hostutils.is_cpu_feature_present(fkey):
                 features.append(fname)
         cpu_info['features'] = features
@@ -75,16 +75,17 @@ class HostOps(object):
 
     def _get_memory_info(self):
         (total_mem_kb, free_mem_kb) = self._hostutils.get_memory_info()
-        total_mem_mb = total_mem_kb / 1024
-        free_mem_mb = free_mem_kb / 1024
+        total_mem_mb = total_mem_kb // 1024
+        free_mem_mb = free_mem_kb // 1024
         return (total_mem_mb, free_mem_mb, total_mem_mb - free_mem_mb)
 
-    def _get_local_hdd_info_gb(self):
-        drive = os.path.splitdrive(self._pathutils.get_instances_dir())[0]
-        (size, free_space) = self._hostutils.get_volume_info(drive)
+    def _get_storage_info_gb(self):
+        instances_dir = self._pathutils.get_instances_dir()
+        (size, free_space) = self._diskutils.get_disk_capacity(
+            instances_dir)
 
-        total_gb = size / units.Gi
-        free_gb = free_space / units.Gi
+        total_gb = size // units.Gi
+        free_gb = free_space // units.Gi
         used_gb = total_gb - free_gb
         return (total_gb, free_gb, used_gb)
 
@@ -104,6 +105,34 @@ class HostOps(object):
         LOG.debug('Windows version: %s ', version)
         return version
 
+    def _get_remotefx_gpu_info(self):
+        total_video_ram = 0
+        available_video_ram = 0
+
+        if CONF.hyperv.enable_remotefx:
+            gpus = self._hostutils.get_remotefx_gpu_info()
+            for gpu in gpus:
+                total_video_ram += int(gpu['total_video_ram'])
+                available_video_ram += int(gpu['available_video_ram'])
+        else:
+            gpus = []
+
+        return {'total_video_ram': total_video_ram,
+                'used_video_ram': total_video_ram - available_video_ram,
+                'gpu_info': jsonutils.dumps(gpus)}
+
+    def _get_host_numa_topology(self):
+        numa_nodes = self._hostutils.get_numa_nodes()
+        cells = []
+        for numa_node in numa_nodes:
+            # Hyper-V does not support CPU pinning / mempages.
+            # initializing the rest of the fields.
+            numa_node.update(pinned_cpus=set(), mempages=[], siblings=[])
+            cell = objects.NUMACell(**numa_node)
+            cells.append(cell)
+
+        return objects.NUMATopology(cells=cells)
+
     def get_available_resource(self):
         """Retrieve resource info.
 
@@ -121,7 +150,7 @@ class HostOps(object):
 
         (total_hdd_gb,
          free_hdd_gb,
-         used_hdd_gb) = self._get_local_hdd_info_gb()
+         used_hdd_gb) = self._get_storage_info_gb()
 
         cpu_info = self._get_cpu_info()
         cpu_topology = cpu_info['topology']
@@ -129,23 +158,61 @@ class HostOps(object):
                  cpu_topology['cores'] *
                  cpu_topology['threads'])
 
+        # NOTE(claudiub): free_hdd_gb only refers to the currently free
+        # physical storage, it doesn't take into consideration the virtual
+        # sizes of the VMs' dynamic disks. This means that the VMs' disks can
+        # expand beyond the free_hdd_gb's value, and instances will still be
+        # scheduled to this compute node.
         dic = {'vcpus': vcpus,
                'memory_mb': total_mem_mb,
                'memory_mb_used': used_mem_mb,
                'local_gb': total_hdd_gb,
                'local_gb_used': used_hdd_gb,
+               'disk_available_least': free_hdd_gb,
                'hypervisor_type': "hyperv",
                'hypervisor_version': self._get_hypervisor_version(),
                'hypervisor_hostname': platform.node(),
                'vcpus_used': 0,
                'cpu_info': jsonutils.dumps(cpu_info),
-               'supported_instances': jsonutils.dumps(
-                   [(arch.I686, hv_type.HYPERV, vm_mode.HVM),
-                    (arch.X86_64, hv_type.HYPERV, vm_mode.HVM)]),
-               'numa_topology': None,
+               'supported_instances': [
+                   (obj_fields.Architecture.I686,
+                    obj_fields.HVType.HYPERV,
+                    obj_fields.VMMode.HVM),
+                   (obj_fields.Architecture.X86_64,
+                    obj_fields.HVType.HYPERV,
+                    obj_fields.VMMode.HVM)],
+               'numa_topology': self._get_host_numa_topology()._to_json(),
+               'pci_passthrough_devices': self._get_pci_passthrough_devices(),
                }
 
+        gpu_info = self._get_remotefx_gpu_info()
+        dic.update(gpu_info)
         return dic
+
+    def _get_pci_passthrough_devices(self):
+        """Get host PCI devices information.
+
+        Obtains PCI devices information and returns it as a JSON string.
+
+        :returns: a JSON string containing a list of the assignable PCI
+                  devices information.
+        """
+
+        pci_devices = self._hostutils.get_pci_passthrough_devices()
+
+        for pci_dev in pci_devices:
+            # NOTE(claudiub): These fields are required by the PCI tracker.
+            dev_label = 'label_%(vendor_id)s_%(product_id)s' % {
+                'vendor_id': pci_dev['vendor_id'],
+                'product_id': pci_dev['product_id']}
+
+            # TODO(claudiub): Find a way to associate the PCI devices with
+            # the NUMA nodes they are in.
+            pci_dev.update(dev_type=obj_fields.PciDeviceType.STANDARD,
+                           label=dev_label,
+                           numa_node=None)
+
+        return jsonutils.dumps(pci_devices)
 
     def host_power_action(self, action):
         """Reboots, shuts down or powers up the host."""
@@ -172,7 +239,7 @@ class HostOps(object):
 
         # format the string to match libvirt driver uptime
         # Libvirt uptime returns a combination of the following
-        # - curent host time
+        # - current host time
         # - time since host is up
         # - number of logged in users
         # - cpu load
@@ -183,4 +250,4 @@ class HostOps(object):
         # value is same as in libvirt
         return "%s up %s,  0 users,  load average: 0, 0, 0" % (
                    str(time.strftime("%H:%M:%S")),
-                   str(datetime.timedelta(milliseconds=long(tick_count64))))
+                   str(datetime.timedelta(milliseconds=int(tick_count64))))

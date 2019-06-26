@@ -18,38 +18,19 @@
 import os
 import shutil
 
-from oslo_config import cfg
-from oslo_log import log as logging
-from oslo_utils import strutils
+from oslo_concurrency import processutils
+from oslo_utils import fileutils
 from oslo_utils import units
+import six
 
+import nova.conf
 from nova import exception
-from nova.i18n import _LW
-from nova.openstack.common import fileutils
+from nova.objects import fields
+import nova.privsep.fs
 from nova import utils
 from nova import version
 
-LOG = logging.getLogger(__name__)
-
-configdrive_opts = [
-    cfg.StrOpt('config_drive_format',
-               default='iso9660',
-               help='Config drive format. One of iso9660 (default) or vfat'),
-    # force_config_drive is a string option, to allow for future behaviors
-    #  (e.g. use config_drive based on image properties)
-    cfg.StrOpt('force_config_drive',
-               choices=('always', 'True', 'False'),
-               help='Set to "always" to force injection to take place on a '
-                    'config drive. NOTE: The "always" will be deprecated in '
-                    'the Liberty release cycle.'),
-    cfg.StrOpt('mkisofs_cmd',
-               default='genisoimage',
-               help='Name and optionally path of the tool used for '
-                    'ISO image creation')
-    ]
-
-CONF = cfg.CONF
-CONF.register_opts(configdrive_opts)
+CONF = nova.conf.CONF
 
 # Config drives are 64mb, if we can't size to the exact size of the data
 CONFIGDRIVESIZE_BYTES = 64 * units.Mi
@@ -59,9 +40,6 @@ class ConfigDriveBuilder(object):
     """Build config drives, optionally as a context manager."""
 
     def __init__(self, instance_md=None):
-        if CONF.force_config_drive == 'always':
-            LOG.warning(_LW('The setting "always" will be deprecated in the '
-                            'Liberty version. Please use "True" instead'))
         self.imagefile = None
         self.mdfiles = []
 
@@ -84,6 +62,10 @@ class ConfigDriveBuilder(object):
         dirname = os.path.dirname(filepath)
         fileutils.ensure_tree(dirname)
         with open(filepath, 'wb') as f:
+            # the given data can be either text or bytes. we can only write
+            # bytes into files.
+            if isinstance(data, six.text_type):
+                data = data.encode('utf-8')
             f.write(data)
 
     def add_instance_metadata(self, instance_md):
@@ -100,21 +82,21 @@ class ConfigDriveBuilder(object):
             'version': version.version_string_with_package()
             }
 
-        utils.execute(CONF.mkisofs_cmd,
-                      '-o', path,
-                      '-ldots',
-                      '-allow-lowercase',
-                      '-allow-multidot',
-                      '-l',
-                      '-publisher',
-                      publisher,
-                      '-quiet',
-                      '-J',
-                      '-r',
-                      '-V', 'config-2',
-                      tmpdir,
-                      attempts=1,
-                      run_as_root=False)
+        processutils.execute(CONF.mkisofs_cmd,
+                             '-o', path,
+                             '-ldots',
+                             '-allow-lowercase',
+                             '-allow-multidot',
+                             '-l',
+                             '-publisher',
+                             publisher,
+                             '-quiet',
+                             '-J',
+                             '-r',
+                             '-V', 'config-2',
+                             tmpdir,
+                             attempts=1,
+                             run_as_root=False)
 
     def _make_vfat(self, path, tmpdir):
         # NOTE(mikal): This is a little horrible, but I couldn't find an
@@ -122,17 +104,14 @@ class ConfigDriveBuilder(object):
         with open(path, 'wb') as f:
             f.truncate(CONFIGDRIVESIZE_BYTES)
 
-        utils.mkfs('vfat', path, label='config-2')
+        nova.privsep.fs.unprivileged_mkfs('vfat', path, label='config-2')
 
         with utils.tempdir() as mountdir:
             mounted = False
             try:
-                _, err = utils.trycmd(
-                    'mount', '-o', 'loop,uid=%d,gid=%d' % (os.getuid(),
-                                                           os.getgid()),
-                    path,
-                    mountdir,
-                    run_as_root=True)
+                _, err = nova.privsep.fs.mount(
+                    None, path, mountdir,
+                    ['-o', 'loop,uid=%d,gid=%d' % (os.getuid(), os.getgid())])
                 if err:
                     raise exception.ConfigDriveMountFailed(operation='mount',
                                                            error=err)
@@ -147,7 +126,7 @@ class ConfigDriveBuilder(object):
 
             finally:
                 if mounted:
-                    utils.execute('umount', mountdir, run_as_root=True)
+                    nova.privsep.fs.umount(mountdir)
 
     def make_drive(self, path):
         """Make the config drive.
@@ -177,18 +156,18 @@ class ConfigDriveBuilder(object):
 
 def required_by(instance):
 
-    image_prop = utils.instance_sys_meta(instance).get(
-        utils.SM_IMAGE_PROP_PREFIX + 'img_config_drive', 'optional')
-    if image_prop not in ['optional', 'mandatory']:
-        LOG.warning(_LW('Image config drive option %(image_prop)s is invalid '
-                        'and will be ignored'),
-                    {'image_prop': image_prop},
-                    instance=instance)
+    image_prop = instance.image_meta.properties.get(
+        "img_config_drive",
+        fields.ConfigDrivePolicy.OPTIONAL)
 
-    return (instance.get('config_drive') or
-            'always' == CONF.force_config_drive or
-            strutils.bool_from_string(CONF.force_config_drive) or
-            image_prop == 'mandatory'
+    # NOTE(pandatt): Option CONF.force_config_drive only applies to newly
+    # being-built VMs. And already launched VMs shouldn't be forced a config
+    # drive, because they may have been cloud-inited via metadata service, and
+    # do not need and have any config drive device. The `launched_at` property
+    # is an apparent flag to tell VMs being built from launched ones.
+    return (instance.config_drive or
+            (CONF.force_config_drive and not instance.launched_at) or
+            image_prop == fields.ConfigDrivePolicy.MANDATORY
             )
 
 

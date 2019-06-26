@@ -13,12 +13,15 @@
 #    under the License.
 
 import base64
+from collections import deque
 import sys
 import traceback
 
 import fixtures
 import mock
 import netaddr
+import os_resource_classes as orc
+import os_vif
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import importutils
@@ -26,14 +29,16 @@ from oslo_utils import timeutils
 import six
 
 from nova.compute import manager
+from nova import conf
 from nova.console import type as ctype
+from nova import context
 from nova import exception
 from nova import objects
 from nova import test
+from nova.tests import fixtures as nova_fixtures
 from nova.tests.unit import fake_block_device
 from nova.tests.unit.image import fake as fake_image
 from nova.tests.unit import utils as test_utils
-from nova.tests.unit.virt.libvirt import fake_libvirt_utils
 from nova.virt import block_device as driver_block_device
 from nova.virt import event as virtevent
 from nova.virt import fake
@@ -42,6 +47,7 @@ from nova.virt import libvirt
 from nova.virt.libvirt import imagebackend
 
 LOG = logging.getLogger(__name__)
+CONF = conf.CONF
 
 
 def catch_notimplementederror(f):
@@ -56,7 +62,7 @@ def catch_notimplementederror(f):
         except NotImplementedError:
             frame = traceback.extract_tb(sys.exc_info()[2])[-1]
             LOG.error("%(driver)s does not implement %(method)s "
-                      "required for test %(test)s" %
+                      "required for test %(test)s",
                       {'driver': type(self.connection),
                        'method': frame[2], 'test': f.__name__})
 
@@ -78,80 +84,57 @@ class _FakeDriverBackendTestCase(object):
         else:
             self.saved_libvirt = None
 
-        import nova.tests.unit.virt.libvirt.fake_imagebackend as \
-            fake_imagebackend
-        import nova.tests.unit.virt.libvirt.fake_libvirt_utils as \
-            fake_libvirt_utils
-        import nova.tests.unit.virt.libvirt.fakelibvirt as fakelibvirt
+        from nova.tests.unit.virt.libvirt import fake_imagebackend
+        from nova.tests.unit.virt.libvirt import fakelibvirt
 
-        sys.modules['libvirt'] = fakelibvirt
-        import nova.virt.libvirt.driver
-        import nova.virt.libvirt.firewall
-        import nova.virt.libvirt.host
+        from nova.tests.unit.virt.libvirt import fake_os_brick_connector
+
+        self.useFixture(fake_imagebackend.ImageBackendFixture())
+        self.useFixture(fakelibvirt.FakeLibvirtFixture())
 
         self.useFixture(fixtures.MonkeyPatch(
-            'nova.virt.libvirt.driver.imagebackend',
-            fake_imagebackend))
-        self.useFixture(fixtures.MonkeyPatch(
-            'nova.virt.libvirt.driver.libvirt',
-            fakelibvirt))
-        self.useFixture(fixtures.MonkeyPatch(
-            'nova.virt.libvirt.driver.libvirt_utils',
-            fake_libvirt_utils))
-        self.useFixture(fixtures.MonkeyPatch(
-            'nova.virt.libvirt.host.libvirt',
-            fakelibvirt))
-        self.useFixture(fixtures.MonkeyPatch(
-            'nova.virt.libvirt.imagebackend.libvirt_utils',
-            fake_libvirt_utils))
-        self.useFixture(fixtures.MonkeyPatch(
-            'nova.virt.libvirt.firewall.libvirt',
-            fakelibvirt))
+            'nova.virt.libvirt.driver.connector',
+            fake_os_brick_connector))
 
-        fakelibvirt.disable_event_thread(self)
+        self.useFixture(fixtures.MonkeyPatch(
+            'nova.virt.libvirt.host.Host._conn_event_thread',
+            lambda *args: None))
 
         self.flags(rescue_image_id="2",
                    rescue_kernel_id="3",
                    rescue_ramdisk_id=None,
                    snapshots_directory='./',
+                   sysinfo_serial='none',
                    group='libvirt')
 
-        def fake_extend(image, size):
+        def fake_wait():
             pass
 
-        def fake_migrateToURI(*a):
-            pass
+        def fake_detach_device_with_retry(_self, get_device_conf_func, device,
+                                          live, *args, **kwargs):
+            # Still calling detach, but instead of returning function
+            # that actually checks if device is gone from XML, just continue
+            # because XML never gets updated in these tests
+            _self.detach_device(get_device_conf_func(device),
+                                live=live)
+            return fake_wait
 
-        def fake_make_drive(_self, _path):
-            pass
-
-        def fake_get_instance_disk_info(_self, instance, xml=None,
-                                        block_device_info=None):
-            return '[]'
-
-        def fake_delete_instance_files(_self, _instance):
-            pass
-
-        self.stubs.Set(nova.virt.libvirt.driver.LibvirtDriver,
-                       '_get_instance_disk_info',
-                       fake_get_instance_disk_info)
-
-        self.stubs.Set(nova.virt.libvirt.driver.disk,
-                       'extend', fake_extend)
-
-        self.stubs.Set(nova.virt.libvirt.driver.LibvirtDriver,
-                       'delete_instance_files',
-                       fake_delete_instance_files)
-
-        # Like the existing fakelibvirt.migrateToURI, do nothing,
-        # but don't fail for these tests.
-        self.stubs.Set(nova.virt.libvirt.driver.libvirt.Domain,
-                       'migrateToURI', fake_migrateToURI)
-
+        self.stub_out('nova.virt.libvirt.driver.LibvirtDriver.'
+                      '_get_instance_disk_info_from_config',
+                      lambda self, guest_config, block_device_info: [])
+        self.stub_out('nova.virt.disk.api.extend', lambda image, size: None)
+        self.stub_out('nova.virt.libvirt.driver.LibvirtDriver.'
+                      'delete_instance_files', lambda self, instance: None)
+        self.stub_out('nova.virt.libvirt.guest.Guest.detach_device_with_retry',
+                      fake_detach_device_with_retry)
+        self.stub_out('nova.virt.libvirt.guest.Guest.migrate',
+                      lambda self, destination, migrate_uri=None,
+                      migrate_disks=None, destination_xml=None, flags=0,
+                      bandwidth=0: None)
         # We can't actually make a config drive v2 because ensure_tree has
         # been faked out
-        self.stubs.Set(nova.virt.configdrive.ConfigDriveBuilder,
-                       'make_drive', fake_make_drive)
+        self.stub_out('nova.virt.configdrive.ConfigDriveBuilder.make_drive',
+                      lambda self, path: None)
 
     def _teardown_fakelibvirt(self):
         # Restore libvirt
@@ -163,7 +146,7 @@ class _FakeDriverBackendTestCase(object):
         # TODO(sdague): it would be nice to do this in a way that only
         # the relevant backends where replaced for tests, though this
         # should not harm anything by doing it for all backends
-        fake_image.stub_out_image_service(self.stubs)
+        fake_image.stub_out_image_service(self)
         self._setup_fakelibvirt()
 
     def tearDown(self):
@@ -179,17 +162,13 @@ class VirtDriverLoaderTestCase(_FakeDriverBackendTestCase, test.TestCase):
     """
 
     # if your driver supports being tested in a fake way, it can go here
-    #
-    # both long form and short form drivers are supported
     new_drivers = {
-        'nova.virt.fake.FakeDriver': 'FakeDriver',
-        'nova.virt.libvirt.LibvirtDriver': 'LibvirtDriver',
         'fake.FakeDriver': 'FakeDriver',
         'libvirt.LibvirtDriver': 'LibvirtDriver'
         }
 
     def test_load_new_drivers(self):
-        for cls, driver in self.new_drivers.iteritems():
+        for cls, driver in self.new_drivers.items():
             self.flags(compute_driver=cls)
             # NOTE(sdague) the try block is to make it easier to debug a
             # failure by knowing which driver broke
@@ -201,14 +180,11 @@ class VirtDriverLoaderTestCase(_FakeDriverBackendTestCase, test.TestCase):
             self.assertEqual(cm.driver.__class__.__name__, driver,
                              "Could't load driver %s" % cls)
 
-    def test_fail_to_load_new_drivers(self):
+    @mock.patch.object(sys, 'exit', side_effect=test.TestingException())
+    def test_fail_to_load_new_drivers(self, mock_exit):
         self.flags(compute_driver='nova.virt.amiga')
-
-        def _fake_exit(error):
-            raise test.TestingException()
-
-        self.stubs.Set(sys, 'exit', _fake_exit)
         self.assertRaises(test.TestingException, manager.ComputeManager)
+        mock_exit.assert_called_once_with(1)
 
 
 class _VirtDriverTestCase(_FakeDriverBackendTestCase):
@@ -224,17 +200,19 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
         # writing and chowning that complicate testing too much by requiring
         # using real directories with proper permissions.  Just stub it out
         # here; we test it in test_imagebackend.py
-        self.stubs.Set(imagebackend.Image, 'resolve_driver_format',
-                       imagebackend.Image._get_driver_format)
+        self.stub_out('nova.virt.libvirt.imagebackend.Image.'
+                      'resolve_driver_format',
+                      imagebackend.Image._get_driver_format)
+        os_vif.initialize()
 
     def _get_running_instance(self, obj=True):
         instance_ref = test_utils.get_test_instance(obj=obj)
         network_info = test_utils.get_test_network_info()
         network_info[0]['network']['subnets'][0]['meta']['dhcp_server'] = \
             '1.1.1.1'
-        image_info = test_utils.get_test_image_info(None, instance_ref)
-        self.connection.spawn(self.ctxt, instance_ref, image_info,
-                              [], 'herp', network_info=network_info)
+        image_meta = test_utils.get_test_image_object(None, instance_ref)
+        self.connection.spawn(self.ctxt, instance_ref, image_meta,
+                              [], 'herp', {}, network_info=network_info)
         return instance_ref, network_info
 
     @catch_notimplementederror
@@ -306,8 +284,8 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
     def test_inject_file(self):
         instance_ref, network_info = self._get_running_instance()
         self.connection.inject_file(instance_ref,
-                                    base64.b64encode('/testfile'),
-                                    base64.b64encode('testcontents'))
+                                    base64.b64encode(b'/testfile'),
+                                    base64.b64encode(b'testcontents'))
 
     @catch_notimplementederror
     def test_resume_state_on_host_boot(self):
@@ -317,19 +295,22 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
 
     @catch_notimplementederror
     def test_rescue(self):
-        image_meta = {}
+        image_meta = objects.ImageMeta.from_dict({})
         instance_ref, network_info = self._get_running_instance()
         self.connection.rescue(self.ctxt, instance_ref, network_info,
                                image_meta, '')
 
     @catch_notimplementederror
-    def test_unrescue_unrescued_instance(self):
+    @mock.patch('os.unlink')
+    @mock.patch('nova.virt.libvirt.utils.load_file', return_value='')
+    def test_unrescue_unrescued_instance(self, mock_load_file, mock_unlink):
         instance_ref, network_info = self._get_running_instance()
         self.connection.unrescue(instance_ref, network_info)
 
     @catch_notimplementederror
-    def test_unrescue_rescued_instance(self):
-        image_meta = {}
+    @mock.patch('os.unlink')
+    def test_unrescue_rescued_instance(self, mock_unlink):
+        image_meta = objects.ImageMeta.from_dict({})
         instance_ref, network_info = self._get_running_instance()
         self.connection.rescue(self.ctxt, instance_ref, network_info,
                                image_meta, '')
@@ -364,6 +345,11 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
         instance_ref, network_info = self._get_running_instance()
         self.connection.power_off(instance_ref)
         self.connection.power_on(self.ctxt, instance_ref, network_info, None)
+
+    @catch_notimplementederror
+    def test_trigger_crash_dump(self):
+        instance_ref, network_info = self._get_running_instance()
+        self.connection.trigger_crash_dump(instance_ref)
 
     @catch_notimplementederror
     def test_soft_delete(self):
@@ -434,6 +420,7 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
         self.assertIn('ip', result)
         self.assertIn('initiator', result)
         self.assertIn('host', result)
+        return result
 
     @catch_notimplementederror
     def test_get_volume_connector_storage_ip(self):
@@ -447,7 +434,9 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
         self.assertEqual(storage_ip, result['ip'])
 
     @catch_notimplementederror
-    def test_attach_detach_volume(self):
+    @mock.patch.object(libvirt.driver.LibvirtDriver, '_build_device_metadata',
+                       return_value=objects.InstanceDeviceMetadata())
+    def test_attach_detach_volume(self, _):
         instance_ref, network_info = self._get_running_instance()
         connection_info = {
             "driver_volume_type": "fake",
@@ -458,11 +447,14 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
             self.connection.attach_volume(None, connection_info, instance_ref,
                                           '/dev/sda'))
         self.assertIsNone(
-            self.connection.detach_volume(connection_info, instance_ref,
-                                      '/dev/sda'))
+            self.connection.detach_volume(mock.sentinel.context,
+                                          connection_info, instance_ref,
+                                          '/dev/sda'))
 
     @catch_notimplementederror
-    def test_swap_volume(self):
+    @mock.patch.object(libvirt.driver.LibvirtDriver, '_build_device_metadata',
+                       return_value=objects.InstanceDeviceMetadata())
+    def test_swap_volume(self, _):
         instance_ref, network_info = self._get_running_instance()
         self.assertIsNone(
             self.connection.attach_volume(None, {'driver_volume_type': 'fake',
@@ -470,7 +462,7 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
                                           instance_ref,
                                           '/dev/sda'))
         self.assertIsNone(
-            self.connection.swap_volume({'driver_volume_type': 'fake',
+            self.connection.swap_volume(None, {'driver_volume_type': 'fake',
                                          'data': {}},
                                         {'driver_volume_type': 'fake',
                                          'data': {}},
@@ -478,7 +470,9 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
                                         '/dev/sda', 2))
 
     @catch_notimplementederror
-    def test_attach_detach_different_power_states(self):
+    @mock.patch.object(libvirt.driver.LibvirtDriver, '_build_device_metadata',
+                       return_value=objects.InstanceDeviceMetadata())
+    def test_attach_detach_different_power_states(self, _):
         instance_ref, network_info = self._get_running_instance()
         connection_info = {
             "driver_volume_type": "fake",
@@ -494,17 +488,19 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
             'swap': None,
             'ephemerals': [],
             'block_device_mapping': driver_block_device.convert_volumes([
-                fake_block_device.FakeDbBlockDeviceDict(
-                       {'id': 1, 'instance_uuid': instance_ref['uuid'],
-                        'device_name': '/dev/sda',
-                        'source_type': 'volume',
-                        'destination_type': 'volume',
-                        'delete_on_termination': False,
-                        'snapshot_id': None,
-                        'volume_id': 'abcdedf',
-                        'volume_size': None,
-                        'no_device': None
-                        }),
+                objects.BlockDeviceMapping(
+                    self.ctxt,
+                    **fake_block_device.FakeDbBlockDeviceDict(
+                        {'id': 1, 'instance_uuid': instance_ref['uuid'],
+                         'device_name': '/dev/sda',
+                         'source_type': 'volume',
+                         'destination_type': 'volume',
+                         'delete_on_termination': False,
+                         'snapshot_id': None,
+                         'volume_id': 'abcdedf',
+                         'volume_size': None,
+                         'no_device': None
+                         })),
                 ])
         }
         bdm['block_device_mapping'][0]['connection_info'] = (
@@ -513,7 +509,8 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
                 driver_block_device.DriverVolumeBlockDevice, 'save'):
             self.connection.power_on(
                     self.ctxt, instance_ref, network_info, bdm)
-            self.connection.detach_volume(connection_info,
+            self.connection.detach_volume(mock.sentinel.context,
+                                          connection_info,
                                           instance_ref,
                                           '/dev/sda')
 
@@ -549,7 +546,6 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
 
     @catch_notimplementederror
     def test_get_console_output(self):
-        fake_libvirt_utils.files['dummy.log'] = ''
         instance_ref, network_info = self._get_running_instance()
         console_output = self.connection.get_console_output(self.ctxt,
             instance_ref)
@@ -582,6 +578,13 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
         self.assertIsInstance(serial_console, ctype.ConsoleSerial)
 
     @catch_notimplementederror
+    def test_get_mks_console(self):
+        instance_ref, network_info = self._get_running_instance()
+        mks_console = self.connection.get_mks_console(self.ctxt,
+                                                      instance_ref)
+        self.assertIsInstance(mks_console, ctype.ConsoleMKS)
+
+    @catch_notimplementederror
     def test_get_console_pool_info(self):
         instance_ref, network_info = self._get_running_instance()
         console_pool = self.connection.get_console_pool_info(instance_ref)
@@ -596,21 +599,10 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
         self.connection.refresh_security_group_rules(1)
 
     @catch_notimplementederror
-    def test_refresh_security_group_members(self):
-        # FIXME: Create security group and add the instance to it
-        instance_ref, network_info = self._get_running_instance()
-        self.connection.refresh_security_group_members(1)
-
-    @catch_notimplementederror
     def test_refresh_instance_security_rules(self):
         # FIXME: Create security group and add the instance to it
         instance_ref, network_info = self._get_running_instance()
         self.connection.refresh_instance_security_rules(instance_ref)
-
-    @catch_notimplementederror
-    def test_refresh_provider_fw_rules(self):
-        instance_ref, network_info = self._get_running_instance()
-        self.connection.refresh_provider_fw_rules()
 
     @catch_notimplementederror
     def test_ensure_filtering_for_instance(self):
@@ -625,11 +617,28 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
         network_info = test_utils.get_test_network_info()
         self.connection.unfilter_instance(instance_ref, network_info)
 
-    @catch_notimplementederror
     def test_live_migration(self):
         instance_ref, network_info = self._get_running_instance()
+        fake_context = context.RequestContext('fake', 'fake')
+        migration = objects.Migration(context=fake_context, id=1)
+        migrate_data = objects.LibvirtLiveMigrateData(
+            migration=migration, bdms=[], block_migration=False,
+            serial_listen_addr='127.0.0.1')
         self.connection.live_migration(self.ctxt, instance_ref, 'otherhost',
-                                       lambda *a: None, lambda *a: None)
+                                       lambda *a, **b: None,
+                                       lambda *a, **b: None,
+                                       migrate_data=migrate_data)
+
+    @catch_notimplementederror
+    def test_live_migration_force_complete(self):
+        instance_ref, network_info = self._get_running_instance()
+        self.connection.active_migrations[instance_ref.uuid] = deque()
+        self.connection.live_migration_force_complete(instance_ref)
+
+    @catch_notimplementederror
+    def test_live_migration_abort(self):
+        instance_ref, network_info = self._get_running_instance()
+        self.connection.live_migration_abort(instance_ref)
 
     @catch_notimplementederror
     def _check_available_resource_fields(self, host_status):
@@ -758,6 +767,18 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
 
         self.connection.emit_event(event1)
 
+    def test_emit_unicode_event(self):
+        """Tests that we do not fail on translated unicode events."""
+        started_event = virtevent.LifecycleEvent(
+            "cef19ce0-0ca2-11df-855d-b19fbce37686",
+            virtevent.EVENT_LIFECYCLE_STARTED)
+        callback = mock.Mock()
+        self.connection.register_event_listener(callback)
+        with mock.patch.object(started_event, 'get_name',
+                               return_value=u'\xF0\x9F\x92\xA9'):
+            self.connection.emit_event(started_event)
+        callback.assert_called_once_with(started_event)
+
     def test_set_bootable(self):
         self.assertRaises(NotImplementedError, self.connection.set_bootable,
                           'instance', True)
@@ -769,11 +790,70 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
         self.connection.get_instance_disk_info(instance_ref,
                                                block_device_info={})
 
+    @catch_notimplementederror
+    def test_get_device_name_for_instance(self):
+        instance, _ = self._get_running_instance()
+        self.connection.get_device_name_for_instance(
+            instance, [], mock.Mock(spec=objects.BlockDeviceMapping))
+
+    def test_network_binding_host_id(self):
+        # NOTE(jroll) self._get_running_instance calls spawn(), so we can't
+        # use it to test this method. Make a simple object instead; we just
+        # need instance.host.
+        instance = objects.Instance(self.ctxt, host='somehost')
+        self.assertEqual(instance.host,
+            self.connection.network_binding_host_id(self.ctxt, instance))
+
+    def test_get_allocation_ratio(self):
+        inv = {}
+        self.flags(cpu_allocation_ratio=16.1)
+        self.flags(ram_allocation_ratio=1.6)
+        self.flags(disk_allocation_ratio=1.1)
+        expeced_ratios = {
+            orc.VCPU: CONF.cpu_allocation_ratio,
+            orc.MEMORY_MB: CONF.ram_allocation_ratio,
+            orc.DISK_GB: CONF.disk_allocation_ratio
+        }
+        # If conf is set, return conf
+        self.assertEqual(expeced_ratios,
+                         self.connection._get_allocation_ratios(inv))
+
+        self.flags(cpu_allocation_ratio=None)
+        self.flags(ram_allocation_ratio=None)
+        self.flags(disk_allocation_ratio=None)
+        self.flags(initial_cpu_allocation_ratio=15.9)
+        self.flags(initial_ram_allocation_ratio=1.4)
+        self.flags(initial_disk_allocation_ratio=0.9)
+        expeced_ratios = {
+            orc.VCPU: CONF.initial_cpu_allocation_ratio,
+            orc.MEMORY_MB: CONF.initial_ram_allocation_ratio,
+            orc.DISK_GB: CONF.initial_disk_allocation_ratio
+        }
+        # if conf is unset and inv doesn't exists, return init conf
+        self.assertEqual(expeced_ratios,
+                         self.connection._get_allocation_ratios(inv))
+
+        inv = {orc.VCPU: {'allocation_ratio': 3.0},
+               orc.MEMORY_MB: {'allocation_ratio': 3.1},
+               orc.DISK_GB: {'allocation_ratio': 3.2}}
+        expeced_ratios = {
+            orc.VCPU: inv[orc.VCPU]['allocation_ratio'],
+            orc.MEMORY_MB: inv[orc.MEMORY_MB]['allocation_ratio'],
+            orc.DISK_GB: inv[orc.DISK_GB]['allocation_ratio']
+        }
+        # if conf is unset and inv exists, return inv
+        self.assertEqual(expeced_ratios,
+                         self.connection._get_allocation_ratios(inv))
+
 
 class AbstractDriverTestCase(_VirtDriverTestCase, test.TestCase):
     def setUp(self):
         self.driver_module = "nova.virt.driver.ComputeDriver"
         super(AbstractDriverTestCase, self).setUp()
+
+    def test_live_migration(self):
+        self.skipTest('Live migration is not implemented in the base '
+                      'virt driver.')
 
 
 class FakeConnectionTestCase(_VirtDriverTestCase, test.TestCase):
@@ -804,14 +884,29 @@ class LibvirtConnTestCase(_VirtDriverTestCase, test.TestCase):
         # Point _VirtDriverTestCase at the right module
         self.driver_module = 'nova.virt.libvirt.LibvirtDriver'
         super(LibvirtConnTestCase, self).setUp()
-        self.stubs.Set(self.connection,
-                       '_set_host_enabled', mock.MagicMock())
-        self.useFixture(fixtures.MonkeyPatch(
-            'nova.context.get_admin_context',
-            self._fake_admin_context))
+        self.stub_out('nova.context.get_admin_context', lambda: self.ctxt)
+        # This is needed for the live migration tests which spawn off the
+        # operation for monitoring.
+        self.useFixture(nova_fixtures.SpawnIsSynchronousFixture())
+        # When using CONF.use_neutron=True and destroying an instance os-vif
+        # will try to execute some commands which hangs tests so let's just
+        # stub out the unplug call to os-vif since we don't care about it.
+        self.stub_out('os_vif.unplug', lambda a, kw: None)
 
-    def _fake_admin_context(self, *args, **kwargs):
-        return self.ctxt
+    def test_init_host_image_type_rbd_force_raw_images_true(self):
+        CONF.set_override('images_type', 'rbd', group='libvirt')
+        CONF.set_override('force_raw_images', True)
+        self.connection.init_host('myhostname')
+
+    def test_init_host_image_type_non_rbd(self):
+        CONF.set_override('images_type', 'default', group='libvirt')
+        self.connection.init_host('myhostname')
+
+    def test_init_host_raise_invalid_configuration(self):
+        CONF.set_override('images_type', 'rbd', group='libvirt')
+        CONF.set_override('force_raw_images', False)
+        self.assertRaises(exception.InvalidConfiguration,
+                          self.connection.init_host, 'myhostname')
 
     def test_force_hard_reboot(self):
         self.flags(wait_soft_reboot_seconds=0, group='libvirt')
@@ -823,7 +918,6 @@ class LibvirtConnTestCase(_VirtDriverTestCase, test.TestCase):
                       " needed to override superclass.")
 
     def test_internal_set_host_enabled(self):
-        self.mox.UnsetStubs()
         service_mock = mock.MagicMock()
 
         # Previous status of the service: disabled: False
@@ -836,7 +930,6 @@ class LibvirtConnTestCase(_VirtDriverTestCase, test.TestCase):
             self.assertEqual(service_mock.disabled_reason, 'AUTO: ERROR!')
 
     def test_set_host_enabled_when_auto_disabled(self):
-        self.mox.UnsetStubs()
         service_mock = mock.MagicMock()
 
         # Previous status of the service: disabled: True, 'AUTO: ERROR'
@@ -849,7 +942,6 @@ class LibvirtConnTestCase(_VirtDriverTestCase, test.TestCase):
             self.assertIsNone(service_mock.disabled_reason)
 
     def test_set_host_enabled_when_manually_disabled(self):
-        self.mox.UnsetStubs()
         service_mock = mock.MagicMock()
 
         # Previous status of the service: disabled: True, 'Manually disabled'
@@ -862,7 +954,6 @@ class LibvirtConnTestCase(_VirtDriverTestCase, test.TestCase):
             self.assertEqual(service_mock.disabled_reason, 'Manually disabled')
 
     def test_set_host_enabled_dont_override_manually_disabled(self):
-        self.mox.UnsetStubs()
         service_mock = mock.MagicMock()
 
         # Previous status of the service: disabled: True, 'Manually disabled'
@@ -891,3 +982,24 @@ class LibvirtConnTestCase(_VirtDriverTestCase, test.TestCase):
         self.assertEqual(unplug_vifs_mock.call_count, 1)
         unplug_vifs_mock.assert_called_once_with(instance_ref,
                                             network_info, True)
+
+    def test_get_device_name_for_instance(self):
+        self.skipTest("Tested by the nova.tests.unit.virt.libvirt suite")
+
+    @catch_notimplementederror
+    @mock.patch('nova.utils.get_image_from_system_metadata')
+    @mock.patch("nova.virt.libvirt.host.Host.has_min_version")
+    def test_set_admin_password(self, ver, mock_image):
+        self.flags(virt_type='kvm', group='libvirt')
+        mock_image.return_value = {"properties": {
+            "hw_qemu_guest_agent": "yes"}}
+        instance, network_info = self._get_running_instance(obj=True)
+        self.connection.set_admin_password(instance, 'p4ssw0rd')
+
+    def test_get_volume_connector(self):
+        for multipath in (True, False):
+            self.flags(volume_use_multipath=multipath, group='libvirt')
+            result = super(LibvirtConnTestCase,
+                           self).test_get_volume_connector()
+            self.assertIn('multipath', result)
+            self.assertEqual(multipath, result['multipath'])

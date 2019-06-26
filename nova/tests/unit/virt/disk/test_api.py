@@ -15,21 +15,22 @@
 
 import tempfile
 
-import fixtures
 import mock
 from oslo_concurrency import processutils
+from oslo_utils import units
 
 from nova import test
-from nova import utils
 from nova.virt.disk import api
 from nova.virt.disk.mount import api as mount
+from nova.virt.disk.vfs import localfs
+from nova.virt.image import model as imgmodel
 
 
 class FakeMount(object):
     device = None
 
     @staticmethod
-    def instance_for_format(imgfile, mountdir, partition, imgfmt):
+    def instance_for_format(image, mountdir, partition):
         return FakeMount()
 
     def get_dev(self):
@@ -40,160 +41,156 @@ class FakeMount(object):
 
 
 class APITestCase(test.NoDBTestCase):
-    def test_can_resize_need_fs_type_specified(self):
-        # NOTE(mikal): Bug 1094373 saw a regression where we failed to
-        # treat a failure to mount as a failure to be able to resize the
-        # filesystem
-        def _fake_get_disk_size(path):
-            return 10
-        self.useFixture(fixtures.MonkeyPatch(
-                'nova.virt.disk.api.get_disk_size', _fake_get_disk_size))
-
-        def fake_trycmd(*args, **kwargs):
-            return '', 'broken'
-        self.useFixture(fixtures.MonkeyPatch('nova.utils.trycmd', fake_trycmd))
-
-        def fake_returns_true(*args, **kwargs):
-            return True
-
-        def fake_returns_nothing(*args, **kwargs):
-            return ''
-        self.useFixture(fixtures.MonkeyPatch(
-                'nova.virt.disk.mount.nbd.NbdMount.get_dev',
-                fake_returns_true))
-        self.useFixture(fixtures.MonkeyPatch(
-                'nova.virt.disk.mount.nbd.NbdMount.map_dev',
-                fake_returns_true))
-        self.useFixture(fixtures.MonkeyPatch(
-                'nova.virt.disk.vfs.localfs.VFSLocalFS.get_image_fs',
-                fake_returns_nothing))
-
-        # Force the use of localfs, which is what was used during the failure
-        # reported in the bug
-        def fake_import_fails(*args, **kwargs):
-            raise Exception('Failed')
-        self.useFixture(fixtures.MonkeyPatch(
-                'oslo.utils.import_module',
-                fake_import_fails))
-
+    @mock.patch.object(localfs.VFSLocalFS, 'get_image_fs', autospec=True,
+                       return_value='')
+    def test_can_resize_need_fs_type_specified(self, mock_image_fs):
         imgfile = tempfile.NamedTemporaryFile()
         self.addCleanup(imgfile.close)
-        self.assertFalse(api.is_image_extendable(imgfile, use_cow=True))
+        image = imgmodel.LocalFileImage(imgfile.name, imgmodel.FORMAT_QCOW2)
+        self.assertFalse(api.is_image_extendable(image))
+        self.assertTrue(mock_image_fs.called)
 
-    def test_resize2fs_success(self):
+    @mock.patch('oslo_concurrency.processutils.execute', autospec=True)
+    def test_is_image_extendable_raw(self, mock_exec):
         imgfile = tempfile.NamedTemporaryFile()
+        image = imgmodel.LocalFileImage(imgfile, imgmodel.FORMAT_RAW)
+        self.addCleanup(imgfile.close)
+        self.assertTrue(api.is_image_extendable(image))
+        mock_exec.assert_called_once_with('e2label', imgfile)
 
-        self.mox.StubOutWithMock(utils, 'execute')
-        utils.execute('e2fsck',
-                      '-fp',
-                      imgfile,
-                      check_exit_code=[0, 1, 2],
-                      run_as_root=False)
-        utils.execute('resize2fs',
-                      imgfile,
-                      check_exit_code=False,
-                      run_as_root=False)
+    @mock.patch('oslo_concurrency.processutils.execute', autospec=True)
+    def test_resize2fs_success(self, mock_exec):
+        imgfile = tempfile.NamedTemporaryFile()
+        self.addCleanup(imgfile.close)
 
-        self.mox.ReplayAll()
         api.resize2fs(imgfile)
 
-    def test_resize2fs_e2fsck_fails(self):
-        imgfile = tempfile.NamedTemporaryFile()
+        mock_exec.assert_has_calls(
+            [mock.call('e2fsck',
+                       '-fp',
+                       imgfile,
+                       check_exit_code=[0, 1, 2]),
+             mock.call('resize2fs',
+                       imgfile,
+                       check_exit_code=False)])
 
-        self.mox.StubOutWithMock(utils, 'execute')
-        utils.execute('e2fsck',
-                      '-fp',
-                      imgfile,
-                      check_exit_code=[0, 1, 2],
-                      run_as_root=False).AndRaise(
-                          processutils.ProcessExecutionError("fs error"))
-        self.mox.ReplayAll()
+    @mock.patch('oslo_concurrency.processutils.execute')
+    @mock.patch('nova.privsep.fs.resize2fs')
+    @mock.patch('nova.privsep.fs.e2fsck')
+    def test_resize2fs_success_as_root(self, mock_fsck, mock_resize,
+                                       mock_exec):
+        imgfile = tempfile.NamedTemporaryFile()
+        self.addCleanup(imgfile.close)
+
+        api.resize2fs(imgfile, run_as_root=True)
+
+        mock_exec.assert_not_called()
+        mock_resize.assert_called()
+        mock_fsck.assert_called()
+
+    @mock.patch('oslo_concurrency.processutils.execute', autospec=True,
+                side_effect=processutils.ProcessExecutionError("fs error"))
+    def test_resize2fs_e2fsck_fails(self, mock_exec):
+        imgfile = tempfile.NamedTemporaryFile()
+        self.addCleanup(imgfile.close)
         api.resize2fs(imgfile)
 
-    def test_extend_qcow_success(self):
+        mock_exec.assert_called_once_with('e2fsck',
+                                          '-fp',
+                                          imgfile,
+                                          check_exit_code=[0, 1, 2])
+
+    @mock.patch.object(api, 'can_resize_image', autospec=True,
+                       return_value=True)
+    @mock.patch.object(api, 'is_image_extendable', autospec=True,
+                       return_value=True)
+    @mock.patch.object(api, 'resize2fs', autospec=True)
+    @mock.patch.object(mount.Mount, 'instance_for_format')
+    @mock.patch('oslo_concurrency.processutils.execute', autospec=True)
+    def test_extend_qcow_success(self, mock_exec, mock_inst, mock_resize,
+                                 mock_extendable, mock_can_resize):
         imgfile = tempfile.NamedTemporaryFile()
+        self.addCleanup(imgfile.close)
         imgsize = 10
         device = "/dev/sdh"
-        use_cow = True
+        image = imgmodel.LocalFileImage(imgfile, imgmodel.FORMAT_QCOW2)
 
         self.flags(resize_fs_using_block_device=True)
         mounter = FakeMount.instance_for_format(
-            imgfile, None, None, 'qcow2')
+            image, None, None)
         mounter.device = device
+        mock_inst.return_value = mounter
 
-        self.mox.StubOutWithMock(api, 'can_resize_image')
-        self.mox.StubOutWithMock(utils, 'execute')
-        self.mox.StubOutWithMock(api, 'is_image_extendable')
-        self.mox.StubOutWithMock(mounter, 'get_dev')
-        self.mox.StubOutWithMock(mounter, 'unget_dev')
-        self.mox.StubOutWithMock(api, 'resize2fs')
-        self.mox.StubOutWithMock(mount.Mount, 'instance_for_format',
-                                 use_mock_anything=True)
+        with test.nested(
+            mock.patch.object(mounter, 'get_dev', autospec=True,
+                              return_value=True),
+            mock.patch.object(mounter, 'unget_dev', autospec=True),
+        ) as (mock_get_dev, mock_unget_dev):
 
-        api.can_resize_image(imgfile, imgsize).AndReturn(True)
-        utils.execute('qemu-img', 'resize', imgfile, imgsize)
-        api.is_image_extendable(imgfile, use_cow).AndReturn(True)
-        mount.Mount.instance_for_format(
-            imgfile, None, None, 'qcow2').AndReturn(mounter)
-        mounter.get_dev().AndReturn(True)
-        api.resize2fs(mounter.device, run_as_root=True, check_exit_code=[0])
-        mounter.unget_dev()
+            api.extend(image, imgsize)
 
-        self.mox.ReplayAll()
-        api.extend(imgfile, imgsize, use_cow=use_cow)
+            mock_can_resize.assert_called_once_with(imgfile, imgsize)
+            mock_exec.assert_called_once_with('qemu-img', 'resize',
+                                              imgfile, imgsize)
+            mock_extendable.assert_called_once_with(image)
+            mock_inst.assert_called_once_with(image, None, None)
+            mock_resize.assert_called_once_with(mounter.device,
+                                                run_as_root=True,
+                                                check_exit_code=[0])
 
-    def test_extend_raw_success(self):
+            mock_get_dev.assert_called_once_with()
+            mock_unget_dev.assert_called_once_with()
+
+    @mock.patch.object(api, 'can_resize_image', autospec=True,
+                       return_value=True)
+    @mock.patch.object(api, 'is_image_extendable', autospec=True)
+    @mock.patch('oslo_concurrency.processutils.execute', autospec=True)
+    def test_extend_qcow_no_resize(self, mock_execute, mock_extendable,
+                                   mock_can_resize_image):
         imgfile = tempfile.NamedTemporaryFile()
+        self.addCleanup(imgfile.close)
         imgsize = 10
-        use_cow = False
+        image = imgmodel.LocalFileImage(imgfile, imgmodel.FORMAT_QCOW2)
 
-        self.mox.StubOutWithMock(api, 'can_resize_image')
-        self.mox.StubOutWithMock(utils, 'execute')
-        self.mox.StubOutWithMock(api, 'is_image_extendable')
-        self.mox.StubOutWithMock(api, 'resize2fs')
+        self.flags(resize_fs_using_block_device=False)
 
-        api.can_resize_image(imgfile, imgsize).AndReturn(True)
-        utils.execute('qemu-img', 'resize', imgfile, imgsize)
-        api.is_image_extendable(imgfile, use_cow).AndReturn(True)
-        api.resize2fs(imgfile, run_as_root=False, check_exit_code=[0])
+        api.extend(image, imgsize)
 
-        self.mox.ReplayAll()
-        api.extend(imgfile, imgsize, use_cow=use_cow)
+        mock_can_resize_image.assert_called_once_with(imgfile, imgsize)
+        mock_execute.assert_called_once_with('qemu-img', 'resize', imgfile,
+                                             imgsize)
+        self.assertFalse(mock_extendable.called)
 
-    HASH_VFAT = utils.get_hash_str(api.FS_FORMAT_VFAT)[:7]
-    HASH_EXT4 = utils.get_hash_str(api.FS_FORMAT_EXT4)[:7]
-    HASH_NTFS = utils.get_hash_str(api.FS_FORMAT_NTFS)[:7]
+    @mock.patch.object(api, 'can_resize_image', autospec=True,
+                       return_value=True)
+    @mock.patch('nova.privsep.libvirt.ploop_resize')
+    def test_extend_ploop(self, mock_ploop_resize, mock_can_resize_image):
+        imgfile = tempfile.NamedTemporaryFile()
+        self.addCleanup(imgfile.close)
+        imgsize = 10 * units.Gi
+        image = imgmodel.LocalFileImage(imgfile, imgmodel.FORMAT_PLOOP)
 
-    def test_get_file_extension_for_os_type(self):
-        self.assertEqual(self.HASH_VFAT,
-                         api.get_file_extension_for_os_type(None, None))
-        self.assertEqual(self.HASH_EXT4,
-                         api.get_file_extension_for_os_type('linux', None))
-        self.assertEqual(self.HASH_NTFS,
-                         api.get_file_extension_for_os_type(
-                             'windows', None))
+        api.extend(image, imgsize)
+        mock_can_resize_image.assert_called_once_with(image.path,
+                                                      imgsize)
+        mock_ploop_resize.assert_called_once_with(imgfile, imgsize)
 
-    def test_get_file_extension_for_os_type_with_overrides(self):
-        with mock.patch('nova.virt.disk.api._DEFAULT_MKFS_COMMAND',
-                        'custom mkfs command'):
-            self.assertEqual("a74d253",
-                             api.get_file_extension_for_os_type(
-                                 'linux', None))
-            self.assertEqual("a74d253",
-                             api.get_file_extension_for_os_type(
-                                 'windows', None))
-            self.assertEqual("a74d253",
-                             api.get_file_extension_for_os_type('osx', None))
+    @mock.patch.object(api, 'can_resize_image', autospec=True,
+                       return_value=True)
+    @mock.patch.object(api, 'resize2fs', autospec=True)
+    @mock.patch('oslo_concurrency.processutils.execute', autospec=True)
+    def test_extend_raw_success(self, mock_exec, mock_resize,
+                                mock_can_resize):
+        imgfile = tempfile.NamedTemporaryFile()
+        self.addCleanup(imgfile.close)
+        imgsize = 10
+        image = imgmodel.LocalFileImage(imgfile, imgmodel.FORMAT_RAW)
 
-        with mock.patch.dict(api._MKFS_COMMAND,
-                             {'osx': 'custom mkfs command'}, clear=True):
-            self.assertEqual(self.HASH_VFAT,
-                             api.get_file_extension_for_os_type(None, None))
-            self.assertEqual(self.HASH_EXT4,
-                             api.get_file_extension_for_os_type('linux', None))
-            self.assertEqual(self.HASH_NTFS,
-                             api.get_file_extension_for_os_type(
-                                 'windows', None))
-            self.assertEqual("a74d253",
-                             api.get_file_extension_for_os_type(
-                                 'osx', None))
+        api.extend(image, imgsize)
+
+        mock_exec.assert_has_calls(
+            [mock.call('qemu-img', 'resize', imgfile, imgsize),
+             mock.call('e2label', image.path)])
+        mock_resize.assert_called_once_with(imgfile, run_as_root=False,
+                                            check_exit_code=[0])
+        mock_can_resize.assert_called_once_with(imgfile, imgsize)

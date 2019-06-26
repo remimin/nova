@@ -12,16 +12,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo_config import cfg
+import mock
 from oslo_middleware import request_id
 from oslo_serialization import jsonutils
 import webob
 import webob.exc
 
 import nova.api.auth
+import nova.conf
 from nova import test
 
-CONF = cfg.CONF
+CONF = nova.conf.CONF
 
 
 class TestNovaKeystoneContextMiddleware(test.NoDBTestCase):
@@ -51,21 +52,8 @@ class TestNovaKeystoneContextMiddleware(test.NoDBTestCase):
         self.assertEqual(response.status, '200 OK')
         self.assertEqual(self.context.user_id, 'testuserid')
 
-    def test_user_only(self):
-        self.request.headers['X_USER'] = 'testuser'
-        response = self.request.get_response(self.middleware)
-        self.assertEqual(response.status, '200 OK')
-        self.assertEqual(self.context.user_id, 'testuser')
-
-    def test_user_id_trumps_user(self):
-        self.request.headers['X_USER_ID'] = 'testuserid'
-        self.request.headers['X_USER'] = 'testuser'
-        response = self.request.get_response(self.middleware)
-        self.assertEqual(response.status, '200 OK')
-        self.assertEqual(self.context.user_id, 'testuserid')
-
     def test_invalid_service_catalog(self):
-        self.request.headers['X_USER'] = 'testuser'
+        self.request.headers['X_USER_ID'] = 'testuser'
         self.request.headers['X_SERVICE_CATALOG'] = "bad json"
         response = self.request.get_response(self.middleware)
         self.assertEqual(response.status, '500 Internal Server Error')
@@ -90,14 +78,14 @@ class TestKeystoneMiddlewareRoles(test.NoDBTestCase):
 
             if "knight" in context.roles and "bad" not in context.roles:
                 return webob.Response(status="200 Role Match")
-            elif context.roles == ['']:
+            elif not context.roles:
                 return webob.Response(status="200 No Roles")
             else:
                 raise webob.exc.HTTPBadRequest("unexpected role header")
 
         self.middleware = nova.api.auth.NovaKeystoneContext(role_check_app)
         self.request = webob.Request.blank('/')
-        self.request.headers['X_USER'] = 'testuser'
+        self.request.headers['X_USER_ID'] = 'testuser'
         self.request.headers['X_TENANT_ID'] = 'testtenantid'
         self.request.headers['X_AUTH_TOKEN'] = 'testauthtoken'
         self.request.headers['X_SERVICE_CATALOG'] = jsonutils.dumps({})
@@ -152,56 +140,17 @@ class TestPipeLineFactory(test.NoDBTestCase):
         self.assertEqual(app.name, pipeline.split()[-1])
         self.assertIsInstance(app, TestPipeLineFactory.FakeApp)
 
-    def test_pipeline_factory_noauthold(self):
-        fake_pipeline = 'test1 test2 test3'
-        CONF.set_override('auth_strategy', 'noauth')
-        app = nova.api.auth.pipeline_factory(
-            TestPipeLineFactory.FakeLoader(), None, noauth=fake_pipeline)
-        self._test_pipeline(fake_pipeline, app)
-
-    def test_pipeline_factory_v21_noauthold(self):
-        fake_pipeline = 'test1 test2 test3'
-        CONF.set_override('auth_strategy', 'noauth')
-        app = nova.api.auth.pipeline_factory_v21(
-            TestPipeLineFactory.FakeLoader(), None, noauth=fake_pipeline)
-        self._test_pipeline(fake_pipeline, app)
-
-    def test_pipeline_factory(self):
-        fake_pipeline = 'test1 test2 test3'
-        CONF.set_override('auth_strategy', 'noauth2')
-        app = nova.api.auth.pipeline_factory(
-            TestPipeLineFactory.FakeLoader(), None, noauth2=fake_pipeline)
-        self._test_pipeline(fake_pipeline, app)
-
     def test_pipeline_factory_v21(self):
         fake_pipeline = 'test1 test2 test3'
-        CONF.set_override('auth_strategy', 'noauth2')
+        CONF.set_override('auth_strategy', 'noauth2', group='api')
         app = nova.api.auth.pipeline_factory_v21(
             TestPipeLineFactory.FakeLoader(), None, noauth2=fake_pipeline)
         self._test_pipeline(fake_pipeline, app)
 
-    def test_pipeline_factory_with_rate_limits(self):
-        CONF.set_override('api_rate_limit', True)
-        CONF.set_override('auth_strategy', 'keystone')
+    @mock.patch('oslo_log.versionutils.report_deprecated_feature')
+    def test_pipeline_factory_legacy_v2_deprecated(self,
+                                                   mock_report_deprecated):
         fake_pipeline = 'test1 test2 test3'
-        app = nova.api.auth.pipeline_factory(
-            TestPipeLineFactory.FakeLoader(), None, keystone=fake_pipeline)
-        self._test_pipeline(fake_pipeline, app)
-
-    def test_pipeline_factory_without_rate_limits(self):
-        CONF.set_override('auth_strategy', 'keystone')
-        fake_pipeline1 = 'test1 test2 test3'
-        fake_pipeline2 = 'test4 test5 test6'
-        app = nova.api.auth.pipeline_factory(
-            TestPipeLineFactory.FakeLoader(), None,
-            keystone_nolimit=fake_pipeline1,
-            keystone=fake_pipeline2)
-        self._test_pipeline(fake_pipeline1, app)
-
-    def test_pipeline_factory_missing_nolimits_pipeline(self):
-        CONF.set_override('api_rate_limit', False)
-        CONF.set_override('auth_strategy', 'keystone')
-        fake_pipeline = 'test1 test2 test3'
-        app = nova.api.auth.pipeline_factory(
-            TestPipeLineFactory.FakeLoader(), None, keystone=fake_pipeline)
-        self._test_pipeline(fake_pipeline, app)
+        nova.api.auth.pipeline_factory(TestPipeLineFactory.FakeLoader(),
+            None, noauth2=fake_pipeline)
+        self.assertTrue(mock_report_deprecated.called)

@@ -15,30 +15,38 @@
 
 from webob import exc
 
-import nova
 from nova.api.openstack import common
-from nova.api.openstack.compute.views import addresses as view_addresses
+from nova.api.openstack.compute.views import addresses as views_addresses
 from nova.api.openstack import wsgi
+from nova.compute import api as compute
 from nova.i18n import _
+from nova.policies import ips as ips_policies
 
 
-class Controller(wsgi.Controller):
+class IPsController(wsgi.Controller):
     """The servers addresses API controller for the OpenStack API."""
+    # Note(gmann): here using V2 view builder instead of V3 to have V2.1
+    # server ips response same as V2 which does not include "OS-EXT-IPS:type"
+    # & "OS-EXT-IPS-MAC:mac_addr". If needed those can be added with
+    # microversion by using V2.1 view builder.
+    _view_builder_class = views_addresses.ViewBuilder
 
-    _view_builder_class = view_addresses.ViewBuilder
+    def __init__(self):
+        super(IPsController, self).__init__()
+        self._compute_api = compute.API()
 
-    def __init__(self, **kwargs):
-        super(Controller, self).__init__(**kwargs)
-        self._compute_api = nova.compute.API()
-
+    @wsgi.expected_errors(404)
     def index(self, req, server_id):
         context = req.environ["nova.context"]
+        context.can(ips_policies.POLICY_ROOT % 'index')
         instance = common.get_instance(self._compute_api, context, server_id)
         networks = common.get_networks_for_instance(context, instance)
         return self._view_builder.index(networks)
 
+    @wsgi.expected_errors(404)
     def show(self, req, server_id, id):
         context = req.environ["nova.context"]
+        context.can(ips_policies.POLICY_ROOT % 'show')
         instance = common.get_instance(self._compute_api, context, server_id)
         networks = common.get_networks_for_instance(context, instance)
         if id not in networks:
@@ -46,7 +54,3 @@ class Controller(wsgi.Controller):
             raise exc.HTTPNotFound(explanation=msg)
 
         return self._view_builder.show(networks[id], id)
-
-
-def create_resource():
-    return wsgi.Resource(Controller())

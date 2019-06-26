@@ -14,20 +14,16 @@
 
 from oslo_log import log as logging
 
-from nova.cells import opts as cells_opts
-from nova.cells import rpcapi as cells_rpcapi
-from nova import db
+from nova.db import api as db
 from nova import exception
-from nova.i18n import _LE
 from nova.objects import base
 from nova.objects import fields
 
 LOG = logging.getLogger(__name__)
 
 
-# TODO(berrange): Remove NovaObjectDictCompat
-class InstanceInfoCache(base.NovaPersistentObject, base.NovaObject,
-                        base.NovaObjectDictCompat):
+@base.NovaObjectRegistry.register
+class InstanceInfoCache(base.NovaPersistentObject, base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: Converted network_info to store the model.
     # Version 1.2: Added new() and update_cells kwarg to save().
@@ -45,7 +41,7 @@ class InstanceInfoCache(base.NovaPersistentObject, base.NovaObject,
     @staticmethod
     def _from_db_object(context, info_cache, db_obj):
         for field in info_cache.fields:
-            info_cache[field] = db_obj[field]
+            setattr(info_cache, field, db_obj[field])
         info_cache.obj_reset_changes()
         info_cache._context = context
         return info_cache
@@ -73,18 +69,7 @@ class InstanceInfoCache(base.NovaPersistentObject, base.NovaObject,
                     instance_uuid=instance_uuid)
         return cls._from_db_object(context, cls(context), db_obj)
 
-    @staticmethod
-    def _info_cache_cells_update(ctxt, info_cache):
-        cell_type = cells_opts.get_cell_type()
-        if cell_type != 'compute':
-            return
-        cells_api = cells_rpcapi.CellsAPI()
-        try:
-            cells_api.instance_info_cache_update_at_top(ctxt, info_cache)
-        except Exception:
-            LOG.exception(_LE("Failed to notify cells of instance info "
-                              "cache update"))
-
+    # TODO(stephenfin): Remove 'update_cells' in version 2.0
     @base.remotable
     def save(self, update_cells=True):
         if 'network_info' in self.obj_what_changed():
@@ -93,8 +78,7 @@ class InstanceInfoCache(base.NovaPersistentObject, base.NovaObject,
             rv = db.instance_info_cache_update(self._context,
                                                self.instance_uuid,
                                                {'network_info': nw_info_json})
-            if update_cells and rv:
-                self._info_cache_cells_update(self._context, rv)
+            self._from_db_object(self._context, self, rv)
         self.obj_reset_changes()
 
     @base.remotable
@@ -108,7 +92,8 @@ class InstanceInfoCache(base.NovaPersistentObject, base.NovaObject,
         current._context = None
 
         for field in self.fields:
-            if self.obj_attr_is_set(field) and self[field] != current[field]:
-                self[field] = current[field]
+            if (self.obj_attr_is_set(field) and
+                    getattr(self, field) != getattr(current, field)):
+                setattr(self, field, getattr(current, field))
 
         self.obj_reset_changes()

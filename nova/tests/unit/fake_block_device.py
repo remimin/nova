@@ -13,11 +13,24 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import uuid
-
+from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
 
 from nova import block_device
+from nova import objects
+
+
+def fake_bdm_object(context, bdm_dict):
+    """Creates a BlockDeviceMapping object from the given bdm_dict
+
+    :param context: nova request context
+    :param bdm_dict: dict of block device mapping info
+    :returns: nova.objects.block_device.BlockDeviceMapping
+    """
+    # FakeDbBlockDeviceDict mutates the bdm_dict so make a copy of it.
+    return objects.BlockDeviceMapping._from_db_object(
+        context, objects.BlockDeviceMapping(),
+        FakeDbBlockDeviceDict(bdm_dict.copy()))
 
 
 class FakeDbBlockDeviceDict(block_device.BlockDeviceDict):
@@ -26,7 +39,8 @@ class FakeDbBlockDeviceDict(block_device.BlockDeviceDict):
     def __init__(self, bdm_dict=None, anon=False, **kwargs):
         bdm_dict = bdm_dict or {}
         db_id = bdm_dict.pop('id', 1)
-        instance_uuid = bdm_dict.pop('instance_uuid', str(uuid.uuid4()))
+        db_uuid = bdm_dict.pop('uuid', uuids.bdm)
+        instance_uuid = bdm_dict.pop('instance_uuid', uuids.fake)
 
         super(FakeDbBlockDeviceDict, self).__init__(bdm_dict=bdm_dict,
                                                     **kwargs)
@@ -35,6 +49,8 @@ class FakeDbBlockDeviceDict(block_device.BlockDeviceDict):
                           'deleted': 0}
         if not anon:
             fake_db_fields['id'] = db_id
+            fake_db_fields['uuid'] = db_uuid
+            fake_db_fields['attachment_id'] = None
             fake_db_fields['created_at'] = timeutils.utcnow()
             fake_db_fields['updated_at'] = timeutils.utcnow()
         self.update(fake_db_fields)

@@ -13,9 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import datetime
-
-from oslo_utils import timeutils
+from nova.policies import used_limits as ul_policies
 
 
 class ViewBuilder(object):
@@ -35,77 +33,74 @@ class ViewBuilder(object):
             "injected_file_content_bytes": ["maxPersonalitySize"],
             "security_groups": ["maxSecurityGroups"],
             "security_group_rules": ["maxSecurityGroupRules"],
+            "server_groups": ["maxServerGroups"],
+            "server_group_members": ["maxServerGroupMembers"]
     }
 
-    def build(self, rate_limits, absolute_limits):
-        rate_limits = self._build_rate_limits(rate_limits)
-        absolute_limits = self._build_absolute_limits(absolute_limits)
+    def build(self, request, quotas, filtered_limits=None,
+              max_image_meta=True):
+        filtered_limits = filtered_limits or []
+        absolute_limits = self._build_absolute_limits(
+            quotas, filtered_limits,
+            max_image_meta=max_image_meta)
 
+        used_limits = self._build_used_limits(
+            request, quotas, filtered_limits)
+
+        absolute_limits.update(used_limits)
         output = {
             "limits": {
-                "rate": rate_limits,
+                "rate": [],
                 "absolute": absolute_limits,
             },
         }
 
         return output
 
-    def _build_absolute_limits(self, absolute_limits):
+    def _build_absolute_limits(self, quotas, filtered_limits=None,
+                               max_image_meta=True):
         """Builder for absolute limits
 
         absolute_limits should be given as a dict of limits.
         For example: {"ram": 512, "gigabytes": 1024}.
 
+        filtered_limits is an optional list of limits to exclude from the
+        result set.
         """
+        absolute_limits = {k: v['limit'] for k, v in quotas.items()}
         limits = {}
-        for name, value in absolute_limits.iteritems():
-            if name in self.limit_names and value is not None:
+        for name, value in absolute_limits.items():
+            if (name in self.limit_names and
+                    value is not None and name not in filtered_limits):
                 for limit_name in self.limit_names[name]:
+                    if not max_image_meta and limit_name == "maxImageMeta":
+                        continue
                     limits[limit_name] = value
         return limits
 
-    def _build_rate_limits(self, rate_limits):
-        limits = []
-        for rate_limit in rate_limits:
-            _rate_limit_key = None
-            _rate_limit = self._build_rate_limit(rate_limit)
-
-            # check for existing key
-            for limit in limits:
-                if (limit["uri"] == rate_limit["URI"] and
-                        limit["regex"] == rate_limit["regex"]):
-                    _rate_limit_key = limit
-                    break
-
-            # ensure we have a key if we didn't find one
-            if not _rate_limit_key:
-                _rate_limit_key = {
-                    "uri": rate_limit["URI"],
-                    "regex": rate_limit["regex"],
-                    "limit": [],
-                }
-                limits.append(_rate_limit_key)
-
-            _rate_limit_key["limit"].append(_rate_limit)
-
-        return limits
-
-    def _build_rate_limit(self, rate_limit):
-        _get_utc = datetime.datetime.utcfromtimestamp
-        next_avail = _get_utc(rate_limit["resetTime"])
-        return {
-            "verb": rate_limit["verb"],
-            "value": rate_limit["value"],
-            "remaining": int(rate_limit["remaining"]),
-            "unit": rate_limit["unit"],
-            "next-available": timeutils.isotime(at=next_avail),
+    def _build_used_limits(self, request, quotas, filtered_limits):
+        self._check_requested_project_scope(request)
+        quota_map = {
+            'totalRAMUsed': 'ram',
+            'totalCoresUsed': 'cores',
+            'totalInstancesUsed': 'instances',
+            'totalFloatingIpsUsed': 'floating_ips',
+            'totalSecurityGroupsUsed': 'security_groups',
+            'totalServerGroupsUsed': 'server_groups',
         }
+        used_limits = {}
+        for display_name, key in quota_map.items():
+            if (key in quotas and key not in filtered_limits):
+                used_limits[display_name] = quotas[key]['in_use']
 
+        return used_limits
 
-class ViewBuilderV3(ViewBuilder):
-
-    def __init__(self):
-        super(ViewBuilderV3, self).__init__()
-        # NOTE In v2.0 these are added by a specific extension
-        self.limit_names["server_groups"] = ["maxServerGroups"]
-        self.limit_names["server_group_members"] = ["maxServerGroupMembers"]
+    def _check_requested_project_scope(self, request):
+        if 'tenant_id' in request.GET:
+            context = request.environ['nova.context']
+            tenant_id = request.GET.get('tenant_id')
+            target = {
+                'project_id': tenant_id,
+                'user_id': context.user_id
+                }
+            context.can(ul_policies.BASE_POLICY_NAME, target)

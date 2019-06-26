@@ -20,6 +20,7 @@ A fake VMware VI API implementation.
 """
 
 import collections
+import sys
 
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
@@ -33,9 +34,11 @@ from nova.virt.vmwareapi import constants
 
 _CLASSES = ['Datacenter', 'Datastore', 'ResourcePool', 'VirtualMachine',
             'Network', 'HostSystem', 'HostNetworkSystem', 'Task', 'session',
-            'files', 'ClusterComputeResource', 'HostStorageSystem']
+            'files', 'ClusterComputeResource', 'HostStorageSystem',
+            'Folder']
 
 _FAKE_FILE_SIZE = 1024
+_FAKE_VCENTER_UUID = '497c514c-ef5e-4e7f-8d93-ec921993b93a'
 
 _db_content = {}
 _array_types = {}
@@ -48,6 +51,7 @@ def reset():
     """Resets the db contents."""
     cleanup()
     create_network()
+    create_folder()
     create_host_network_system()
     create_host_storage_system()
     ds_ref1 = create_datastore('ds1', 1024, 500)
@@ -74,6 +78,7 @@ def cleanup():
 
 def _create_object(table, table_obj):
     """Create an object in the db."""
+    _db_content.setdefault(table, {})
     _db_content[table][table_obj.obj] = table_obj
 
 
@@ -132,16 +137,6 @@ class FakeRetrieveResult(object):
 
     def add_object(self, object):
         self.objects.append(object)
-
-
-class MissingProperty(object):
-    """Missing object in ObjectContent's missing set."""
-    def __init__(self, path='fake-path', message='fake_message',
-                 method_fault=None):
-        self.path = path
-        self.fault = DataObject()
-        self.fault.localizedMessage = message
-        self.fault.fault = method_fault
 
 
 def _get_object_refs(obj_type):
@@ -236,7 +231,7 @@ class ManagedObject(object):
 
     def delete(self, attr):
         """Deletes an attribute."""
-        self.propSet = filter(lambda elem: elem.name != attr, self.propSet)
+        self.propSet = [elem for elem in self.propSet if elem.name != attr]
 
     def __setattr__(self, attr, val):
         # TODO(hartsocks): this is adds unnecessary complexity to the class
@@ -274,6 +269,8 @@ class DataObject(object):
     """Data object base class."""
 
     def __init__(self, obj_name=None):
+        if obj_name is None:
+            obj_name = 'ns0:' + self.__class__.__name__
         self.obj_name = obj_name
 
     def __repr__(self):
@@ -286,10 +283,11 @@ class DataObject(object):
 class HostInternetScsiHba(DataObject):
     """iSCSI Host Bus Adapter."""
 
-    def __init__(self):
+    def __init__(self, iscsi_name=None):
         super(HostInternetScsiHba, self).__init__()
         self.device = 'vmhba33'
         self.key = 'key-vmhba33'
+        self.iScsiName = iscsi_name
 
 
 class FileAlreadyExists(DataObject):
@@ -367,8 +365,9 @@ class VirtualIDEController(DataObject):
 
 class VirtualLsiLogicController(DataObject):
     """VirtualLsiLogicController class."""
-    def __init__(self, key=0, scsiCtlrUnitNumber=0):
+    def __init__(self, key=0, scsiCtlrUnitNumber=0, busNumber=0):
         self.key = key
+        self.busNumber = busNumber
         self.scsiCtlrUnitNumber = scsiCtlrUnitNumber
         self.device = []
 
@@ -532,6 +531,14 @@ class VirtualMachine(ManagedObject):
             pass
 
 
+class Folder(ManagedObject):
+    """Folder class."""
+
+    def __init__(self):
+        super(Folder, self).__init__("Folder")
+        self.set("childEntity", [])
+
+
 class Network(ManagedObject):
     """Network class."""
 
@@ -585,7 +592,7 @@ class DatastoreHostMount(DataObject):
     def __init__(self, value='host-100'):
         super(DatastoreHostMount, self).__init__()
         host_ref = (_db_content["HostSystem"]
-                    [_db_content["HostSystem"].keys()[0]].obj)
+                    [list(_db_content["HostSystem"].keys())[0]].obj)
         host_system = DataObject()
         host_system.ManagedObjectReference = [host_ref]
         host_system.value = value
@@ -656,8 +663,8 @@ class ClusterComputeResource(ManagedObject):
             summary.numCpuCores += host_summary.hardware.numCpuCores
             summary.numCpuThreads += host_summary.hardware.numCpuThreads
             summary.totalMemory += host_summary.hardware.memorySize
-            free_memory = (host_summary.hardware.memorySize / units.Mi
-                           - host_summary.quickStats.overallMemoryUsage)
+            free_memory = (host_summary.hardware.memorySize / units.Mi -
+                           host_summary.quickStats.overallMemoryUsage)
             summary.effectiveMemory += free_memory if connected else 0
             summary.numEffectiveHosts += 1 if connected else 0
         self.set("summary", summary)
@@ -712,7 +719,7 @@ class HostSystem(ManagedObject):
             create_host_network_system()
         if not _get_object_refs('HostStorageSystem'):
             create_host_storage_system()
-        host_net_key = _db_content["HostNetworkSystem"].keys()[0]
+        host_net_key = list(_db_content["HostNetworkSystem"].keys())[0]
         host_net_sys = _db_content["HostNetworkSystem"][host_net_key].obj
         self.set("configManager.networkSystem", host_net_sys)
         host_storage_sys_key = _get_object_refs('HostStorageSystem')[0]
@@ -751,7 +758,7 @@ class HostSystem(ManagedObject):
 
         product = DataObject()
         product.name = "VMware ESXi"
-        product.version = "5.0.0"
+        product.version = constants.MIN_VC_VERSION
         config = DataObject()
         config.product = product
         summary.config = config
@@ -765,12 +772,14 @@ class HostSystem(ManagedObject):
         self.set("capability.maxHostSupportedVcpus", 600)
         self.set("summary.hardware", hardware)
         self.set("summary.runtime", runtime)
+        self.set("summary.quickStats", quickstats)
         self.set("config.network.pnic", net_info_pnic)
         self.set("connected", connected)
 
         if _db_content.get("Network", None) is None:
             create_network()
-        net_ref = _db_content["Network"][_db_content["Network"].keys()[0]].obj
+        net_ref = _db_content["Network"][
+            list(_db_content["Network"].keys())[0]].obj
         network_do = DataObject()
         network_do.ManagedObjectReference = [net_ref]
         self.set("network", network_do)
@@ -870,10 +879,17 @@ class Datacenter(ManagedObject):
     def __init__(self, name="ha-datacenter", ds_ref=None):
         super(Datacenter, self).__init__("dc")
         self.set("name", name)
-        self.set("vmFolder", "vm_folder_ref")
+        if _db_content.get("Folder", None) is None:
+            create_folder()
+        folder_ref = _db_content["Folder"][
+            list(_db_content["Folder"].keys())[0]].obj
+        folder_do = DataObject()
+        folder_do.ManagedObjectReference = [folder_ref]
+        self.set("vmFolder", folder_ref)
         if _db_content.get("Network", None) is None:
             create_network()
-        net_ref = _db_content["Network"][_db_content["Network"].keys()[0]].obj
+        net_ref = _db_content["Network"][
+            list(_db_content["Network"].keys())[0]].obj
         network_do = DataObject()
         network_do.ManagedObjectReference = [net_ref]
         self.set("network", network_do)
@@ -938,6 +954,12 @@ def create_res_pool():
     return res_pool.obj
 
 
+def create_folder():
+    folder = Folder()
+    _create_object('Folder', folder)
+    return folder.obj
+
+
 def create_network():
     network = Network()
     _create_object('Network', network)
@@ -968,15 +990,16 @@ def create_vm(uuid=None, name=None,
         devices = []
 
     if vmPathName is None:
-        vm_path = ds_obj.DatastorePath(_db_content['Datastore'].values()[0])
+        vm_path = ds_obj.DatastorePath(
+            list(_db_content['Datastore'].values())[0])
     else:
         vm_path = ds_obj.DatastorePath.parse(vmPathName)
 
     if res_pool_ref is None:
-        res_pool_ref = _db_content['ResourcePool'].keys()[0]
+        res_pool_ref = list(_db_content['ResourcePool'].keys())[0]
 
     if host_ref is None:
-        host_ref = _db_content["HostSystem"].keys()[0]
+        host_ref = list(_db_content["HostSystem"].keys())[0]
 
     # Fill in the default path to the vmx file if we were only given a
     # datastore. Note that if you create a VM with vmPathName '[foo]', when you
@@ -985,7 +1008,7 @@ def create_vm(uuid=None, name=None,
     if vm_path.rel_path == '':
         vm_path = vm_path.join(name, name + '.vmx')
 
-    for key, value in _db_content["Datastore"].iteritems():
+    for key, value in _db_content["Datastore"].items():
         if value.get('summary.name') == vm_path.datastore:
             ds = key
             break
@@ -1078,7 +1101,7 @@ def fake_fetch_image(context, instance, host, port, dc_name, ds_name,
 def _get_vm_mdo(vm_ref):
     """Gets the Virtual Machine with the ref from the db."""
     if _db_content.get("VirtualMachine", None) is None:
-            raise exception.NotFound("There is no VM registered")
+        raise exception.NotFound("There is no VM registered")
     if vm_ref not in _db_content.get("VirtualMachine"):
         raise exception.NotFound("Virtual Machine with ref %s is not "
                                  "there" % vm_ref)
@@ -1103,7 +1126,32 @@ class FakeFactory(object):
 
     def create(self, obj_name):
         """Creates a namespace object."""
-        return DataObject(obj_name)
+        klass = obj_name[4:]  # skip 'ns0:'
+        module = sys.modules[__name__]
+        fake_klass = getattr(module, klass, None)
+        if fake_klass is None:
+            return DataObject(obj_name)
+        else:
+            return fake_klass()
+
+
+class SharesInfo(DataObject):
+    def __init__(self):
+        super(SharesInfo, self).__init__()
+        self.level = None
+        self.shares = None
+
+
+class VirtualEthernetCardResourceAllocation(DataObject):
+    def __init__(self):
+        super(VirtualEthernetCardResourceAllocation, self).__init__()
+        self.share = SharesInfo()
+
+
+class VirtualE1000(DataObject):
+    def __init__(self):
+        super(VirtualE1000, self).__init__()
+        self.resourceAllocation = VirtualEthernetCardResourceAllocation()
 
 
 class FakeService(DataObject):
@@ -1150,6 +1198,9 @@ class FakeObjectRetrievalSession(FakeSession):
         self.ind = 0
 
     def _call_method(self, module, method, *args, **kwargs):
+        if (method == 'continue_retrieval' or
+            method == 'cancel_retrieval'):
+            return
         # return fake objects in a circular manner
         self.ind = (self.ind + 1) % len(self.ret)
         return self.ret[self.ind - 1]
@@ -1191,7 +1242,9 @@ class FakeVim(object):
 
         about_info = DataObject()
         about_info.name = "VMware vCenter Server"
-        about_info.version = "5.1.0"
+        about_info.version = constants.MIN_VC_VERSION
+        about_info.instanceUuid = _FAKE_VCENTER_UUID
+
         service_content.about = about_info
 
         self._service_content = service_content
@@ -1262,11 +1315,21 @@ class FakeVim(object):
         task_mdo = create_task(method, "success", result=vm_ref)
         return task_mdo.obj
 
+    def _create_folder(self, method, *args, **kwargs):
+        return create_folder()
+
     def _reconfig_vm(self, method, *args, **kwargs):
         """Reconfigures a VM and sets the properties supplied."""
         vm_ref = args[0]
         vm_mdo = _get_vm_mdo(vm_ref)
         vm_mdo.reconfig(self.client.factory, kwargs.get("spec"))
+        task_mdo = create_task(method, "success")
+        return task_mdo.obj
+
+    def _rename(self, method, *args, **kwargs):
+        vm_ref = args[0]
+        vm_mdo = _get_vm_mdo(vm_ref)
+        vm_mdo.set('name', kwargs['newName'])
         task_mdo = create_task(method, "success")
         return task_mdo.obj
 
@@ -1280,7 +1343,7 @@ class FakeVim(object):
         return task_mdo.obj
 
     def _extend_disk(self, method, size):
-        """Extend disk size when create a instance."""
+        """Extend disk size when create an instance."""
         task_mdo = create_task(method, "success")
         return task_mdo.obj
 
@@ -1380,7 +1443,7 @@ class FakeVim(object):
             for file in _db_content.get("files"):
                 if file.find(ds_path) != -1:
                     if not file.endswith(ds_path):
-                        path = file.lstrip(dname).split('/')
+                        path = file.replace(dname, '', 1).split('/')
                         if path:
                             matched_files.add(path[0])
             if not matched_files:
@@ -1396,6 +1459,7 @@ class FakeVim(object):
             for file in matched_files:
                 matched = DataObject()
                 matched.path = file
+                matched.fileSize = 1024
                 result.file.append(matched)
             task_mdo = create_task(method, "success", result=result)
         else:
@@ -1497,7 +1561,7 @@ class FakeVim(object):
 
     def _add_port_group(self, method, *args, **kwargs):
         """Adds a port group to the host system."""
-        _host_sk = _db_content["HostSystem"].keys()[0]
+        _host_sk = list(_db_content["HostSystem"].keys())[0]
         host_mdo = _db_content["HostSystem"][_host_sk]
         host_mdo._add_port_group(kwargs.get("portgrp"))
 
@@ -1527,8 +1591,14 @@ class FakeVim(object):
         elif attr_name == "CreateVM_Task":
             return lambda *args, **kwargs: self._create_vm(attr_name,
                                                 *args, **kwargs)
+        elif attr_name == "CreateFolder":
+            return lambda *args, **kwargs: self._create_folder(attr_name,
+                                                *args, **kwargs)
         elif attr_name == "ReconfigVM_Task":
             return lambda *args, **kwargs: self._reconfig_vm(attr_name,
+                                                *args, **kwargs)
+        elif attr_name == "Rename_Task":
+            return lambda *args, **kwargs: self._rename(attr_name,
                                                 *args, **kwargs)
         elif attr_name == "CreateVirtualDisk_Task":
             return lambda *args, **kwargs: self._create_copy_disk(attr_name,

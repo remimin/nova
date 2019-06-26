@@ -12,20 +12,17 @@
 
 """Implementation of a fake volume API."""
 
-import uuid
-
-from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
 
+import nova.conf
 from nova import exception
 
 
 LOG = logging.getLogger(__name__)
 
-CONF = cfg.CONF
-CONF.import_opt('cross_az_attach',
-                'nova.volume.cinder', group='cinder')
+CONF = nova.conf.CONF
 
 
 class fake_volume(object):
@@ -40,7 +37,7 @@ class fake_volume(object):
         if snapshot is not None:
             snapshot_id = snapshot['id']
         if volume_id is None:
-            volume_id = str(uuid.uuid4())
+            volume_id = uuids.fake1
         self.vol = {
             'created_at': timeutils.utcnow(),
             'deleted_at': None,
@@ -66,7 +63,8 @@ class fake_volume(object):
             'display_description': description,
             'provider_location': 'fake-location',
             'provider_auth': 'fake-auth',
-            'volume_type_id': 99
+            'volume_type_id': 99,
+            'multiattach': False
             }
 
     def get(self, key, default=None):
@@ -76,7 +74,7 @@ class fake_volume(object):
         self.vol[key] = value
 
     def __getitem__(self, key):
-        self.vol[key]
+        return self.vol[key]
 
 
 class fake_snapshot(object):
@@ -85,7 +83,7 @@ class fake_snapshot(object):
 
     def __init__(self, volume_id, size, name, desc, id=None):
         if id is None:
-            id = str(uuid.uuid4())
+            id = uuids.fake2
         self.snap = {
             'created_at': timeutils.utcnow(),
             'deleted_at': None,
@@ -110,7 +108,7 @@ class fake_snapshot(object):
         self.snap[key] = value
 
     def __getitem__(self, key):
-        self.snap[key]
+        return self.snap[key]
 
 
 class API(object):
@@ -181,47 +179,32 @@ class API(object):
         self.volume_list = [v for v in self.volume_list
                             if v['id'] != volume_id]
 
-    def check_attach(self, context, volume, instance=None):
-        if volume['status'] != 'available':
-            msg = "status must be available"
-            msg = "%s" % volume
-            raise exception.InvalidVolume(reason=msg)
-        if volume['attach_status'] == 'attached':
-            msg = "already attached"
-            raise exception.InvalidVolume(reason=msg)
+    def check_availability_zone(self, context, volume, instance=None):
         if instance and not CONF.cinder.cross_az_attach:
             if instance['availability_zone'] != volume['availability_zone']:
                 msg = "Instance and volume not in same availability_zone"
                 raise exception.InvalidVolume(reason=msg)
 
-    def check_detach(self, context, volume):
-        if volume['status'] == "available":
-            msg = "already detached"
-            raise exception.InvalidVolume(reason=msg)
-
     def attach(self, context, volume_id, instance_uuid, mountpoint, mode='rw'):
         LOG.info('attaching volume %s', volume_id)
         volume = self.get(context, volume_id)
         volume['status'] = 'in-use'
-        volume['mountpoint'] = mountpoint
         volume['attach_status'] = 'attached'
-        volume['instance_uuid'] = instance_uuid
         volume['attach_time'] = timeutils.utcnow()
-
-    def fake_set_snapshot_id(self, context, volume, snapshot_id):
-        volume['snapshot_id'] = snapshot_id
+        volume['multiattach'] = True
+        volume['attachments'] = {instance_uuid:
+                                 {'attachment_id': uuids.fake3,
+                                  'mountpoint': mountpoint}}
 
     def reset_fake_api(self, context):
         del self.volume_list[:]
         del self.snapshot_list[:]
 
-    def detach(self, context, volume_id):
+    def detach(self, context, volume_id, instance_uuid, attachment_id=None):
         LOG.info('detaching volume %s', volume_id)
         volume = self.get(context, volume_id)
         volume['status'] = 'available'
-        volume['mountpoint'] = None
         volume['attach_status'] = 'detached'
-        volume['instance_uuid'] = None
 
     def initialize_connection(self, context, volume_id, connector):
         return {'driver_volume_type': 'iscsi', 'data': {}}

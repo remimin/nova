@@ -15,46 +15,40 @@
 import contextlib
 import copy
 import datetime
-import hashlib
-import inspect
 import os
 import pprint
 
+import fixtures
 import mock
-from oslo_log import log
-from oslo_serialization import jsonutils
 from oslo_utils import timeutils
+from oslo_versionedobjects import base as ovo_base
+from oslo_versionedobjects import exception as ovo_exc
+from oslo_versionedobjects import fixture
 import six
-from testtools import matchers
 
-from nova.conductor import rpcapi as conductor_rpcapi
 from nova import context
-from nova import exception
 from nova import objects
 from nova.objects import base
 from nova.objects import fields
-from nova import rpc
+from nova.objects import virt_device_metadata
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.unit import fake_notifier
 from nova import utils
 
 
-LOG = log.getLogger(__name__)
-
-
 class MyOwnedObject(base.NovaPersistentObject, base.NovaObject):
     VERSION = '1.0'
-    fields = {'baz': fields.Field(fields.Integer())}
+    fields = {'baz': fields.IntegerField()}
 
 
 class MyObj(base.NovaPersistentObject, base.NovaObject,
             base.NovaObjectDictCompat):
     VERSION = '1.6'
-    fields = {'foo': fields.Field(fields.Integer(), default=1),
-              'bar': fields.Field(fields.String()),
-              'missing': fields.Field(fields.String()),
-              'readonly': fields.Field(fields.Integer(), read_only=True),
+    fields = {'foo': fields.IntegerField(default=1),
+              'bar': fields.StringField(),
+              'missing': fields.StringField(),
+              'readonly': fields.IntegerField(read_only=True),
               'rel_object': fields.ObjectField('MyOwnedObject', nullable=True),
               'rel_objects': fields.ListOfObjectsField('MyOwnedObject',
                                                        nullable=True),
@@ -113,101 +107,20 @@ class MyObj(base.NovaPersistentObject, base.NovaObject,
             primitive['bar'] = 'old%s' % primitive['bar']
 
 
-class MyObjDiffVers(MyObj):
-    VERSION = '1.5'
-
-    @classmethod
-    def obj_name(cls):
-        return 'MyObj'
-
-
-class MyObj2(object):
-    @classmethod
-    def obj_name(cls):
-        return 'MyObj'
-
-    @base.remotable_classmethod
-    def query(cls, *args, **kwargs):
-        pass
-
-
 class RandomMixInWithNoFields(object):
     """Used to test object inheritance using a mixin that has no fields."""
     pass
 
 
-class TestSubclassedObject(RandomMixInWithNoFields, MyObj):
-    fields = {'new_field': fields.Field(fields.String())}
-
-
-class TestMetaclass(test.NoDBTestCase):
-    def test_obj_tracking(self):
-
-        @six.add_metaclass(base.NovaObjectMetaclass)
-        class NewBaseClass(object):
-            VERSION = '1.0'
-            fields = {}
-
-            @classmethod
-            def obj_name(cls):
-                return cls.__name__
-
-        class Fake1TestObj1(NewBaseClass):
-            @classmethod
-            def obj_name(cls):
-                return 'fake1'
-
-        class Fake1TestObj2(Fake1TestObj1):
-            pass
-
-        class Fake1TestObj3(Fake1TestObj1):
-            VERSION = '1.1'
-
-        class Fake2TestObj1(NewBaseClass):
-            @classmethod
-            def obj_name(cls):
-                return 'fake2'
-
-        class Fake1TestObj4(Fake1TestObj3):
-            VERSION = '1.2'
-
-        class Fake2TestObj2(Fake2TestObj1):
-            VERSION = '1.1'
-
-        class Fake1TestObj5(Fake1TestObj1):
-            VERSION = '1.1'
-
-        # Newest versions first in the list. Duplicate versions take the
-        # newest object.
-        expected = {'fake1': [Fake1TestObj4, Fake1TestObj5, Fake1TestObj2],
-                    'fake2': [Fake2TestObj2, Fake2TestObj1]}
-        self.assertEqual(expected, NewBaseClass._obj_classes)
-        # The following should work, also.
-        self.assertEqual(expected, Fake1TestObj1._obj_classes)
-        self.assertEqual(expected, Fake1TestObj2._obj_classes)
-        self.assertEqual(expected, Fake1TestObj3._obj_classes)
-        self.assertEqual(expected, Fake1TestObj4._obj_classes)
-        self.assertEqual(expected, Fake1TestObj5._obj_classes)
-        self.assertEqual(expected, Fake2TestObj1._obj_classes)
-        self.assertEqual(expected, Fake2TestObj2._obj_classes)
-
-    def test_field_checking(self):
-        def create_class(field):
-            class TestField(base.NovaObject):
-                VERSION = '1.5'
-                fields = {'foo': field()}
-            return TestField
-
-        create_class(fields.IPV4AndV6AddressField)
-        self.assertRaises(exception.ObjectFieldInvalid,
-                          create_class, fields.IPV4AndV6Address)
-        self.assertRaises(exception.ObjectFieldInvalid,
-                          create_class, int)
+@base.NovaObjectRegistry.register_if(False)
+class SubclassedObject(RandomMixInWithNoFields, MyObj):
+    fields = {'new_field': fields.StringField()}
 
 
 class TestObjToPrimitive(test.NoDBTestCase):
 
     def test_obj_to_primitive_list(self):
+        @base.NovaObjectRegistry.register_if(False)
         class MyObjElement(base.NovaObject):
             fields = {'foo': fields.IntegerField()}
 
@@ -215,6 +128,7 @@ class TestObjToPrimitive(test.NoDBTestCase):
                 super(MyObjElement, self).__init__()
                 self.foo = foo
 
+        @base.NovaObjectRegistry.register_if(False)
         class MyList(base.ObjectListBase, base.NovaObject):
             fields = {'objects': fields.ListOfObjectsField('MyObjElement')}
 
@@ -224,11 +138,14 @@ class TestObjToPrimitive(test.NoDBTestCase):
                          [x['foo'] for x in base.obj_to_primitive(mylist)])
 
     def test_obj_to_primitive_dict(self):
+        base.NovaObjectRegistry.register(MyObj)
         myobj = MyObj(foo=1, bar='foo')
         self.assertEqual({'foo': 1, 'bar': 'foo'},
                          base.obj_to_primitive(myobj))
 
     def test_obj_to_primitive_recursive(self):
+        base.NovaObjectRegistry.register(MyObj)
+
         class MyList(base.ObjectListBase, base.NovaObject):
             fields = {'objects': fields.ListOfObjectsField('MyObj')}
 
@@ -239,6 +156,7 @@ class TestObjToPrimitive(test.NoDBTestCase):
                          base.obj_to_primitive(mylist))
 
     def test_obj_to_primitive_with_ip_addr(self):
+        @base.NovaObjectRegistry.register_if(False)
         class TestObject(base.NovaObject):
             fields = {'addr': fields.IPAddressField(),
                       'cidr': fields.IPNetworkField()}
@@ -246,24 +164,6 @@ class TestObjToPrimitive(test.NoDBTestCase):
         obj = TestObject(addr='1.2.3.4', cidr='1.1.1.1/16')
         self.assertEqual({'addr': '1.2.3.4', 'cidr': '1.1.1.1/16'},
                          base.obj_to_primitive(obj))
-
-
-class TestObjMakeList(test.NoDBTestCase):
-
-    def test_obj_make_list(self):
-        class MyList(base.ObjectListBase, base.NovaObject):
-            pass
-
-        db_objs = [{'foo': 1, 'bar': 'baz', 'missing': 'banana'},
-                   {'foo': 2, 'bar': 'bat', 'missing': 'apple'},
-                   ]
-        mylist = base.obj_make_list('ctxt', MyList(), MyObj, db_objs)
-        self.assertEqual(2, len(mylist))
-        self.assertEqual('ctxt', mylist._context)
-        for index, item in enumerate(mylist):
-            self.assertEqual(db_objs[index]['foo'], item.foo)
-            self.assertEqual(db_objs[index]['bar'], item.bar)
-            self.assertEqual(db_objs[index]['missing'], item.missing)
 
 
 def compare_obj(test, obj, db_obj, subs=None, allow_missing=None,
@@ -307,22 +207,21 @@ def compare_obj(test, obj, db_obj, subs=None, allow_missing=None,
 class _BaseTestCase(test.TestCase):
     def setUp(self):
         super(_BaseTestCase, self).setUp()
-        self.remote_object_calls = list()
         self.user_id = 'fake-user'
         self.project_id = 'fake-project'
         self.context = context.RequestContext(self.user_id, self.project_id)
-        fake_notifier.stub_notifier(self.stubs)
+        fake_notifier.stub_notifier(self)
         self.addCleanup(fake_notifier.reset)
+
+        # NOTE(danms): register these here instead of at import time
+        # so that they're not always present
+        base.NovaObjectRegistry.register(MyObj)
+        base.NovaObjectRegistry.register(MyOwnedObject)
 
     def compare_obj(self, obj, db_obj, subs=None, allow_missing=None,
                     comparators=None):
         compare_obj(self, obj, db_obj, subs=subs, allow_missing=allow_missing,
                     comparators=comparators)
-
-    def json_comparator(self, expected, obj_val):
-        # json-ify an object field for comparison with its db str
-        # equivalent
-        self.assertEqual(expected, jsonutils.dumps(obj_val))
 
     def str_comparator(self, expected, obj_val):
         """Compare an object field to a string in the db by performing
@@ -330,26 +229,12 @@ class _BaseTestCase(test.TestCase):
         """
         self.assertEqual(expected, str(obj_val))
 
-    def assertNotIsInstance(self, obj, cls, msg=None):
-        """Python < v2.7 compatibility.  Assert 'not isinstance(obj, cls)."""
-        try:
-            f = super(_BaseTestCase, self).assertNotIsInstance
-        except AttributeError:
-            self.assertThat(obj,
-                            matchers.Not(matchers.IsInstance(cls)),
-                            message=msg or '')
-        else:
-            f(obj, cls, msg=msg)
-
 
 class _LocalTest(_BaseTestCase):
     def setUp(self):
         super(_LocalTest, self).setUp()
         # Just in case
         self.useFixture(nova_fixtures.IndirectionAPIFixture(None))
-
-    def assertRemotes(self):
-        self.assertEqual(self.remote_object_calls, [])
 
 
 @contextlib.contextmanager
@@ -362,54 +247,79 @@ def things_temporarily_local():
     base.NovaObject.indirection_api = _api
 
 
+# FIXME(danms): We shouldn't be overriding any of this, but need to
+# for the moment because of the mocks in the base fixture that don't
+# hit our registry subclass.
+class FakeIndirectionHack(fixture.FakeIndirectionAPI):
+    def object_action(self, context, objinst, objmethod, args, kwargs):
+        objinst = self._ser.deserialize_entity(
+            context, self._ser.serialize_entity(
+                context, objinst))
+        objmethod = six.text_type(objmethod)
+        args = self._ser.deserialize_entity(
+            None, self._ser.serialize_entity(None, args))
+        kwargs = self._ser.deserialize_entity(
+            None, self._ser.serialize_entity(None, kwargs))
+        original = objinst.obj_clone()
+        with mock.patch('nova.objects.base.NovaObject.'
+                        'indirection_api', new=None):
+            result = getattr(objinst, objmethod)(*args, **kwargs)
+        updates = self._get_changes(original, objinst)
+        updates['obj_what_changed'] = objinst.obj_what_changed()
+        return updates, result
+
+    def object_class_action(self, context, objname, objmethod, objver,
+                            args, kwargs):
+        objname = six.text_type(objname)
+        objmethod = six.text_type(objmethod)
+        objver = six.text_type(objver)
+        args = self._ser.deserialize_entity(
+            None, self._ser.serialize_entity(None, args))
+        kwargs = self._ser.deserialize_entity(
+            None, self._ser.serialize_entity(None, kwargs))
+        cls = base.NovaObject.obj_class_from_name(objname, objver)
+        with mock.patch('nova.objects.base.NovaObject.'
+                        'indirection_api', new=None):
+            result = getattr(cls, objmethod)(context, *args, **kwargs)
+        manifest = ovo_base.obj_tree_get_versions(objname)
+        return (base.NovaObject.obj_from_primitive(
+            result.obj_to_primitive(target_version=objver,
+                                    version_manifest=manifest),
+            context=context)
+            if isinstance(result, base.NovaObject) else result)
+
+    def object_class_action_versions(self, context, objname, objmethod,
+                                     object_versions, args, kwargs):
+        objname = six.text_type(objname)
+        objmethod = six.text_type(objmethod)
+        object_versions = {six.text_type(o): six.text_type(v)
+                           for o, v in object_versions.items()}
+        args, kwargs = self._canonicalize_args(context, args, kwargs)
+        objver = object_versions[objname]
+        cls = base.NovaObject.obj_class_from_name(objname, objver)
+        with mock.patch('nova.objects.base.NovaObject.'
+                        'indirection_api', new=None):
+            result = getattr(cls, objmethod)(context, *args, **kwargs)
+        return (base.NovaObject.obj_from_primitive(
+            result.obj_to_primitive(target_version=objver),
+            context=context)
+            if isinstance(result, base.NovaObject) else result)
+
+
+class IndirectionFixture(fixtures.Fixture):
+    def setUp(self):
+        super(IndirectionFixture, self).setUp()
+        ser = base.NovaObjectSerializer()
+        self.indirection_api = FakeIndirectionHack(serializer=ser)
+        self.useFixture(fixtures.MonkeyPatch(
+            'nova.objects.base.NovaObject.indirection_api',
+            self.indirection_api))
+
+
 class _RemoteTest(_BaseTestCase):
-    def _testable_conductor(self):
-        self.conductor_service = self.start_service(
-            'conductor', manager='nova.conductor.manager.ConductorManager')
-        self.remote_object_calls = list()
-
-        orig_object_class_action = \
-            self.conductor_service.manager.object_class_action
-        orig_object_action = \
-            self.conductor_service.manager.object_action
-
-        def fake_object_class_action(*args, **kwargs):
-            self.remote_object_calls.append((kwargs.get('objname'),
-                                             kwargs.get('objmethod')))
-            with things_temporarily_local():
-                result = orig_object_class_action(*args, **kwargs)
-            return (base.NovaObject.obj_from_primitive(result, context=args[0])
-                    if isinstance(result, base.NovaObject) else result)
-        self.stubs.Set(self.conductor_service.manager, 'object_class_action',
-                       fake_object_class_action)
-
-        def fake_object_action(*args, **kwargs):
-            self.remote_object_calls.append((kwargs.get('objinst'),
-                                             kwargs.get('objmethod')))
-            with things_temporarily_local():
-                result = orig_object_action(*args, **kwargs)
-            return result
-        self.stubs.Set(self.conductor_service.manager, 'object_action',
-                       fake_object_action)
-
-        # Things are remoted by default in this session
-        self.useFixture(nova_fixtures.IndirectionAPIFixture(
-                            conductor_rpcapi.ConductorAPI()))
-
-        # To make sure local and remote contexts match
-        self.stubs.Set(rpc.RequestContextSerializer,
-                       'serialize_context',
-                       lambda s, c: c)
-        self.stubs.Set(rpc.RequestContextSerializer,
-                       'deserialize_context',
-                       lambda s, c: c)
-
     def setUp(self):
         super(_RemoteTest, self).setUp()
-        self._testable_conductor()
-
-    def assertRemotes(self):
-        self.assertNotEqual(self.remote_object_calls, [])
+        self.useFixture(IndirectionFixture())
 
 
 class _TestObject(object):
@@ -458,7 +368,7 @@ class _TestObject(object):
                      'nova_object.namespace': 'foo',
                      'nova_object.version': '1.5',
                      'nova_object.data': {'foo': 1}}
-        self.assertRaises(exception.UnsupportedObjectError,
+        self.assertRaises(ovo_exc.UnsupportedObjectError,
                           MyObj.obj_from_primitive, primitive)
 
     def test_hydration_additional_unexpected_stuff(self):
@@ -498,21 +408,14 @@ class _TestObject(object):
             obj.foo = 'a'
         self.assertRaises(ValueError, fail)
 
-    def test_object_dict_syntax(self):
-        obj = MyObj(foo=123, bar='bar')
-        self.assertEqual(obj['foo'], 123)
-        self.assertEqual(sorted(obj.items(), key=lambda x: x[0]),
-                         [('bar', 'bar'), ('foo', 123)])
-        self.assertEqual(sorted(list(obj.iteritems()), key=lambda x: x[0]),
-                         [('bar', 'bar'), ('foo', 123)])
-
     def test_load(self):
         obj = MyObj()
         self.assertEqual(obj.bar, 'loaded!')
 
     def test_load_in_base(self):
+        @base.NovaObjectRegistry.register_if(False)
         class Foo(base.NovaObject):
-            fields = {'foobar': fields.Field(fields.Integer())}
+            fields = {'foobar': fields.IntegerField()}
         obj = Foo()
         with self.assertRaisesRegex(NotImplementedError, ".*foobar.*"):
             obj.foobar
@@ -539,34 +442,11 @@ class _TestObject(object):
         obj2.obj_reset_changes()
         self.assertEqual(obj2.obj_what_changed(), set())
 
-    def test_obj_class_from_name(self):
-        obj = base.NovaObject.obj_class_from_name('MyObj', '1.5')
-        self.assertEqual('1.5', obj.VERSION)
-
-    def test_obj_class_from_name_latest_compatible(self):
-        obj = base.NovaObject.obj_class_from_name('MyObj', '1.1')
-        self.assertEqual('1.6', obj.VERSION)
-
-    def test_unknown_objtype(self):
-        self.assertRaises(exception.UnsupportedObjectError,
-                          base.NovaObject.obj_class_from_name, 'foo', '1.0')
-
-    def test_obj_class_from_name_supported_version(self):
-        error = None
-        try:
-            base.NovaObject.obj_class_from_name('MyObj', '1.25')
-        except exception.IncompatibleObjectVersion as error:
-            pass
-
-        self.assertIsNotNone(error)
-        self.assertEqual('1.6', error.kwargs['supported'])
-
     def test_orphaned_object(self):
         obj = MyObj.query(self.context)
         obj._context = None
-        self.assertRaises(exception.OrphanedObjectError,
+        self.assertRaises(ovo_exc.OrphanedObjectError,
                           obj._update_test)
-        self.assertRemotes()
 
     def test_changed_1(self):
         obj = MyObj.query(self.context)
@@ -575,7 +455,6 @@ class _TestObject(object):
         obj._update_test()
         self.assertEqual(obj.obj_what_changed(), set(['foo', 'bar']))
         self.assertEqual(obj.foo, 123)
-        self.assertRemotes()
 
     def test_changed_2(self):
         obj = MyObj.query(self.context)
@@ -584,7 +463,6 @@ class _TestObject(object):
         obj.save()
         self.assertEqual(obj.obj_what_changed(), set([]))
         self.assertEqual(obj.foo, 123)
-        self.assertRemotes()
 
     def test_changed_3(self):
         obj = MyObj.query(self.context)
@@ -594,7 +472,6 @@ class _TestObject(object):
         self.assertEqual(obj.obj_what_changed(), set([]))
         self.assertEqual(obj.foo, 321)
         self.assertEqual(obj.bar, 'refreshed')
-        self.assertRemotes()
 
     def test_changed_4(self):
         obj = MyObj.query(self.context)
@@ -605,9 +482,9 @@ class _TestObject(object):
         self.assertEqual(obj.foo, 42)
         self.assertEqual(obj.bar, 'meow')
         self.assertIsInstance(obj.rel_object, MyOwnedObject)
-        self.assertRemotes()
 
     def test_changed_with_sub_object(self):
+        @base.NovaObjectRegistry.register_if(False)
         class ParentObject(base.NovaObject):
             fields = {'foo': fields.IntegerField(),
                       'bar': fields.ObjectField('MyObj'),
@@ -629,14 +506,12 @@ class _TestObject(object):
         self.assertEqual(obj.bar, 'bar')
         result = obj.marco()
         self.assertEqual(result, 'polo')
-        self.assertRemotes()
 
     def test_updates(self):
         obj = MyObj.query(self.context)
         self.assertEqual(obj.foo, 1)
         obj._update_test()
         self.assertEqual(obj.bar, 'updated')
-        self.assertRemotes()
 
     def test_base_attributes(self):
         dt = datetime.datetime(1955, 11, 5)
@@ -648,13 +523,14 @@ class _TestObject(object):
                     'nova_object.changes':
                         ['deleted', 'created_at', 'deleted_at', 'updated_at'],
                     'nova_object.data':
-                        {'created_at': timeutils.isotime(dt),
-                         'updated_at': timeutils.isotime(dt),
+                        {'created_at': utils.isotime(dt),
+                         'updated_at': utils.isotime(dt),
                          'deleted_at': None,
                          'deleted': False,
                          }
                     }
-        self.assertEqual(obj.obj_to_primitive(), expected)
+        actual = obj.obj_to_primitive()
+        self.assertJsonEqual(actual, expected)
 
     def test_contains(self):
         obj = MyObj()
@@ -668,23 +544,6 @@ class _TestObject(object):
         self.assertTrue(obj.obj_attr_is_set('foo'))
         self.assertFalse(obj.obj_attr_is_set('bar'))
         self.assertRaises(AttributeError, obj.obj_attr_is_set, 'bang')
-
-    def test_obj_reset_changes_recursive(self):
-        obj = MyObj(rel_object=MyOwnedObject(baz=123),
-                    rel_objects=[MyOwnedObject(baz=456)])
-        self.assertEqual(set(['rel_object', 'rel_objects']),
-                         obj.obj_what_changed())
-        obj.obj_reset_changes()
-        self.assertEqual(set(['rel_object']), obj.obj_what_changed())
-        self.assertEqual(set(['baz']), obj.rel_object.obj_what_changed())
-        self.assertEqual(set(['baz']), obj.rel_objects[0].obj_what_changed())
-        obj.obj_reset_changes(recursive=True, fields=['foo'])
-        self.assertEqual(set(['rel_object']), obj.obj_what_changed())
-        self.assertEqual(set(['baz']), obj.rel_object.obj_what_changed())
-        self.assertEqual(set(['baz']), obj.rel_objects[0].obj_what_changed())
-        obj.obj_reset_changes(recursive=True)
-        self.assertEqual(set([]), obj.rel_object.obj_what_changed())
-        self.assertEqual(set([]), obj.obj_what_changed())
 
     def test_get(self):
         obj = MyObj(foo=1)
@@ -708,36 +567,15 @@ class _TestObject(object):
         myobj_fields = (['foo', 'bar', 'missing',
                          'readonly', 'rel_object',
                          'rel_objects', 'mutable_default'] +
-                        base_fields)
+                        list(base_fields))
         myobj3_fields = ['new_field']
-        self.assertTrue(issubclass(TestSubclassedObject, MyObj))
+        self.assertTrue(issubclass(SubclassedObject, MyObj))
         self.assertEqual(len(myobj_fields), len(MyObj.fields))
         self.assertEqual(set(myobj_fields), set(MyObj.fields.keys()))
         self.assertEqual(len(myobj_fields) + len(myobj3_fields),
-                         len(TestSubclassedObject.fields))
+                         len(SubclassedObject.fields))
         self.assertEqual(set(myobj_fields) | set(myobj3_fields),
-                         set(TestSubclassedObject.fields.keys()))
-
-    def test_obj_as_admin(self):
-        obj = MyObj(context=self.context)
-
-        def fake(*args, **kwargs):
-            self.assertTrue(obj._context.is_admin)
-
-        with mock.patch.object(obj, 'obj_reset_changes') as mock_fn:
-            mock_fn.side_effect = fake
-            with obj.obj_as_admin():
-                obj.save()
-            self.assertTrue(mock_fn.called)
-
-        self.assertFalse(obj._context.is_admin)
-
-    def test_obj_as_admin_orphaned(self):
-        def testme():
-            obj = MyObj()
-            with obj.obj_as_admin():
-                pass
-        self.assertRaises(exception.OrphanedObjectError, testme)
+                         set(SubclassedObject.fields.keys()))
 
     def test_obj_alternate_context(self):
         obj = MyObj(context=self.context)
@@ -757,8 +595,9 @@ class _TestObject(object):
         self.assertEqual({}, obj.obj_get_changes())
 
     def test_obj_fields(self):
+        @base.NovaObjectRegistry.register_if(False)
         class TestObj(base.NovaObject):
-            fields = {'foo': fields.Field(fields.Integer())}
+            fields = {'foo': fields.IntegerField()}
             obj_extra_fields = ['bar']
 
             @property
@@ -777,7 +616,7 @@ class _TestObject(object):
     def test_obj_read_only(self):
         obj = MyObj(context=self.context, foo=123, bar='abc')
         obj.readonly = 1
-        self.assertRaises(exception.ReadOnlyFieldError, setattr,
+        self.assertRaises(ovo_exc.ReadOnlyFieldError, setattr,
                           obj, 'readonly', 2)
 
     def test_obj_mutable_default(self):
@@ -828,7 +667,8 @@ class _TestObject(object):
         with mock.patch.object(subobj, 'obj_make_compatible') as mock_compat:
             primitive = copy.deepcopy(orig_primitive)
             obj._obj_make_obj_compatible(primitive, '1.7', 'rel_object')
-            self.assertFalse(mock_compat.called)
+            mock_compat.assert_called_once_with(
+                primitive['rel_object']['nova_object.data'], '1.2')
 
         with mock.patch.object(subobj, 'obj_make_compatible') as mock_compat:
             primitive = copy.deepcopy(orig_primitive)
@@ -868,20 +708,18 @@ class _TestObject(object):
             obj.obj_make_compatible({'rel_object': 'foo'}, '1.10')
             self.assertFalse(mock_compat.called)
 
-    def test_obj_make_compatible_complains_about_missing_rules(self):
-        subobj = MyOwnedObject(baz=1)
-        obj = MyObj(foo=123, rel_object=subobj)
-        obj.obj_relationships = {}
-        self.assertRaises(exception.ObjectActionError,
-                          obj.obj_make_compatible, {}, '1.0')
-
     def test_obj_make_compatible_doesnt_skip_falsey_sub_objects(self):
+        @base.NovaObjectRegistry.register_if(False)
         class MyList(base.ObjectListBase, base.NovaObject):
             VERSION = '1.2'
             fields = {'objects': fields.ListOfObjectsField('MyObjElement')}
+            obj_relationships = {
+                'objects': [('1.1', '1.1'), ('1.2', '1.2')],
+            }
 
         mylist = MyList(objects=[])
 
+        @base.NovaObjectRegistry.register_if(False)
         class MyOwner(base.NovaObject):
             VERSION = '1.2'
             fields = {'mylist': fields.ObjectField('MyList')}
@@ -931,7 +769,7 @@ class TestObject(_LocalTest, _TestObject):
 
     def test_set_defaults_no_default(self):
         obj = MyObj()
-        self.assertRaises(exception.ObjectActionError,
+        self.assertRaises(ovo_exc.ObjectActionError,
                           obj.obj_set_defaults, 'bar')
 
     def test_set_all_defaults(self):
@@ -948,140 +786,6 @@ class TestObject(_LocalTest, _TestObject):
         obj.obj_set_defaults()
         self.assertEqual(1, obj.foo)
         self.assertTrue(obj.deleted)
-
-
-class TestRemoteObject(_RemoteTest, _TestObject):
-    def test_major_version_mismatch(self):
-        MyObj2.VERSION = '2.0'
-        self.assertRaises(exception.IncompatibleObjectVersion,
-                          MyObj2.query, self.context)
-
-    def test_minor_version_greater(self):
-        MyObj2.VERSION = '1.7'
-        self.assertRaises(exception.IncompatibleObjectVersion,
-                          MyObj2.query, self.context)
-
-    def test_minor_version_less(self):
-        MyObj2.VERSION = '1.2'
-        obj = MyObj2.query(self.context)
-        self.assertEqual(obj.bar, 'bar')
-        self.assertRemotes()
-
-    def test_compat(self):
-        MyObj2.VERSION = '1.1'
-        obj = MyObj2.query(self.context)
-        self.assertEqual('oldbar', obj.bar)
-
-    def test_revision_ignored(self):
-        MyObj2.VERSION = '1.1.456'
-        obj = MyObj2.query(self.context)
-        self.assertEqual('bar', obj.bar)
-
-
-class TestObjectListBase(test.NoDBTestCase):
-    def test_list_like_operations(self):
-        class MyElement(base.NovaObject):
-            fields = {'foo': fields.IntegerField()}
-
-            def __init__(self, foo):
-                super(MyElement, self).__init__()
-                self.foo = foo
-
-        class Foo(base.ObjectListBase, base.NovaObject):
-            fields = {'objects': fields.ListOfObjectsField('MyElement')}
-
-        objlist = Foo(context='foo',
-                      objects=[MyElement(1), MyElement(2), MyElement(3)])
-        self.assertEqual(list(objlist), objlist.objects)
-        self.assertEqual(len(objlist), 3)
-        self.assertIn(objlist.objects[0], objlist)
-        self.assertEqual(list(objlist[:1]), [objlist.objects[0]])
-        self.assertEqual(objlist[:1]._context, 'foo')
-        self.assertEqual(objlist[2], objlist.objects[2])
-        self.assertEqual(objlist.count(objlist.objects[0]), 1)
-        self.assertEqual(objlist.index(objlist.objects[1]), 1)
-        objlist.sort(key=lambda x: x.foo, reverse=True)
-        self.assertEqual([3, 2, 1],
-                         [x.foo for x in objlist])
-
-    def test_serialization(self):
-        class Foo(base.ObjectListBase, base.NovaObject):
-            fields = {'objects': fields.ListOfObjectsField('Bar')}
-
-        class Bar(base.NovaObject):
-            fields = {'foo': fields.Field(fields.String())}
-
-        obj = Foo(objects=[])
-        for i in 'abc':
-            bar = Bar(foo=i)
-            obj.objects.append(bar)
-
-        obj2 = base.NovaObject.obj_from_primitive(obj.obj_to_primitive())
-        self.assertFalse(obj is obj2)
-        self.assertEqual([x.foo for x in obj],
-                         [y.foo for y in obj2])
-
-    def _test_object_list_version_mappings(self, list_obj_class):
-        # Figure out what sort of object this list is for
-        list_field = list_obj_class.fields['objects']
-        item_obj_field = list_field._type._element_type
-        item_obj_name = item_obj_field._type._obj_name
-
-        # Look through all object classes of this type and make sure that
-        # the versions we find are covered by the parent list class
-        for item_class in base.NovaObject._obj_classes[item_obj_name]:
-            self.assertIn(
-                item_class.VERSION,
-                list_obj_class.child_versions.values(),
-                'Version mapping is incomplete for %s' % (
-                    list_obj_class.__name__))
-
-    def test_object_version_mappings(self):
-        # Find all object list classes and make sure that they at least handle
-        # all the current object versions
-        for obj_classes in base.NovaObject._obj_classes.values():
-            for obj_class in obj_classes:
-                if issubclass(obj_class, base.ObjectListBase):
-                    self._test_object_list_version_mappings(obj_class)
-
-    def test_list_changes(self):
-        class Foo(base.ObjectListBase, base.NovaObject):
-            fields = {'objects': fields.ListOfObjectsField('Bar')}
-
-        class Bar(base.NovaObject):
-            fields = {'foo': fields.StringField()}
-
-        obj = Foo(objects=[])
-        self.assertEqual(set(['objects']), obj.obj_what_changed())
-        obj.objects.append(Bar(foo='test'))
-        self.assertEqual(set(['objects']), obj.obj_what_changed())
-        obj.obj_reset_changes()
-        # This should still look dirty because the child is dirty
-        self.assertEqual(set(['objects']), obj.obj_what_changed())
-        obj.objects[0].obj_reset_changes()
-        # This should now look clean because the child is clean
-        self.assertEqual(set(), obj.obj_what_changed())
-
-    def test_initialize_objects(self):
-        class Foo(base.ObjectListBase, base.NovaObject):
-            fields = {'objects': fields.ListOfObjectsField('Bar')}
-
-        class Bar(base.NovaObject):
-            fields = {'foo': fields.StringField()}
-
-        obj = Foo()
-        self.assertEqual([], obj.objects)
-        self.assertEqual(set(), obj.obj_what_changed())
-
-    def test_obj_repr(self):
-        class Foo(base.ObjectListBase, base.NovaObject):
-            fields = {'objects': fields.ListOfObjectsField('Bar')}
-
-        class Bar(base.NovaObject):
-            fields = {'uuid': fields.StringField()}
-
-        obj = Foo(objects=[Bar(uuid='fake-uuid')])
-        self.assertEqual('Foo(objects=[Bar(fake-uuid)])', repr(obj))
 
 
 class TestObjectSerializer(_BaseTestCase):
@@ -1103,22 +807,24 @@ class TestObjectSerializer(_BaseTestCase):
                                        my_version='1.6'):
         ser = base.NovaObjectSerializer()
         ser._conductor = mock.Mock()
-        ser._conductor.object_backport.return_value = 'backported'
+        ser._conductor.object_backport_versions.return_value = 'backported'
 
         class MyTestObj(MyObj):
             VERSION = my_version
+
+        base.NovaObjectRegistry.register(MyTestObj)
 
         obj = MyTestObj()
         obj.VERSION = obj_version
         primitive = obj.obj_to_primitive()
         result = ser.deserialize_entity(self.context, primitive)
         if backported_to is None:
-            self.assertFalse(ser._conductor.object_backport.called)
+            self.assertFalse(ser._conductor.object_backport_versions.called)
         else:
             self.assertEqual('backported', result)
-            ser._conductor.object_backport.assert_called_with(self.context,
-                                                              primitive,
-                                                              backported_to)
+            versions = ovo_base.obj_tree_get_versions('MyTestObj')
+            ser._conductor.object_backport_versions.assert_called_with(
+                self.context, primitive, versions)
 
     def test_deserialize_entity_newer_version_backports(self):
         self._test_deserialize_entity_newer('1.25', '1.6')
@@ -1150,6 +856,78 @@ class TestObjectSerializer(_BaseTestCase):
         # .0 of the object.
         self.assertEqual('1.6', obj.VERSION)
 
+    @mock.patch('oslo_versionedobjects.base.obj_tree_get_versions')
+    def test_object_tree_backport(self, mock_get_versions):
+        # Test the full client backport path all the way from the serializer
+        # to the conductor and back.
+        self.start_service('conductor',
+                           manager='nova.conductor.manager.ConductorManager')
+
+        # NOTE(danms): Actually register a complex set of objects,
+        # two versions of the same parent object which contain a
+        # child sub object.
+        @base.NovaObjectRegistry.register
+        class Child(base.NovaObject):
+            VERSION = '1.10'
+
+        @base.NovaObjectRegistry.register
+        class Parent(base.NovaObject):
+            VERSION = '1.0'
+
+            fields = {
+                'child': fields.ObjectField('Child'),
+            }
+
+        @base.NovaObjectRegistry.register  # noqa
+        class Parent(base.NovaObject):
+            VERSION = '1.1'
+
+            fields = {
+                'child': fields.ObjectField('Child'),
+            }
+
+        # NOTE(danms): Since we're on the same node as conductor,
+        # return a fake version manifest so that we confirm that it
+        # actually honors what the client asked for and not just what
+        # it sees in the local machine state.
+        mock_get_versions.return_value = {
+            'Parent': '1.0',
+            'Child': '1.5',
+        }
+        call_context = {}
+        real_ofp = base.NovaObject.obj_from_primitive
+
+        def fake_obj_from_primitive(*a, **k):
+            # NOTE(danms): We need the first call to this to report an
+            # incompatible object version, but subsequent calls must
+            # succeed. Since we're testing the backport path all the
+            # way through conductor and RPC, we can't fully break this
+            # method, we just need it to fail once to trigger the
+            # backport.
+            if 'run' in call_context:
+                return real_ofp(*a, **k)
+            else:
+                call_context['run'] = True
+                raise ovo_exc.IncompatibleObjectVersion('foo')
+
+        child = Child()
+        parent = Parent(child=child)
+        prim = parent.obj_to_primitive()
+        ser = base.NovaObjectSerializer()
+
+        with mock.patch('nova.objects.base.NovaObject.'
+                        'obj_from_primitive') as mock_ofp:
+            mock_ofp.side_effect = fake_obj_from_primitive
+            result = ser.deserialize_entity(self.context, prim)
+
+            # Our newest version (and what we passed back) of Parent
+            # is 1.1, make sure that the manifest version is honored
+            self.assertEqual('1.0', result.VERSION)
+
+            # Our newest version (and what we passed back) of Child
+            # is 1.10, make sure that the manifest version is honored
+            self.assertEqual('1.5', result.child.VERSION)
+
     def test_object_serialization(self):
         ser = base.NovaObjectSerializer()
         obj = MyObj()
@@ -1176,11 +954,11 @@ class TestObjectSerializer(_BaseTestCase):
         thing = {'key': obj}
         primitive = ser.serialize_entity(self.context, thing)
         self.assertEqual(1, len(primitive))
-        for item in primitive.itervalues():
+        for item in six.itervalues(primitive):
             self.assertNotIsInstance(item, base.NovaObject)
         thing2 = ser.deserialize_entity(self.context, primitive)
         self.assertEqual(1, len(thing2))
-        for item in thing2.itervalues():
+        for item in six.itervalues(thing2):
             self.assertIsInstance(item, MyObj)
 
         # object-action updates dict case
@@ -1191,264 +969,348 @@ class TestObjectSerializer(_BaseTestCase):
         self.assertIsInstance(thing2['foo'], base.NovaObject)
 
 
+class TestArgsSerializer(test.NoDBTestCase):
+    def setUp(self):
+        super(TestArgsSerializer, self).setUp()
+        self.now = timeutils.utcnow()
+        self.str_now = utils.strtime(self.now)
+        self.unicode_str = u'\xF0\x9F\x92\xA9'
+
+    @base.serialize_args
+    def _test_serialize_args(self, *args, **kwargs):
+        expected_args = ('untouched', self.str_now, self.str_now)
+        for index, val in enumerate(args):
+            self.assertEqual(expected_args[index], val)
+
+        expected_kwargs = {'a': 'untouched', 'b': self.str_now,
+                           'c': self.str_now, 'exc_val': self.unicode_str}
+        for key, val in kwargs.items():
+            self.assertEqual(expected_kwargs[key], val)
+
+    def test_serialize_args(self):
+        self._test_serialize_args('untouched', self.now, self.now,
+                                  a='untouched', b=self.now, c=self.now,
+                                  exc_val=self.unicode_str)
+
+
+class TestRegistry(test.NoDBTestCase):
+    @mock.patch('nova.objects.base.objects')
+    def test_hook_chooses_newer_properly(self, mock_objects):
+        reg = base.NovaObjectRegistry()
+        reg.registration_hook(MyObj, 0)
+
+        class MyNewerObj(object):
+            VERSION = '1.123'
+
+            @classmethod
+            def obj_name(cls):
+                return 'MyObj'
+
+        self.assertEqual(MyObj, mock_objects.MyObj)
+        reg.registration_hook(MyNewerObj, 0)
+        self.assertEqual(MyNewerObj, mock_objects.MyObj)
+
+    @mock.patch('nova.objects.base.objects')
+    def test_hook_keeps_newer_properly(self, mock_objects):
+        reg = base.NovaObjectRegistry()
+        reg.registration_hook(MyObj, 0)
+
+        class MyOlderObj(object):
+            VERSION = '1.1'
+
+            @classmethod
+            def obj_name(cls):
+                return 'MyObj'
+
+        self.assertEqual(MyObj, mock_objects.MyObj)
+        reg.registration_hook(MyOlderObj, 0)
+        self.assertEqual(MyObj, mock_objects.MyObj)
+
+
 # NOTE(danms): The hashes in this list should only be changed if
 # they come with a corresponding version bump in the affected
 # objects
 object_data = {
-    'Agent': '1.0-cf1b002f0e50f5333e0f33588f6c2d57',
-    'AgentList': '1.0-31f07426a729311a42ff7f6246e76e25',
-    'Aggregate': '1.1-7b3f04af5342ba544955d01c9c954fa5',
-    'AggregateList': '1.2-4b02a285b8612bfb86a96ff80052fb0a',
-    'BandwidthUsage': '1.2-e7d3b3a5c3950cc67c99bc26a1075a70',
-    'BandwidthUsageList': '1.2-5b564cbfd5ae6e106443c086938e7602',
-    'BlockDeviceMapping': '1.8-c87e9c7e5cfd6a402f32727aa74aca95',
-    'BlockDeviceMappingList': '1.9-0faaeebdca213010c791bc37a22546e3',
-    'CellMapping': '1.0-4b1616970814c3c819e10c7ef6b9c3d5',
-    'ComputeNode': '1.10-5f8cd6948ad98fcc0c39b79d49acc4b6',
-    'ComputeNodeList': '1.10-4ae1f844c247029fbcdb5fdccbe9e619',
-    'DNSDomain': '1.0-5bdc288d7c3b723ce86ede998fd5c9ba',
-    'DNSDomainList': '1.0-cfb3e7e82be661501c31099523154db4',
-    'EC2InstanceMapping': '1.0-e9c3257badcc3aa14089b0a62f163108',
-    'EC2SnapshotMapping': '1.0-a545acd0d1519d4316b9b00f30e59b4d',
-    'EC2VolumeMapping': '1.0-15710aa212b5cbfdb155fdc81cce4ede',
-    'FixedIP': '1.9-4e8060f91f6c94ae73d557708ec62f56',
-    'FixedIPList': '1.9-68ade91cf8d97053c1ef401d87eb6ecd',
-    'Flavor': '1.1-01ed47361fbe76bf728edf667d3f45d3',
-    'FlavorList': '1.1-a3d5551267cb8f62ff38ded125900721',
-    'FloatingIP': '1.6-24c614d2c3d4887254a679be65c11de5',
-    'FloatingIPList': '1.7-f376f63ed99243f9d90841b7f6732bbf',
-    'HVSpec': '1.0-c4d8377cc4fe519930e60c1d8265a142',
-    'Instance': '1.19-3e1d995b0fc1d109568bf6cf95abb0eb',
-    'InstanceAction': '1.1-866fb0235d45ab51cc299b8726303d9c',
-    'InstanceActionEvent': '1.1-538698f30974064543134784c5da6056',
-    'InstanceActionEventList': '1.0-1d5cc958171d6ce07383c2ad6208318e',
-    'InstanceActionList': '1.0-368410fdb8d69ae20c495308535d6266',
-    'InstanceExternalEvent': '1.0-f1134523654407a875fd59b80f759ee7',
-    'InstanceFault': '1.2-090c74b3833c715845ec2cf24a686aaf',
-    'InstanceFaultList': '1.1-aeb598ffd0cd6aa61fca7adf0f5e900d',
-    'InstanceGroup': '1.9-a77a59735d62790dcaa413a21acfaa73',
-    'InstanceGroupList': '1.6-c6b78f3c9d9080d33c08667e80589817',
-    'InstanceInfoCache': '1.5-ef7394dae46cff2dd560324555cb85cf',
-    'InstanceList': '1.16-8594a8f95e717e57ee57b4aba59c688e',
-    'InstanceMapping': '1.0-d7cfc251f16c93df612af2b9de59e5b7',
-    'InstanceMappingList': '1.0-3523d501c591640b483c5c1971ef9fd0',
-    'InstanceNUMACell': '1.2-5d2dfa36e9ecca9b63f24bf3bc958ea4',
-    'InstanceNUMATopology': '1.1-b6fab68a3f0f1dfab4c98a236d29839a',
-    'InstancePCIRequest': '1.1-e082d174f4643e5756ba098c47c1510f',
-    'InstancePCIRequests': '1.1-4825b599f000538991fdc9972a92c2c6',
-    'KeyPair': '1.3-2d7c9ccade5532f7cd185110a9367e6a',
-    'KeyPairList': '1.2-1f84680a0a533374db8a9fac7bd7bbc7',
-    'Migration': '1.1-dc2db9e6e625bd3444a5a114438b298d',
-    'MigrationList': '1.1-8c5f678edc72a592d591a13b35e54353',
-    'MyObj': '1.6-fce707f79d6fee00f0ebbac98816a380',
-    'MyOwnedObject': '1.0-0f3d6c028543d7f3715d121db5b8e298',
-    'NUMACell': '1.2-cb9c3b08cc1c418d021492f788d04173',
-    'NUMAPagesTopology': '1.0-97d93f70a68625b5f29ff63a40a4f612',
-    'NUMATopology': '1.2-790f6bdff85bf6e5677f409f3a4f1c6a',
-    'NUMATopologyLimits': '1.0-201845851897940c0a300e3d14ebf04a',
-    'Network': '1.2-141c797b794a4f8dbe251f929dc15268',
-    'NetworkList': '1.2-aa4ad23f035b97a41732ea8b3445fc5e',
-    'NetworkRequest': '1.1-f31192f5a725017707f989585e12d7dc',
-    'NetworkRequestList': '1.1-beeab521ac9450f1f5ef4eaa945a783c',
-    'PciDevice': '1.3-6d37f795ee934e7db75b5a6a1926def0',
-    'PciDeviceList': '1.1-38cbe2d3c23b9e46f7a74b486abcad85',
-    'PciDevicePool': '1.0-d6ed1abe611c9947345a44155abe6f11',
-    'PciDevicePoolList': '1.0-d31e08e0ff620a4df7cc2014b6c50da8',
-    'Quotas': '1.2-615ed622082c92d938119fd49e6d84ee',
-    'QuotasNoOp': '1.2-164c628906b170fd946a7672e85e4935',
-    'S3ImageMapping': '1.0-56d23342db8131d826797c7229dc4050',
-    'SecurityGroup': '1.1-cd2f3c063640723b584634fa1075be77',
-    'SecurityGroupList': '1.0-528e6448adfeeb78921ebeda499ab72f',
-    'SecurityGroupRule': '1.1-38290b6f9a35e416c2bcab5f18708967',
-    'SecurityGroupRuleList': '1.1-667fca3a9928f23d2d10e61962c55f3c',
-    'Service': '1.11-1a34a387914f90aacc33c8c43d45d0b3',
-    'ServiceList': '1.9-54656820acc49b3cc0eb57b2a684b84a',
-    'Tag': '1.0-521693d0515aa031dff2b8ae3f86c8e0',
-    'TagList': '1.0-e89bf8c8055f1f1d654fb44f0abf1f53',
-    'TestSubclassedObject': '1.6-d0f7f126f87433003c4d2ced202d6c86',
-    'VirtCPUFeature': '1.0-3cac8c77d84a632ba79da01a4b87afb9',
-    'VirtCPUModel': '1.0-ae051080026849eddf7179e353673756',
+    'Agent': '1.0-c0c092abaceb6f51efe5d82175f15eba',
+    'AgentList': '1.0-5a7380d02c3aaf2a32fc8115ae7ca98c',
+    'Aggregate': '1.3-f315cb68906307ca2d1cca84d4753585',
+    'AggregateList': '1.3-3ea55a050354e72ef3306adefa553957',
+    'BandwidthUsage': '1.2-c6e4c779c7f40f2407e3d70022e3cd1c',
+    'BandwidthUsageList': '1.2-5fe7475ada6fe62413cbfcc06ec70746',
+    'BlockDeviceMapping': '1.20-45a6ad666ddf14bbbedece2293af77e2',
+    'BlockDeviceMappingList': '1.17-1e568eecb91d06d4112db9fd656de235',
+    'BuildRequest': '1.3-077dee42bed93f8a5b62be77657b7152',
+    'BuildRequestList': '1.0-cd95608eccb89fbc702c8b52f38ec738',
+    'CellMapping': '1.1-5d652928000a5bc369d79d5bde7e497d',
+    'CellMappingList': '1.1-496ef79bb2ab41041fff8bcb57996352',
+    'ComputeNode': '1.19-af6bd29a6c3b225da436a0d8487096f2',
+    'ComputeNodeList': '1.17-52f3b0962b1c86b98590144463ebb192',
+    'ConsoleAuthToken': '1.0-a61bf7b54517c4013a12289c5a5268ea',
+    'CpuDiagnostics': '1.0-d256f2e442d1b837735fd17dfe8e3d47',
+    'DNSDomain': '1.0-7b0b2dab778454b6a7b6c66afe163a1a',
+    'DNSDomainList': '1.0-4ee0d9efdfd681fed822da88376e04d2',
+    'Destination': '1.2-74854e8cfe7fe616294d93a5d189d885',
+    'DeviceBus': '1.0-77509ea1ea0dd750d5864b9bd87d3f9d',
+    'DeviceMetadata': '1.0-04eb8fd218a49cbc3b1e54b774d179f7',
+    'Diagnostics': '1.0-38ad3e9b1a59306253fc03f97936db95',
+    'DiskDiagnostics': '1.0-dfd0892b5924af1a585f3fed8c9899ca',
+    'DiskMetadata': '1.0-e7a0f1ccccf10d26a76b28e7492f3788',
+    'EC2Ids': '1.0-474ee1094c7ec16f8ce657595d8c49d9',
+    'EC2InstanceMapping': '1.0-a4556eb5c5e94c045fe84f49cf71644f',
+    'EC2SnapshotMapping': '1.0-47e7ddabe1af966dce0cfd0ed6cd7cd1',
+    'EC2VolumeMapping': '1.0-5b713751d6f97bad620f3378a521020d',
+    'FixedIP': '1.14-53e1c10b539f1a82fe83b1af4720efae',
+    'FixedIPList': '1.15-07b6261cef836cb09d2d8673f68ece15',
+    'Flavor': '1.2-4ce99b41327bb230262e5a8f45ff0ce3',
+    'FlavorList': '1.1-52b5928600e7ca973aa4fc1e46f3934c',
+    'FloatingIP': '1.10-52a67d52d85eb8b3f324a5b7935a335b',
+    'FloatingIPList': '1.12-e4debd21fddb12cf40d36f737225fa9d',
+    'HVSpec': '1.2-de06bcec472a2f04966b855a49c46b41',
+    'HostMapping': '1.0-1a3390a696792a552ab7bd31a77ba9ac',
+    'HostMappingList': '1.1-18ac2bfb8c1eb5545bed856da58a79bc',
+    'HyperVLiveMigrateData': '1.4-e265780e6acfa631476c8170e8d6fce0',
+    'IDEDeviceBus': '1.0-29d4c9f27ac44197f01b6ac1b7e16502',
+    'ImageMeta': '1.8-642d1b2eb3e880a367f37d72dd76162d',
+    'ImageMetaProps': '1.22-b1c9ea78c43e8d7989a7d1f0f34d149a',
+    'Instance': '2.5-94e3881f0b9a06c2c3640e44816b51de',
+    'InstanceAction': '1.1-f9f293e526b66fca0d05c3b3a2d13914',
+    'InstanceActionEvent': '1.2-b2f368b8a29d8d872b1f6ea841e820a0',
+    'InstanceActionEventList': '1.1-13d92fb953030cdbfee56481756e02be',
+    'InstanceActionList': '1.1-a2b2fb6006b47c27076d3a1d48baa759',
+    'InstanceDeviceMetadata': '1.0-74d78dd36aa32d26d2769a1b57caf186',
+    'InstanceExternalEvent': '1.2-23eb6ba79cde5cd06d3445f845ba4589',
+    'InstanceFault': '1.2-7ef01f16f1084ad1304a513d6d410a38',
+    'InstanceFaultList': '1.2-6bb72de2872fe49ded5eb937a93f2451',
+    'InstanceGroup': '1.11-852ac511d30913ee88f3c3a869a8f30a',
+    'InstanceGroupList': '1.8-90f8f1a445552bb3bbc9fa1ae7da27d4',
+    'InstanceInfoCache': '1.5-cd8b96fefe0fc8d4d337243ba0bf0e1e',
+    'InstanceList': '2.4-d2c5723da8c1d08e07cb00160edfd292',
+    'InstanceMapping': '1.2-3bd375e65c8eb9c45498d2f87b882e03',
+    'InstanceMappingList': '1.3-d34b6ebb076d542ae0f8b440534118da',
+    'InstanceNUMACell': '1.4-7c1eb9a198dee076b4de0840e45f4f55',
+    'InstanceNUMATopology': '1.3-ec0030cb0402a49c96da7051c037082a',
+    'InstancePCIRequest': '1.3-f6d324f1c337fad4f34892ed5f484c9a',
+    'InstancePCIRequests': '1.1-65e38083177726d806684cb1cc0136d2',
+    'KeyPair': '1.4-1244e8d1b103cc69d038ed78ab3a8cc6',
+    'KeyPairList': '1.3-94aad3ac5c938eef4b5e83da0212f506',
+    'LibvirtLiveMigrateBDMInfo': '1.1-5f4a68873560b6f834b74e7861d71aaf',
+    'LibvirtLiveMigrateData': '1.9-7082cc7dd48ca49df71fe3846521b2f3',
+    'MemoryDiagnostics': '1.0-2c995ae0f2223bb0f8e523c5cc0b83da',
+    'Migration': '1.6-fd6b1abfd8e3ce945348e7b5f04baa28',
+    'MigrationContext': '1.1-9fb17b0b521370957a884636499df52d',
+    'MigrationList': '1.4-983a9c29d4f1e747ce719dc9063b729b',
+    'MonitorMetric': '1.1-53b1db7c4ae2c531db79761e7acc52ba',
+    'MonitorMetricList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+    'NUMACell': '1.3-64b5fec7c51c0a85760c56b42dd307a5',
+    'NUMAPagesTopology': '1.1-edab9fa2dc43c117a38d600be54b4542',
+    'NUMATopology': '1.2-c63fad38be73b6afd04715c9c1b29220',
+    'NUMATopologyLimits': '1.1-4235c5da7a76c7e36075f0cd2f5cf922',
+    'Network': '1.2-a977ab383aa462a479b2fae8211a5dde',
+    'NetworkInterfaceMetadata': '1.2-6f3d480b40fe339067b1c0dd4d656716',
+    'NetworkList': '1.2-69eca910d8fa035dfecd8ba10877ee59',
+    'NetworkMetadata': '1.0-2cb8d21b34f87b0261d3e1d1ae5cf218',
+    'NetworkRequest': '1.2-af1ff2d986999fbb79377712794d82aa',
+    'NetworkRequestList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+    'NicDiagnostics': '1.0-895e9ad50e0f56d5258585e3e066aea5',
+    'PCIDeviceBus': '1.0-2b891cb77e42961044689f3dc2718995',
+    'PciDevice': '1.6-2a2612baaa1786679e52084e82ca7e66',
+    'PciDeviceList': '1.3-52ff14355491c8c580bdc0ba34c26210',
+    'PciDevicePool': '1.1-3f5ddc3ff7bfa14da7f6c7e9904cc000',
+    'PciDevicePoolList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+    'PowerVMLiveMigrateData': '1.4-a745f4eda16b45e1bc5686a0c498f27e',
+    'Quotas': '1.3-40fcefe522111dddd3e5e6155702cf4e',
+    'QuotasNoOp': '1.3-347a039fc7cfee7b225b68b5181e0733',
+    'RequestGroup': '1.2-b9f9db748fe8cde0573af69db771c5ce',
+    'RequestSpec': '1.12-25010470f219af9b6163f2a457a513f5',
+    'S3ImageMapping': '1.0-7dd7366a890d82660ed121de9092276e',
+    'SCSIDeviceBus': '1.0-61c1e89a00901069ab1cf2991681533b',
+    'SchedulerLimits': '1.0-249c4bd8e62a9b327b7026b7f19cc641',
+    'SchedulerRetries': '1.1-3c9c8b16143ebbb6ad7030e999d14cc0',
+    'SecurityGroup': '1.2-86d67d8d3ab0c971e1dc86e02f9524a8',
+    'SecurityGroupList': '1.1-c655ed13298e630f4d398152f7d08d71',
+    'SecurityGroupRule': '1.1-ae1da17b79970012e8536f88cb3c6b29',
+    'SecurityGroupRuleList': '1.2-0005c47fcd0fb78dd6d7fd32a1409f5b',
+    'Selection': '1.0-7f5c065097371fe527dd1245f1530653',
+    'Service': '1.22-8a740459ab9bf258a19c8fcb875c2d9a',
+    'ServiceList': '1.19-5325bce13eebcbf22edc9678285270cc',
+    'Tag': '1.1-8b8d7d5b48887651a0e01241672e2963',
+    'TagList': '1.1-55231bdb671ecf7641d6a2e9109b5d8e',
+    'TaskLog': '1.0-78b0534366f29aa3eebb01860fbe18fe',
+    'TaskLogList': '1.0-cc8cce1af8a283b9d28b55fcd682e777',
+    'TrustedCerts': '1.0-dcf528851e0f868c77ee47e90563cda7',
+    'USBDeviceBus': '1.0-e4c7dd6032e46cd74b027df5eb2d4750',
+    'VIFMigrateData': '1.0-cb15282b25a039ab35046ed705eb931d',
+    'VMwareLiveMigrateData': '1.0-a3cc858a2bf1d3806d6f57cfaa1fb98a',
+    'VirtCPUFeature': '1.0-ea2464bdd09084bd388e5f61d5d4fc86',
+    'VirtCPUModel': '1.0-5e1864af9227f698326203d7249796b5',
     'VirtCPUTopology': '1.0-fc694de72e20298f7c6bab1083fd4563',
-    'VirtualInterface': '1.0-d3d14066c99b8ae4d5204059fb147279',
-    'VirtualInterfaceList': '1.0-accbf02628a8063c1d885077a2bf49b6',
+    'VirtualInterface': '1.3-efd3ca8ebcc5ce65fff5a25f31754c54',
+    'VirtualInterfaceList': '1.0-9750e2074437b3077e46359102779fc6',
+    'VolumeUsage': '1.0-6c8190c46ce1469bb3286a1f21c2e475',
+    'XenDeviceBus': '1.0-272a4f899b24e31e42b2b9a7ed7e9194',
+    'XenapiLiveMigrateData': '1.4-7dc9417e921b2953faa6751f18785f3f'
 }
 
 
-object_relationships = {
-    'BlockDeviceMapping': {'Instance': '1.19'},
-    'ComputeNode': {'HVSpec': '1.0', 'PciDevicePoolList': '1.0'},
-    'FixedIP': {'Instance': '1.19', 'Network': '1.2',
-                'VirtualInterface': '1.0',
-                'FloatingIPList': '1.7'},
-    'FloatingIP': {'FixedIP': '1.9'},
-    'Instance': {'InstanceFault': '1.2',
-                 'InstanceInfoCache': '1.5',
-                 'InstanceNUMATopology': '1.1',
-                 'PciDeviceList': '1.1',
-                 'TagList': '1.0',
-                 'SecurityGroupList': '1.0',
-                 'Flavor': '1.1',
-                 'InstancePCIRequests': '1.1',
-                 'VirtCPUModel': '1.0',
-                 },
-    'InstanceNUMACell': {'VirtCPUTopology': '1.0'},
-    'InstanceNUMATopology': {'InstanceNUMACell': '1.2'},
-    'InstancePCIRequests': {'InstancePCIRequest': '1.1'},
-    'MyObj': {'MyOwnedObject': '1.0'},
-    'NUMACell': {'NUMAPagesTopology': '1.0'},
-    'NUMATopology': {'NUMACell': '1.2'},
-    'SecurityGroupRule': {'SecurityGroup': '1.1'},
-    'Service': {'ComputeNode': '1.10'},
-    'TestSubclassedObject': {'MyOwnedObject': '1.0'},
-    'VirtCPUModel': {'VirtCPUFeature': '1.0', 'VirtCPUTopology': '1.0'},
-}
+def get_nova_objects():
+    """Get Nova versioned objects
+
+    This returns a dict of versioned objects which are
+    in the Nova project namespace only. ie excludes
+    objects from os-vif and other 3rd party modules
+
+    :return: a dict mapping class names to lists of versioned objects
+    """
+
+    all_classes = base.NovaObjectRegistry.obj_classes()
+    nova_classes = {}
+    for name in all_classes:
+        objclasses = all_classes[name]
+        if (objclasses[0].OBJ_PROJECT_NAMESPACE !=
+            base.NovaObject.OBJ_PROJECT_NAMESPACE):
+            continue
+        nova_classes[name] = objclasses
+    return nova_classes
 
 
 class TestObjectVersions(test.NoDBTestCase):
-    def _find_remotable_method(self, cls, thing, parent_was_remotable=False):
-        """Follow a chain of remotable things down to the original function."""
-        if isinstance(thing, classmethod):
-            return self._find_remotable_method(cls, thing.__get__(None, cls))
-        elif inspect.ismethod(thing) and hasattr(thing, 'remotable'):
-            return self._find_remotable_method(cls, thing.original_fn,
-                                               parent_was_remotable=True)
-        elif parent_was_remotable:
-            # We must be the first non-remotable thing underneath a stack of
-            # remotable things (i.e. the actual implementation method)
-            return thing
-        else:
-            # This means the top-level thing never hit a remotable layer
-            return None
-
-    def _get_fingerprint(self, obj_name):
-        obj_class = base.NovaObject._obj_classes[obj_name][0]
-        fields = obj_class.fields.items()
-        fields.sort()
-        methods = []
-        for name in dir(obj_class):
-            thing = getattr(obj_class, name)
-            if inspect.ismethod(thing) or isinstance(thing, classmethod):
-                method = self._find_remotable_method(obj_class, thing)
-                if method:
-                    methods.append((name, inspect.getargspec(method)))
-        methods.sort()
-        # NOTE(danms): Things that need a version bump are any fields
-        # and their types, or the signatures of any remotable methods.
-        # Of course, these are just the mechanical changes we can detect,
-        # but many other things may require a version bump (method behavior
-        # and return value changes, for example).
-        if hasattr(obj_class, 'child_versions'):
-            relevant_data = (fields, methods, obj_class.child_versions)
-        else:
-            relevant_data = (fields, methods)
-        fingerprint = '%s-%s' % (obj_class.VERSION,
-                                 hashlib.md5(str(relevant_data)).hexdigest())
-        return fingerprint
-
     def test_versions(self):
-        fingerprints = {}
-        for obj_name in base.NovaObject._obj_classes:
-            fingerprints[obj_name] = self._get_fingerprint(obj_name)
+        checker = fixture.ObjectVersionChecker(
+            get_nova_objects())
+        fingerprints = checker.get_hashes()
 
         if os.getenv('GENERATE_HASHES'):
-            file('object_hashes.txt', 'w').write(
+            open('object_hashes.txt', 'w').write(
                 pprint.pformat(fingerprints))
             raise test.TestingException(
                 'Generated hashes in object_hashes.txt')
 
-        stored = set(object_data.items())
-        computed = set(fingerprints.items())
-        changed = stored.symmetric_difference(computed)
-        expected = {}
-        actual = {}
-        for name, hash in changed:
-            expected[name] = object_data.get(name)
-            actual[name] = fingerprints.get(name)
-
+        expected, actual = checker.test_hashes(object_data)
         self.assertEqual(expected, actual,
                          'Some objects have changed; please make sure the '
                          'versions have been bumped, and then update their '
                          'hashes here.')
 
-    def _get_object_field_name(self, field):
-        if isinstance(field._type, fields.Object):
-            return field._type._obj_name
-        if isinstance(field, fields.ListOfObjectsField):
-            return field._type._element_type._type._obj_name
-        return None
-
-    def _build_tree(self, tree, obj_class):
-        obj_name = obj_class.obj_name()
-        if obj_name in tree:
-            return
-
-        for name, field in obj_class.fields.items():
-            # Notes(yjiang5): ObjectListBase should be covered by
-            # child_versions test
-            if (issubclass(obj_class, base.ObjectListBase) and
-                    name == 'objects'):
-                continue
-            sub_obj_name = self._get_object_field_name(field)
-            if sub_obj_name:
-                sub_obj_class = base.NovaObject._obj_classes[sub_obj_name][0]
-                self._build_tree(tree, sub_obj_class)
-                tree.setdefault(obj_name, {})
-                tree[obj_name][sub_obj_name] = sub_obj_class.VERSION
-
-    def test_relationships(self):
-        tree = {}
-        for obj_name in base.NovaObject._obj_classes.keys():
-            self._build_tree(tree, base.NovaObject._obj_classes[obj_name][0])
-
-        stored = set([(x, str(y)) for x, y in object_relationships.items()])
-        computed = set([(x, str(y)) for x, y in tree.items()])
-        changed = stored.symmetric_difference(computed)
-        expected = {}
-        actual = {}
-        for name, deps in changed:
-            expected[name] = object_relationships.get(name)
-            actual[name] = tree.get(name)
-        self.assertEqual(expected, actual,
-                         'Some objects have changed dependencies. '
-                         'Please make sure to bump the versions of '
-                         'parent objects and provide a rule in their '
-                         'obj_make_compatible() routines to backlevel '
-                         'the child object.')
-
     def test_obj_make_compatible(self):
-        # Iterate all object classes and verify that we can run
-        # obj_make_compatible with every older version than current.
-        # This doesn't actually test the data conversions, but it at least
-        # makes sure the method doesn't blow up on something basic like
-        # expecting the wrong version format.
-        for obj_name in base.NovaObject._obj_classes:
-            obj_class = base.NovaObject._obj_classes[obj_name][0]
-            version = utils.convert_version_to_tuple(obj_class.VERSION)
-            for n in range(version[1]):
-                test_version = '%d.%d' % (version[0], n)
-                LOG.info('testing obj: %s version: %s' %
-                         (obj_name, test_version))
-                obj_class().obj_to_primitive(target_version=test_version)
+        # NOTE(danms): This is normally not registered because it is just a
+        # base class. However, the test fixture below requires it to be
+        # in the registry so that it can verify backports based on its
+        # children. So, register it here, which will be reverted after the
+        # cleanUp for this (and all) tests is run.
+        base.NovaObjectRegistry.register(virt_device_metadata.DeviceBus)
 
-    def test_obj_relationships_in_order(self):
         # Iterate all object classes and verify that we can run
         # obj_make_compatible with every older version than current.
         # This doesn't actually test the data conversions, but it at least
         # makes sure the method doesn't blow up on something basic like
         # expecting the wrong version format.
-        for obj_name in base.NovaObject._obj_classes:
-            obj_class = base.NovaObject._obj_classes[obj_name][0]
-            for field, versions in obj_class.obj_relationships.items():
-                last_my_version = (0, 0)
-                last_child_version = (0, 0)
-                for my_version, child_version in versions:
-                    _my_version = utils.convert_version_to_tuple(my_version)
-                    _ch_version = utils.convert_version_to_tuple(child_version)
-                    self.assertTrue((last_my_version < _my_version
-                                     and last_child_version <= _ch_version),
-                                    'Object %s relationship '
-                                    '%s->%s for field %s is out of order' % (
-                                        obj_name, my_version, child_version,
-                                        field))
-                    last_my_version = _my_version
-                    last_child_version = _ch_version
+
+        # Hold a dictionary of args/kwargs that need to get passed into
+        # __init__() for specific classes. The key in the dictionary is
+        # the obj_class that needs the init args/kwargs.
+        init_args = {}
+        init_kwargs = {}
+
+        checker = fixture.ObjectVersionChecker(
+            base.NovaObjectRegistry.obj_classes())
+        checker.test_compatibility_routines(use_manifest=True,
+                                            init_args=init_args,
+                                            init_kwargs=init_kwargs)
+
+    def test_list_obj_make_compatible(self):
+        @base.NovaObjectRegistry.register_if(False)
+        class TestObj(base.NovaObject):
+            VERSION = '1.4'
+            fields = {'foo': fields.IntegerField()}
+
+        @base.NovaObjectRegistry.register_if(False)
+        class TestListObj(base.ObjectListBase, base.NovaObject):
+            VERSION = '1.5'
+            fields = {'objects': fields.ListOfObjectsField('TestObj')}
+            obj_relationships = {
+                'objects': [('1.0', '1.1'), ('1.1', '1.2'),
+                            ('1.3', '1.3'), ('1.5', '1.4')]
+            }
+
+        my_list = TestListObj()
+        my_obj = TestObj(foo=1)
+        my_list.objects = [my_obj]
+        primitive = my_list.obj_to_primitive(target_version='1.5')
+        primitive_data = primitive['nova_object.data']
+        obj_primitive = my_obj.obj_to_primitive(target_version='1.4')
+        obj_primitive_data = obj_primitive['nova_object.data']
+        with mock.patch.object(TestObj, 'obj_make_compatible') as comp:
+            my_list.obj_make_compatible(primitive_data, '1.1')
+            comp.assert_called_with(obj_primitive_data,
+                                    '1.2')
+
+    def test_list_obj_make_compatible_when_no_objects(self):
+        # Test to make sure obj_make_compatible works with no 'objects'
+        # If a List object ever has a version that did not contain the
+        # 'objects' key, we need to make sure converting back to that version
+        # doesn't cause backporting problems.
+        @base.NovaObjectRegistry.register_if(False)
+        class TestObj(base.NovaObject):
+            VERSION = '1.1'
+            fields = {'foo': fields.IntegerField()}
+
+        @base.NovaObjectRegistry.register_if(False)
+        class TestListObj(base.ObjectListBase, base.NovaObject):
+            VERSION = '1.1'
+            fields = {'objects': fields.ListOfObjectsField('TestObj')}
+            # pretend that version 1.0 didn't have 'objects'
+            obj_relationships = {
+                'objects': [('1.1', '1.1')]
+            }
+
+        my_list = TestListObj()
+        my_list.objects = [TestObj(foo=1)]
+        primitive = my_list.obj_to_primitive(target_version='1.1')
+        primitive_data = primitive['nova_object.data']
+        my_list.obj_make_compatible(primitive_data,
+                                    target_version='1.0')
+        self.assertNotIn('objects', primitive_data,
+                         "List was backported to before 'objects' existed."
+                         " 'objects' should not be in the primitive.")
+
+
+class TestObjEqualPrims(_BaseTestCase):
+
+    def test_object_equal(self):
+        obj1 = MyObj(foo=1, bar='goodbye')
+        obj1.obj_reset_changes()
+        obj2 = MyObj(foo=1, bar='goodbye')
+        obj2.obj_reset_changes()
+        obj2.bar = 'goodbye'
+        # obj2 will be marked with field 'three' updated
+        self.assertTrue(base.obj_equal_prims(obj1, obj2),
+                        "Objects that differ only because one a is marked "
+                        "as updated should be equal")
+
+    def test_object_not_equal(self):
+        obj1 = MyObj(foo=1, bar='goodbye')
+        obj1.obj_reset_changes()
+        obj2 = MyObj(foo=1, bar='hello')
+        obj2.obj_reset_changes()
+        self.assertFalse(base.obj_equal_prims(obj1, obj2),
+                         "Objects that differ in any field "
+                         "should not be equal")
+
+    def test_object_ignore_equal(self):
+        obj1 = MyObj(foo=1, bar='goodbye')
+        obj1.obj_reset_changes()
+        obj2 = MyObj(foo=1, bar='hello')
+        obj2.obj_reset_changes()
+        self.assertTrue(base.obj_equal_prims(obj1, obj2, ['bar']),
+                        "Objects that only differ in an ignored field "
+                        "should be equal")
+
+
+class TestObjMethodOverrides(test.NoDBTestCase):
+    def test_obj_reset_changes(self):
+        args = utils.getargspec(base.NovaObject.obj_reset_changes)
+        obj_classes = base.NovaObjectRegistry.obj_classes()
+        for obj_name in obj_classes:
+            obj_class = obj_classes[obj_name][0]
+            self.assertEqual(args,
+                utils.getargspec(obj_class.obj_reset_changes))
