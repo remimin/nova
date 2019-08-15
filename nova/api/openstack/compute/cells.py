@@ -29,6 +29,7 @@ from nova.cells import rpcapi as cells_rpcapi
 import nova.conf
 from nova import exception
 from nova.i18n import _
+from nova import objects
 from nova.policies import cells as cells_policies
 from nova import rpc
 
@@ -300,3 +301,61 @@ class CellsController(wsgi.Controller):
             deleted = strutils.bool_from_string(deleted, strict=True)
         self.cells_rpcapi.sync_instances(context, project_id=project_id,
                 updated_since=updated_since, deleted=deleted)
+
+
+class CellsControllerV2(wsgi.Controller):
+
+    def _host_mapping_view(self, host_mapping):
+        _host = {'host': host_mapping.host,
+                 'cell_name': host_mapping.cell_mapping.name,
+                 'cell_uuid': host_mapping.cell_mapping.uuid}
+        return _host
+
+    @wsgi.expected_errors((403, 404, 400, 501))
+    def get_hosts_by_cell(self, req, id):
+        ctxt = req.environ['nova.context']
+        if not ctxt.is_admin:
+            msg = _("Only administrators may list deleted instances")
+            raise exc.HTTPForbidden(explanation=msg)
+        # Find the CellMapping given the uuid.
+        try:
+            cell_mapping = objects.CellMapping.get_by_uuid(ctxt, id)
+        except exception.CellMappingNotFound:
+            msg = (_('Cell with uuid %s was not found.') % id)
+            raise exc.HTTPNotFound(explanation=msg)
+        host_mappings = objects.HostMappingList.get_by_cell_id(
+            ctxt, cell_mapping.id)
+        _hosts = []
+        for host in host_mappings:
+            _hosts.append(self._host_mapping_view(host))
+        response = {'hosts': _hosts}
+        return response
+
+    @wsgi.expected_errors((403, 400, 501))
+    def get_hosts_mapping(self, req):
+        ctxt = req.environ['nova.context']
+        if not ctxt.is_admin:
+            msg = _("Only administrators may list deleted instances")
+            raise exc.HTTPForbidden(explanation=msg)
+        host_mappings = objects.HostMappingList.get_all(ctxt)
+        _hosts = []
+        for host in host_mappings:
+            _hosts.append(self._host_mapping_view(host))
+        response = {'hosts': _hosts}
+        return response
+
+    @wsgi.expected_errors((403, 400, 501))
+    def info(self, req):
+        ctxt =  req.environ['nova.context']
+        if not ctxt.is_admin:
+            msg = _("Only administrators may list deleted instances")
+            raise exc.HTTPForbidden(explanation=msg)
+        cell_mappings = objects.CellMappingList.get_all(ctxt)
+        _cells = []
+        for cell in cell_mappings:
+            _cells.append(dict(cell_name=cell.name,
+                               cell_uuid=cell.uuid,
+                               transport_url=cell.transport_url,
+                               database_connection=cell.database_connection))
+        response = {'cells': _cells}
+        return response

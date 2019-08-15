@@ -136,6 +136,8 @@ baremetal_nodes_controller = functools.partial(
 cells_controller = functools.partial(
     _create_controller, cells.CellsController, [], [])
 
+cells_controller_v2 = functools.partial(
+    _create_controller, cells.CellsControllerV2, [], [])
 
 certificates_controller = functools.partial(
     _create_controller, certificates.CertificatesController, [], [])
@@ -528,6 +530,15 @@ ROUTE_LIST = (
     }),
     ('/os-cells/{id}/capacities', {
         'GET': [cells_controller, 'capacities']
+    }),
+    ('/os-cells-v2/info', {
+        'GET': [cells_controller_v2, 'info']
+    }),
+    ('/os-cells-v2/hostsmapping', {
+        'GET': [cells_controller_v2, 'get_hosts_mapping']
+    }),
+    ('/os-cells-v2/{id}', {
+        'GET': [cells_controller_v2, 'get_hosts_by_cell']
     }),
     ('/os-certificates', {
         'POST': [certificates_controller, 'create']
