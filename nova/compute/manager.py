@@ -2907,6 +2907,50 @@ class ComputeManager(manager.Manager):
             # partitions.
             raise exception.PreserveEphemeralNotSupported()
 
+        def _new_bdms():
+            # Add for wocloud rebuild with bootable volume
+            root_bdm = compute_utils.get_root_bdm(context, instance, bdms)
+            if root_bdm.is_volume:
+                old_root_volume = self.volume_api.get(
+                    context, root_bdm.volume_id)
+                new_root_volume = self.volume_api.create(
+                    context,
+                    old_root_volume['size'],
+                    None,
+                    None,
+                    image_id=image_meta.id,
+                    volume_type=old_root_volume['volume_type_id'])
+                self._await_block_device_map_created(context,
+                                                     new_root_volume['id'])
+                bdm = objects.BlockDeviceMapping(
+                    context=context,
+                    source_type='image', destination_type='volume',
+                    instance_uuid=instance.uuid, boot_index=0,
+                    volume_id=new_root_volume['id'],
+                    device_name=root_bdm.device_name,
+                    disk_bus=root_bdm.disk_bus,
+                    device_type=root_bdm.device_type,
+                    tag=root_bdm.tag)
+                bdm.create()
+                LOG.debug("Destroy instance %(instance)s old root "
+                          "volume %(volume)s.",
+                          {'instance':instance.uuid,
+                           'volume': old_root_volume['id']})
+                root_bdm.destroy()
+                if root_bdm.delete_on_termination:
+                    try:
+                        self.volume_api.delete(context,
+                                               old_root_volume['id'])
+                    except Exception as exc:
+                        LOG.warning(_LW('Failed to delete volume: '
+                                        '%(volume_id)s due to %(exc)s'),
+                                    {'volume_id': root_bdm.volume_id,
+                                     'exc': exc})
+                new_bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+                    context, instance.uuid)
+                return new_bdms
+            else:
+                return bdms
         if evacuate:
             detach_block_devices(context, bdms)
         else:
@@ -2918,6 +2962,8 @@ class ComputeManager(manager.Manager):
 
         instance.task_state = task_states.REBUILD_BLOCK_DEVICE_MAPPING
         instance.save(expected_task_state=[task_states.REBUILDING])
+
+        bdms = _new_bdms()
 
         new_block_device_info = attach_block_devices(context, instance, bdms)
 

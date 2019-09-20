@@ -3226,8 +3226,9 @@ class API(base.Base):
                           orig_image_ref, instance=instance)
                 msg = _('Unable to rebuild with a different image for a '
                         'volume-backed server.')
-                raise exception.ImageUnacceptable(
-                    image_id=image_href, reason=msg)
+                LOG.warning(msg)
+                #raise exception.ImageUnacceptable(
+                #    image_id=image_href, reason=msg)
         else:
             orig_image_ref = instance.image_ref
 
