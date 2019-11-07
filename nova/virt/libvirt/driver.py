@@ -4847,7 +4847,7 @@ class LibvirtDriver(driver.ComputeDriver):
                 "quiet = false\r\n"
                 "Hostname = \"{2}\"\r\n"
                 "[[outputs.file]]\r\n"
-                "files = [\"\\\\.\\Global\\org.qemu.telegraf_agent.0\"]\r\n"
+                "files = [\"\\\\\\\\.\\\\Global\\\\org.qemu.telegraf_agent.0\"]\r\n"
                 "data_format = \"influx\"\r\n"
                 "[[inputs.win_perf_counters]]\r\n"
                 "[[inputs.win_perf_counters.object]]\r\n"
