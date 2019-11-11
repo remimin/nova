@@ -455,7 +455,8 @@ create_image = {
             'type': 'object',
             'properties': {
                 'name': parameter_types.name,
-                'metadata': parameter_types.metadata
+                'metadata': parameter_types.metadata,
+                'snapshot_only': parameter_types.boolean
             },
             'required': ['name'],
             'additionalProperties': False

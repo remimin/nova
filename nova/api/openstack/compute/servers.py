@@ -1012,9 +1012,11 @@ class ServersController(wsgi.Controller):
         entity = body["createImage"]
         image_name = common.normalize_name(entity["name"])
         metadata = entity.get('metadata', {})
+        snapshot_only = strutils.bool_from_string(
+            entity.get('snapshot_only', False))
 
         # Starting from microversion 2.39 we don't check quotas on createImage
-        if api_version_request.is_supported(
+        if not snapshot_only and api_version_request.is_supported(
                 req, max_version=
                 api_version_request.MAX_IMAGE_META_PROXY_API_VERSION):
             common.check_img_metadata_properties_quota(context, metadata)
@@ -1034,7 +1036,9 @@ class ServersController(wsgi.Controller):
                                                        instance,
                                                        image_name,
                                                        extra_properties=
-                                                       metadata)
+                                                       metadata,
+                                                       snapshot_only=
+                                                       snapshot_only)
             else:
                 image = self.compute_api.snapshot(context,
                                                   instance,
@@ -1052,8 +1056,12 @@ class ServersController(wsgi.Controller):
 
         # Starting with microversion 2.45 we return a response body containing
         # the snapshot image id without the Location header.
-        if api_version_request.is_supported(req, '2.45'):
+        if not snapshot_only and api_version_request.is_supported(req, '2.45'):
             return {'image_id': image['id']}
+
+        if snapshot_only:
+            # return image meta
+            return image
 
         # build location of newly-created image entity
         image_id = str(image['id'])

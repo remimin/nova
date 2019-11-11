@@ -2967,7 +2967,8 @@ class API(base.Base):
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
                                     vm_states.SUSPENDED])
     def snapshot_volume_backed(self, context, instance, name,
-                               extra_properties=None):
+                               extra_properties=None,
+                               snapshot_only=False):
         """Snapshot the given volume-backed instance.
 
         :param instance: nova.objects.instance.Instance object
@@ -3067,7 +3068,8 @@ class API(base.Base):
                     # NOTE(yamahata): Should we wait for snapshot creation?
                     #                 Linux LVM snapshot creation completes in
                     #                 short time, it doesn't matter for now.
-                    name = _('snapshot for %s') % image_meta['name']
+                    name = _('snapshot for %s') % image_meta['name'] if \
+                        not snapshot_only else image_meta['name']
                     LOG.debug('Creating snapshot from volume %s.',
                               volume['id'], instance=instance)
                     snapshot = self.volume_api.create_snapshot_force(
@@ -3102,6 +3104,9 @@ class API(base.Base):
         if mapping:
             properties['block_device_mapping'] = mapping
             properties['bdm_v2'] = True
+
+        if snapshot_only:
+            return {'image_meta': image_meta}
 
         return self.image_api.create(context, image_meta)
 
