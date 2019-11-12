@@ -2962,8 +2962,8 @@ class ComputeManager(manager.Manager):
 
         instance.task_state = task_states.REBUILD_BLOCK_DEVICE_MAPPING
         instance.save(expected_task_state=[task_states.REBUILDING])
-
-        bdms = _new_bdms()
+        if not evacuate:
+            bdms = _new_bdms()
 
         new_block_device_info = attach_block_devices(context, instance, bdms)
 
