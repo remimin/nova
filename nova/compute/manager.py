@@ -3688,27 +3688,35 @@ class ComputeManager(manager.Manager):
                 instance=instance.uuid, reason=_msg)
 
         try:
+            self._notify_about_instance_usage(context, instance,
+                    "change_password.start")
             self.driver.set_admin_password(instance, new_pass)
             LOG.info("Admin password set", instance=instance)
             instance.task_state = None
             instance.save(
                 expected_task_state=task_states.UPDATING_PASSWORD)
-        except exception.InstanceAgentNotEnabled:
+        except exception.InstanceAgentNotEnabled as e:
             with excutils.save_and_reraise_exception():
+                self._notify_about_instance_usage(context, instance,
+                    "change_password.error", fault=e)
                 LOG.debug('Guest agent is not enabled for the instance.',
                           instance=instance)
                 instance.task_state = None
                 instance.save(
                     expected_task_state=task_states.UPDATING_PASSWORD)
-        except exception.SetAdminPasswdNotSupported:
+        except exception.SetAdminPasswdNotSupported as e:
             with excutils.save_and_reraise_exception():
+                self._notify_about_instance_usage(context, instance,
+                    "change_password.error", fault=e)
                 LOG.info('set_admin_password is not supported '
                          'by this driver or guest instance.',
                          instance=instance)
                 instance.task_state = None
                 instance.save(
                     expected_task_state=task_states.UPDATING_PASSWORD)
-        except NotImplementedError:
+        except NotImplementedError as e:
+            self._notify_about_instance_usage(context, instance,
+                "change_password.error", fault=e)
             LOG.warning('set_admin_password is not implemented '
                         'by this driver or guest instance.',
                         instance=instance)
@@ -3718,11 +3726,15 @@ class ComputeManager(manager.Manager):
             raise NotImplementedError(_('set_admin_password is not '
                                         'implemented by this driver or guest '
                                         'instance.'))
-        except exception.UnexpectedTaskStateError:
+        except exception.UnexpectedTaskStateError as e:
+            self._notify_about_instance_usage(context, instance,
+                "change_password.error", fault=e)
             # interrupted by another (most likely delete) task
             # do not retry
             raise
-        except Exception:
+        except Exception as e:
+            self._notify_about_instance_usage(context, instance,
+                "change_password.error", fault=e)
             # Catch all here because this could be anything.
             LOG.exception('set_admin_password failed', instance=instance)
             # We create a new exception here so that we won't
@@ -3731,6 +3743,8 @@ class ComputeManager(manager.Manager):
             _msg = _('error setting admin password')
             raise exception.InstancePasswordSetFailed(
                 instance=instance.uuid, reason=_msg)
+        self._notify_about_instance_usage(context, instance,
+               "change_password.end")
 
     @wrap_exception()
     @reverts_task_state
