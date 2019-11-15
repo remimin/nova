@@ -3188,8 +3188,18 @@ class API(base.Base):
 
         image_id, image = self._get_image(context, image_href)
         self._check_auto_disk_config(image=image, **kwargs)
-
-        flavor = instance.get_flavor()
+        if 'flavor_id' in kwargs and kwargs['flavor_id'] != instance.flavor.id:
+            flavor = flavors.get_flavor_by_flavor_id(
+                    kwargs['flavor_id'], read_deleted="no")
+            cur_flavor = instance.get_flavor()
+            self._check_quota_for_upsize(context, instance,
+                                         cur_flavor,
+                                         flavor)
+            instance.new_flavor = flavor
+            instance.old_flavor = cur_flavor
+            instance.flavor = flavor
+        else:
+            flavor = instance.get_flavor()
         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
             context, instance.uuid)
         root_bdm = compute_utils.get_root_bdm(context, instance, bdms)

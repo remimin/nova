@@ -2913,25 +2913,51 @@ class ComputeManager(manager.Manager):
             if root_bdm.is_volume:
                 old_root_volume = self.volume_api.get(
                     context, root_bdm.volume_id)
+                image_properties = image_meta.properties
+                # Get the block device mappings defined by the image.
+                image_defined_bdms = \
+                    image_properties.get('img_block_device_mapping') or []
+                legacy_image_defined = image_properties.get('img_bdm_v2') or False
                 new_root_volume = self.volume_api.create(
                     context,
-                    old_root_volume['size'],
+                    instance.flavor.root_gb,
                     None,
                     None,
                     image_id=image_meta.id,
-                    volume_type=old_root_volume['volume_type_id'])
+                    volume_type=old_root_volume['volume_type_id'],
+                    microversion='3.46')
                 self._await_block_device_map_created(context,
                                                      new_root_volume['id'])
-                bdm = objects.BlockDeviceMapping(
-                    context=context,
-                    source_type='image', destination_type='volume',
-                    instance_uuid=instance.uuid, boot_index=0,
-                    volume_id=new_root_volume['id'],
-                    device_name=root_bdm.device_name,
-                    disk_bus=root_bdm.disk_bus,
-                    device_type=root_bdm.device_type,
-                    tag=root_bdm.tag)
-                bdm.create()
+
+                if not len(image_defined_bdms):
+                    new_root_bdm = objects.BlockDeviceMapping(
+                        context=context,
+                        source_type='image', destination_type='volume',
+                        instance_uuid=instance.uuid, boot_index=0,
+                        volume_id=new_root_volume['id'],
+                        device_name=root_bdm.device_name,
+                        disk_bus=root_bdm.disk_bus,
+                        device_type=root_bdm.device_type,
+                        tag=root_bdm.tag)
+                else:
+                    if legacy_image_defined:
+                        image_defined_bdms = block_device.from_legacy_mapping(
+                            image_defined_bdms, None, root_bdm.device_name)
+                    else:
+                        image_defined_bdms = list(map(block_device.BlockDeviceDict,
+                                                      image_defined_bdms))
+                    for _bdm in image_defined_bdms:
+                        if _bdm['boot_index'] == 0:
+                            _bdm.update(dict(instance_uuid=instance.uuid,
+                                             tag=root_bdm.tag,
+                                             volume_id=new_root_volume['id'],
+                                             disk_bus=root_bdm.disk_bus,
+                                             device_name=root_bdm.device_name))
+                            new_root_bdm = objects.BlockDeviceMapping(
+                                context=context, **_bdm)
+                            break
+
+                new_root_bdm.create()
                 LOG.debug("Destroy instance %(instance)s old root "
                           "volume %(volume)s.",
                           {'instance':instance.uuid,
@@ -2951,6 +2977,7 @@ class ComputeManager(manager.Manager):
                 return new_bdms
             else:
                 return bdms
+
         if evacuate:
             detach_block_devices(context, bdms)
         else:
@@ -3076,10 +3103,29 @@ class ComputeManager(manager.Manager):
 
         with self._error_out_instance_on_exception(context, instance):
             try:
-                claim_ctxt = rebuild_claim(
-                    context, instance, scheduled_node,
-                    limits=limits, image_meta=image_meta,
-                    migration=migration)
+
+                if instance.new_flavor:
+                    migration = objects.Migration(context=context.elevated())
+                    migration.old_instance_type_id = instance.old_flavor.id
+                    migration.new_instance_type_id = instance.new_flavor.id
+                    migration.status = 'pre-migrating'
+                    migration.instance_uuid = instance.uuid
+                    migration.source_compute = instance.host
+                    migration.source_node = instance.node
+                    migration.dest_compute = instance.host
+                    migration.dest_node = instance.node
+                    migration.migration_type = 'resize'
+                    migration.create()
+                    claim_ctxt = rt.resize_claim(context, instance,
+                                                 instance.new_flavor,
+                                                 scheduled_node,
+                                                 limits=limits, image_meta=image_meta,
+                                                 migration=migration)
+                else:
+                    claim_ctxt = rebuild_claim(
+                        context, instance, scheduled_node,
+                        limits=limits, image_meta=image_meta,
+                        migration=migration)
                 self._do_rebuild_instance_with_claim(
                     claim_ctxt, context, instance, orig_image_ref,
                     image_ref, injected_files, new_pass, orig_sys_metadata,
@@ -3110,6 +3156,7 @@ class ComputeManager(manager.Manager):
                 # not raise ComputeResourcesUnavailable.
                 rt.delete_allocation_for_evacuated_instance(
                     context, instance, scheduled_node, node_type='destination')
+
                 self._notify_instance_rebuild_error(context, instance, e, bdms)
                 raise exception.BuildAbortException(
                     instance_uuid=instance.uuid, reason=e.format_message())
@@ -3121,7 +3168,12 @@ class ComputeManager(manager.Manager):
                 self._notify_instance_rebuild_error(context, instance, e, bdms)
             except Exception as e:
                 self._set_migration_status(migration, 'failed')
-                if evacuate or scheduled_node is not None:
+                if instance.new_flavor:
+                    instance.new_flavor = None
+                    instance.old_flavor = None
+                    instance.save()
+                    rt.drop_move_claim(context, instance, instance.node)
+                elif evacuate or scheduled_node is not None:
                     rt.delete_allocation_for_evacuated_instance(
                         context, instance, scheduled_node,
                         node_type='destination')
@@ -3135,6 +3187,10 @@ class ComputeManager(manager.Manager):
                 # entry.
                 instance.host = self.host
                 instance.node = scheduled_node
+                if instance.new_flavor:
+                    instance.flavor = instance.new_flavor
+                    instance.new_flavor = None
+                    instance.old_flavor = None
                 instance.save()
                 instance.drop_migration_context()
 

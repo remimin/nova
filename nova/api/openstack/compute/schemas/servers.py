@@ -391,6 +391,7 @@ base_rebuild = {
                 'accessIPv4': parameter_types.accessIPv4,
                 'accessIPv6': parameter_types.accessIPv6,
                 'personality': parameter_types.personality,
+                'flavorRef': parameter_types.flavor_ref,
             },
             'required': ['imageRef'],
             'additionalProperties': False,

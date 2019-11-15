@@ -909,6 +909,9 @@ class ServersController(wsgi.Controller):
 
         kwargs = {}
 
+        if rebuild_dict.get('flavorRef'):
+            kwargs['flavor_id'] = \
+                common.get_id_from_href(rebuild_dict['flavorRef'])
         helpers.translate_attributes(helpers.REBUILD, rebuild_dict, kwargs)
 
         if (api_version_request.is_supported(req, min_version='2.54')

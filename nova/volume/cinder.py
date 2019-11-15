@@ -609,8 +609,8 @@ class API(object):
     @translate_volume_exception
     def create(self, context, size, name, description, snapshot=None,
                image_id=None, volume_type=None, metadata=None,
-               availability_zone=None):
-        client = cinderclient(context)
+               availability_zone=None, microversion=None):
+        client = cinderclient(context, microversion=microversion)
 
         if snapshot is not None:
             snapshot_id = snapshot['id']
