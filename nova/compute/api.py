@@ -24,6 +24,7 @@ import copy
 import functools
 import re
 import string
+from webob import exc
 
 from castellan import key_manager
 from oslo_log import log as logging
@@ -4946,6 +4947,40 @@ class API(base.Base):
         self._record_action_start(context, instance,
                                   instance_actions.ATTACH_MONITOR_DEVICE)
         self.compute_rpcapi.attach_monitor_device(context, instance)
+
+    @check_instance_lock
+    @check_instance_host
+    @check_instance_cell
+    @check_instance_state(vm_state=[vm_states.STOPPED],
+                          task_state=[None])
+    def revert_to_snapshot(self, context, instance, snapshot_id):
+        # if snapshot is not found, get_snapshot will raise SnapshotNotFound
+        # exception.
+        snapshot = self.volume_api.get_snapshot(context, snapshot_id)
+        root_bdm = objects.BlockDeviceMappingList.get_by_instance_uuid(
+            context, instance.uuid).root_bdm()
+        if root_bdm.volume_size != snapshot.get('size'):
+            raise exc.HTTPBadRequest(
+                explanation="Instance %(ins_id)s root device volume size is "
+                            "not equal snapshot %(s_id)s size." %
+                            {'ins_id': instance.uuid,
+                             's_id': snapshot_id})
+        if snapshot.get('status') != 'available':
+            raise exc.HTTPBadRequest(
+                explanation='Snapshot %(s_id)s is not available. Instance '
+                            '%(ins_id)s cannot revert to this snapshot' %
+                            {'s_id': snapshot_id,
+                             'ins_id': instance.uuid})
+        if snapshot.get('volume_id') != root_bdm.volume_id:
+            raise exc.HTTPBadRequest(
+                explanation='Snapshot %(s_id)s is not one of volume '
+                            '%(vol_id)s.' %
+                            {'s_id': snapshot_id,
+                             'vol_id': root_bdm.volume_id})
+        self._record_action_start(context,
+                                  instance,
+                                  instance_actions.REVERT_TO_SNAPSHOT)
+        self.compute_rpcapi.revert_to_snapshot(context, instance, snapshot)
 
 
 def target_host_cell(fn):

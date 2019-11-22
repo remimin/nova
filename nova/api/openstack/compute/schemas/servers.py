@@ -634,3 +634,19 @@ query_params_v226['properties'].update({
     'not-tags': parameter_types.common_query_regex_param,
     'not-tags-any': parameter_types.common_query_regex_param,
 })
+
+revert_to_snapshot = {
+    'type': 'object',
+    'properties': {
+        'revert_to_snapshot': {
+            'type': 'object',
+            'properties': {
+                'snapshot_id': {'type': 'string', 'format': 'uuid'}
+            },
+            'required': ['snapshot_id'],
+            'additionalProperties': False,
+        },
+    },
+    'required': ['revert_to_snapshot'],
+    'additionalProperties': False,
+}

@@ -726,3 +726,32 @@ class InstanceExistsNotification(base.NotificationBase):
     fields = {
         'payload': fields.ObjectField('InstanceExistsPayload')
     }
+
+
+@nova_base.NovaObjectRegistry.register_notification
+class InstanceActionRevertPayload(InstanceActionPayload):
+    # Version 1.0: Initial version. 
+    VERSION = '1.0'
+    fields = {
+        'snapshot_id': fields.UUIDField(),
+    }
+
+    def __init__(self, context, instance, fault, snapshot_id):
+        super(InstanceActionRevertPayload, self).__init__(
+                context=context,
+                instance=instance,
+                fault=fault)
+        self.snapshot_id = snapshot_id
+
+
+@base.notification_sample('instance-revert-start.json')
+@base.notification_sample('instance-revert-end.json')
+@base.notification_sample('instance-revert-error.json')
+@nova_base.NovaObjectRegistry.register_notification
+class InstanceActionRevertNotification(base.NotificationBase):
+    # Version 1.0: Initial version
+    VERSION = '1.0'
+
+    fields = {
+        'payload': fields.ObjectField('InstanceActionRevertPayload')
+    }

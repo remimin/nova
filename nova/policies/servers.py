@@ -322,6 +322,17 @@ will be changed to default to ``rule:admin_api`` in a subsequent release.
                 'path': '/servers/{server_id}/action (attach_monitor_device)'
             }
         ]),
+    policy.DocumentedRuleDefault(
+        SERVERS % 'revert_to_snapshot',
+        RULE_AOO,
+        "Revert instance to snapshot.",
+        [
+            {
+                'method': 'POST',
+                'path': '/servers/{server_id}/action revert_to_snapshot'
+            }
+        ]
+    )
 ]
 
 

@@ -1188,3 +1188,37 @@ def notify_about_instance_delete(notifier, context, instance,
     finally:
         notify_about_instance_usage(notifier, context, instance,
                                     "%s.end" % delete_type)
+
+
+@rpc.if_notifications_enabled
+def notify_about_instance_revert_to_snapshot_action(context, instance, host,
+                                                    snapshot_id, phase=None,
+                                                    exception=None, tb=None):
+    """Send versioned notification about the action made on the instance
+
+    :param context: nova context object
+    :param instance: the instance which the action performed on
+    :param host: the host emitting the notification
+    :param snapshot_id: the uuid for snapshot object
+    :param phase: the phase of the action
+    :param exception: the thrown exception (used in error notifications)
+    :param tb: the traceback (used in error notifications)
+    """
+    fault, priority = _get_fault_and_priority_from_exc_and_tb(exception, tb)
+    payload = instance_notification.InstanceActionRevertPayload(
+            context=context,
+            instance=instance,
+            fault=fault,
+            snapshot_id=snapshot_id)
+
+    notification = instance_notification.InstanceActionRevertNotification(
+            context=context,
+            priority=priority,
+            publisher=notification_base.NotificationPublisher(
+                host=host, source=fields.NotificationSource.COMPUTE),
+            event_type=notification_base.EventType(
+                    object='instance',
+                    action=fields.NotificationAction.REVERT_TO_SNAPSHOT,
+                    phase=phase),
+            payload=payload)
+    notification.emit(context)

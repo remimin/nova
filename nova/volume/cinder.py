@@ -440,6 +440,29 @@ def translate_snapshot_exception(method):
     return translate_cinder_exception(wrapper)
 
 
+def translate_snapshot_revert_exception(method):
+    """Transforms the exception for the volume revert to snapshot but keeps
+    its traceback intact.
+    """
+    def wrapper(self, ctx, volume_id, snapshot_id, *args, **kwargs):
+        try:
+            res = method(self, ctx, volume_id, snapshot_id, *args, **kwargs)
+        except (keystone_exception.NotFound, cinder_exception.NotFound):
+            _reraise(exception.SnapshotNotFound(snapshot_id=snapshot_id))
+        except cinder_exception.Forbidden as ex:
+            _reraise(exception.OverQuota(ex.message))
+        except cinder_exception.ClientException:
+            _reraise(exception.InvalidVolume(
+                reason="Cannot revert volume %(vol_id)s to its snapshot "
+                       "%(s_id)s. Volume's and snapshot's status must be "
+                       "available") % {
+                'vol_id': volume_id,
+                's_id': snapshot_id
+            })
+        return res
+    return translate_cinder_exception(wrapper)
+
+
 def translate_mixed_exceptions(method):
     """Transforms exceptions that can come from both volumes and snapshots."""
     def wrapper(self, ctx, res_id, *args, **kwargs):
@@ -867,3 +890,26 @@ class API(object):
                           {'id': attachment_id,
                            'msg': six.text_type(ex),
                            'code': getattr(ex, 'code', None)})
+
+    @translate_snapshot_revert_exception
+    def revert_to_snapshot(self, context, volume_id, snapshot_id):
+        """Revert volume to snapshot.
+
+        :param context: The nova request context.
+        :param volume_id: uuid of the volume
+        :param snapshot_id: uuid of the snapshot
+        """
+        try:
+            cinderclient(
+                context, '3.44', skip_version_check=True).volumes.\
+                revert_to_snapshot(volume_id, snapshot_id)
+        except cinder_exception.ClientException as ex:
+            with excutils.save_and_reraise_exception():
+                LOG.error('Failed revert volume %(vol_id)s to snapshot '
+                          '%(s_id)s. Error: %(msg)s Code: %(code)s',
+                          {
+                              'vol_id': volume_id,
+                              's_id': snapshot_id,
+                              'msg': six.text_type(ex),
+                              'code': getattr(ex, 'code', None)
+                          })

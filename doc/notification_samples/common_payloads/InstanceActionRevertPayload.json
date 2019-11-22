@@ -1,0 +1,8 @@
+{
+    "$ref": "InstanceActionPayload.json",
+    "nova_object.data": {
+        "snapshot_id": "79934713-ebc6-46d7-a3b0-df9fbe214129"
+    },
+    "nova_object.name": "InstanceActionRevertPayload",
+    "nova_object.version": "1.0"
+}

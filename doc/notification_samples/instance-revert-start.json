@@ -1,0 +1,11 @@
+{
+    "priority": "INFO",
+    "event_type": "instance.revert_to_snapshot.start",
+    "publisher_id": "nova-compute:compute",
+    "payload": {
+        "$ref": "common_payloads/InstanceActionRevertPayload.json#",
+        "nova_object.data": {
+            "task_state": "reverting"
+        }
+    }
+}

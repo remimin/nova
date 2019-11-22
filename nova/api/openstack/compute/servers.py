@@ -1186,6 +1186,26 @@ class ServersController(wsgi.Controller):
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                 'attach_monitor_device', id)
 
+    @wsgi.response(202)
+    @wsgi.expected_errors((400, 404, 409))
+    @wsgi.action('revert_to_snapshot')
+    @validation.schema(schema_servers.revert_to_snapshot)
+    def _action_revert_to_snapshot(self, req, id, body):
+        """Revert instance's system disk(volume) revert to snapshot."""
+        context = req.environ['nova.context']
+        instance = self._get_instance(context, id)
+        context.can(server_policies.SERVERS % 'revert_to_snapshot',
+                    target={'user_id': instance.user_id,
+                            'project_id': instance.project_id})
+        snapshot_id = body['revert_to_snapshot']['snapshot_id']
+        try:
+            self.compute_api.revert_to_snapshot(context, instance, snapshot_id)
+        except exception.SnapshotNotFound as ex:
+            raise exc.HTTPNotFound(explanation=ex.format_message())
+        except exception.InstanceInvalidState as state_error:
+            common.raise_http_conflict_for_instance_invalid_state(state_error,
+                'revert_to_snapshot', id)
+
 
 def remove_invalid_options(context, search_options, allowed_search_options):
     """Remove search options that are not valid for non-admin API/context."""

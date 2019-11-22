@@ -130,3 +130,6 @@ resizing_states = (RESIZE_PREP, RESIZE_MIGRATING, RESIZE_MIGRATED,
 
 # These states indicate a rebuild
 rebuild_states = (REBUILDING, REBUILD_BLOCK_DEVICE_MAPPING, REBUILD_SPAWNING)
+
+# pssible task states during revert_to_snapshot
+REVERTING = fields.InstanceTaskState.REVERTING

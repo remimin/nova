@@ -8697,3 +8697,147 @@ class ComputeManager(manager.Manager):
         compute_utils.notify_about_instance_action(context, instance,
                 self.host, action=fields.NotificationAction.MONITOR_ATTACH,
                 phase=fields.NotificationPhase.END)
+
+    @wrap_exception()
+    @wrap_instance_event(prefix='compute')
+    @wrap_instance_fault
+    def revert_to_snapshot(self, context, instance, snapshot):
+        LOG.info('Reverting instance to snapshot.', instance=instance)
+
+        snapshot_id = snapshot['id']
+        notify_extra_usage_info = {'snapshot_id': snapshot_id}
+        self._notify_about_instance_usage(
+            context, instance, "revert_to_snapshot.start",
+            extra_usage_info=notify_extra_usage_info)
+        compute_utils.notify_about_instance_revert_to_snapshot_action(
+            context, instance, self.host, snapshot_id,
+            phase=fields.NotificationPhase.START)
+        # update instance task_state to reverting
+        instance.task_state = task_states.REVERTING
+        instance.save()
+        root_bdm = objects.BlockDeviceMappingList.get_by_instance_uuid(
+            context, instance.uuid).root_bdm()
+        volume_id = root_bdm.volume_id
+        instance_uuid = instance.uuid
+        attachment_id = root_bdm.attachment_id
+        fault = None
+        detached = False
+        try:
+            if not attachment_id:
+                # legacy detach(no attachment).
+                LOG.debug(
+                    'Detaching volume %(vol_id)s to %(mnt)s before revert '
+                    'instance to snapshot %(s_id)s.',
+                    {'vol_id': volume_id,
+                     'mnt': root_bdm.device_name,
+                     's_id': snapshot_id}, instance=instance)
+                self.volume_api.detach(context, volume_id)
+            else:
+                LOG.debug(
+                    'Deleting volume %s attachment before revert instance '
+                    'to snapshot %s.',
+                    volume_id, snapshot_id, instance=instance)
+                self.volume_api.attachment_delete(context, attachment_id)
+            LOG.debug('Detach volume %s is successful.', volume_id,
+                      instance=instance)
+            detached = True
+            LOG.info('Begin revert instance.')
+            self.volume_api.revert_to_snapshot(context, volume_id, snapshot_id)
+        except (exception.SnapshotNotFound,
+                exception.OverQuota,
+                exception.InvalidVolume) as e:
+            LOG.error('Failed revert instance to snapshot %s.',
+                      snapshot_id, instance=instance)
+            fault = e
+        except (exception.VolumeNotFound,
+                exception.VolumeAttachmentNotFound) as e:
+            with excutils.save_and_reraise_exception():
+                tb = traceback.format_exc()
+                LOG.error('Terminating revert instance to snapshot, because of'
+                          ' detaching root volume is failed. Error: %s',
+                          six.text_type(ex))
+                instance.task_state = None
+                instance.save()
+                self._notify_about_instance_usage(
+                    context, instance, "revert_to_snapshot.error",
+                    extra_usage_info=notify_extra_usage_info,
+                    fault=e)
+                compute_utils.notify_about_instance_revert_to_snapshot_action(
+                    context, instance, self.host, snapshot_id,
+                    phase=fields.NotificationPhase.ERROR,
+                    exception=e, tb=tb)
+        except Exception as e:
+            LOG.exception('Unexpected build failure about reverting '
+                          'instance to snapshot.', instance=instance)
+            fault = e
+        else:
+            with timeutils.StopWatch() as timer:
+                # revert_to_snapshot is a async call for cinder, so we must
+                # wait snapshot status become available or error
+                try:
+                    self._wait_for_revert_to_snapshots_completion(context,
+                                                                  snapshot_id)
+                except Exception as error:
+                    LOG.exception("Exception while waiting completion of "
+                                  "volume revert to snapshots: %s",
+                                  error, instance=instance)
+            LOG.info('Took %0.2f seconds to revert instance to snapshot.',
+                     timer.elapsed(), instance=instance)
+        if detached:
+            if not attachment_id:
+                LOG.debug('Attaching volume %(vol_id)s to %(mnt)s after revert'
+                          ' instance to snapshot %(s_id)s.',
+                          {'vol_id': volume_id,
+                           'mnt': root_bdm.device_name,
+                           's_id': snapshot_id}, instance=instance)
+                self.volume_api.attach(context, volume_id, instance_uuid,
+                                       root_bdm.device_name)
+            else:
+                LOG.debug('Creating and completing a new attachment for root '
+                          'volume %(vol_id)s after revert instance to snapshot'
+                          ' %(s_id)s.',
+                          {'vol_id': volume_id,
+                           's_id': snapshot_id}, instance=instance)
+                attachment = self.volume_api.attachment_create(context,
+                                                               volume_id,
+                                                               instance_uuid)
+                connector = self.driver.get_volume_connector(instance)
+                self.volume_api.attachment_update(context, attachment['id'],
+                                                  connector,
+                                                  mountpoint=root_bdm.device_name)
+                self.volume_api.attachment_complete(context, attachment['id'])
+                # update attachment_id for block_device_mapping(root) beacause
+                # we recreate a new attachment for the root volume.
+                root_bdm.attachment_id = attachment['id']
+                root_bdm.save()
+        instance.task_state = None
+        instance.save()
+        if fault:
+            tb = traceback.format_exc()
+            self._notify_about_instance_usage(
+                context, instance, "revert_to_snapshot.error",
+                extra_usage_info=notify_extra_usage_info,
+                fault=fault)
+            compute_utils.notify_about_instance_revert_to_snapshot_action(
+                context, instance, self.host, snapshot_id,
+                phase=fields.NotificationPhase.ERROR,
+                exception=fault, tb=tb)
+        else:
+            self._notify_about_instance_usage(
+                context, instance, "revert_to_snapshot.end",
+                extra_usage_info=notify_extra_usage_info)
+            compute_utils.notify_about_instance_revert_to_snapshot_action(
+                context, instance, self.host, snapshot_id,
+                phase=fields.NotificationPhase.END)
+            LOG.info('Reverting instance to snapshot is successful.',
+                     instance=instance)
+
+    def _wait_for_revert_to_snapshots_completion(self, context, snapshot_id):
+        def _wait_snapshot():
+            snapshot = self.volume_api.get_snapshot(
+                context, snapshot_id)
+            if snapshot.get('status') != 'restoring':
+                raise loopingcall.LoopingCallDone()
+
+        timer = loopingcall.FixedIntervalLoopingCall(_wait_snapshot)
+        timer.start(interval=0.5).wait()
