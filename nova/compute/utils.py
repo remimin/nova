@@ -1192,13 +1192,13 @@ def notify_about_instance_delete(notifier, context, instance,
 
 @rpc.if_notifications_enabled
 def notify_about_instance_revert_to_snapshot_action(context, instance, host,
-                                                    snapshot_id, phase=None,
-                                                    exception=None, tb=None):
+        volume_id, snapshot_id, phase=None, exception=None, tb=None):
     """Send versioned notification about the action made on the instance
 
     :param context: nova context object
     :param instance: the instance which the action performed on
     :param host: the host emitting the notification
+    :param volume_id: the uuid for volume
     :param snapshot_id: the uuid for snapshot object
     :param phase: the phase of the action
     :param exception: the thrown exception (used in error notifications)
@@ -1209,6 +1209,7 @@ def notify_about_instance_revert_to_snapshot_action(context, instance, host,
             context=context,
             instance=instance,
             fault=fault,
+            volume_id=volume_id,
             snapshot_id=snapshot_id)
 
     notification = instance_notification.InstanceActionRevertNotification(

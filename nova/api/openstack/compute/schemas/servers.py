@@ -641,9 +641,10 @@ revert_to_snapshot = {
         'revert_to_snapshot': {
             'type': 'object',
             'properties': {
-                'snapshot_id': {'type': 'string', 'format': 'uuid'}
+                'snapshot_id': {'type': 'string', 'format': 'uuid'},
+                'volume_id': {'type': 'string', 'format': 'uuid'}
             },
-            'required': ['snapshot_id'],
+            'required': ['volume_id', 'snapshot_id'],
             'additionalProperties': False,
         },
     },

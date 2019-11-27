@@ -8701,25 +8701,24 @@ class ComputeManager(manager.Manager):
     @wrap_exception()
     @wrap_instance_event(prefix='compute')
     @wrap_instance_fault
-    def revert_to_snapshot(self, context, instance, snapshot):
+    def revert_to_snapshot(self, context, instance, volume_id, snapshot_id):
         LOG.info('Reverting instance to snapshot.', instance=instance)
 
-        snapshot_id = snapshot['id']
-        notify_extra_usage_info = {'snapshot_id': snapshot_id}
+        notify_extra_usage_info = {'volume_id': volume_id,
+                                   'snapshot_id': snapshot_id}
         self._notify_about_instance_usage(
             context, instance, "revert_to_snapshot.start",
             extra_usage_info=notify_extra_usage_info)
         compute_utils.notify_about_instance_revert_to_snapshot_action(
-            context, instance, self.host, snapshot_id,
+            context, instance, self.host, volume_id, snapshot_id,
             phase=fields.NotificationPhase.START)
         # update instance task_state to reverting
         instance.task_state = task_states.REVERTING
         instance.save()
-        root_bdm = objects.BlockDeviceMappingList.get_by_instance_uuid(
-            context, instance.uuid).root_bdm()
-        volume_id = root_bdm.volume_id
+        bdm = objects.BlockDeviceMapping.get_by_volume_and_instance(
+            context, volume_id, instance.uuid)
         instance_uuid = instance.uuid
-        attachment_id = root_bdm.attachment_id
+        attachment_id = bdm.attachment_id
         fault = None
         detached = False
         try:
@@ -8729,7 +8728,7 @@ class ComputeManager(manager.Manager):
                     'Detaching volume %(vol_id)s to %(mnt)s before revert '
                     'instance to snapshot %(s_id)s.',
                     {'vol_id': volume_id,
-                     'mnt': root_bdm.device_name,
+                     'mnt': bdm.device_name,
                      's_id': snapshot_id}, instance=instance)
                 self.volume_api.detach(context, volume_id)
             else:
@@ -8763,7 +8762,7 @@ class ComputeManager(manager.Manager):
                     extra_usage_info=notify_extra_usage_info,
                     fault=e)
                 compute_utils.notify_about_instance_revert_to_snapshot_action(
-                    context, instance, self.host, snapshot_id,
+                    context, instance, self.host, volume_id, snapshot_id,
                     phase=fields.NotificationPhase.ERROR,
                     exception=e, tb=tb)
         except Exception as e:
@@ -8788,10 +8787,10 @@ class ComputeManager(manager.Manager):
                 LOG.debug('Attaching volume %(vol_id)s to %(mnt)s after revert'
                           ' instance to snapshot %(s_id)s.',
                           {'vol_id': volume_id,
-                           'mnt': root_bdm.device_name,
+                           'mnt': bdm.device_name,
                            's_id': snapshot_id}, instance=instance)
                 self.volume_api.attach(context, volume_id, instance_uuid,
-                                       root_bdm.device_name)
+                                       bdm.device_name)
             else:
                 LOG.debug('Creating and completing a new attachment for root '
                           'volume %(vol_id)s after revert instance to snapshot'
@@ -8804,12 +8803,12 @@ class ComputeManager(manager.Manager):
                 connector = self.driver.get_volume_connector(instance)
                 self.volume_api.attachment_update(context, attachment['id'],
                                                   connector,
-                                                  mountpoint=root_bdm.device_name)
+                                                  mountpoint=bdm.device_name)
                 self.volume_api.attachment_complete(context, attachment['id'])
                 # update attachment_id for block_device_mapping(root) beacause
                 # we recreate a new attachment for the root volume.
-                root_bdm.attachment_id = attachment['id']
-                root_bdm.save()
+                bdm.attachment_id = attachment['id']
+                bdm.save()
         instance.task_state = None
         instance.save()
         if fault:
@@ -8819,7 +8818,7 @@ class ComputeManager(manager.Manager):
                 extra_usage_info=notify_extra_usage_info,
                 fault=fault)
             compute_utils.notify_about_instance_revert_to_snapshot_action(
-                context, instance, self.host, snapshot_id,
+                context, instance, self.host, volume_id, snapshot_id,
                 phase=fields.NotificationPhase.ERROR,
                 exception=fault, tb=tb)
         else:
@@ -8827,7 +8826,7 @@ class ComputeManager(manager.Manager):
                 context, instance, "revert_to_snapshot.end",
                 extra_usage_info=notify_extra_usage_info)
             compute_utils.notify_about_instance_revert_to_snapshot_action(
-                context, instance, self.host, snapshot_id,
+                context, instance, self.host, volume_id, snapshot_id,
                 phase=fields.NotificationPhase.END)
             LOG.info('Reverting instance to snapshot is successful.',
                      instance=instance)

@@ -342,6 +342,7 @@ class ComputeAPI(object):
                  potential alternate hosts for retries within a cell.
         * 4.22 - Add request_spec to rebuild_instance()
         * 4.23 - Add revert_to_snapshot method
+        * 4.24 - Add volume to revert_to_snapshot
 
         ... Version 5.0 is functionally equivalent to 4.22, aside from
         removing deprecated parameters. Queens sends 5.0 by default,
@@ -1098,9 +1099,10 @@ class ComputeAPI(object):
                 server=_compute_host(None, instance), version=version)
         cctxt.cast(ctxt, 'attach_monitor_device', instance=instance)
 
-    def revert_to_snapshot(self, context, instance, snapshot):
+    def revert_to_snapshot(self, context, instance, volume_id, snapshot_id):
         version = '5.0'
         cctxt = self.router.client(context).prepare(
             server=_compute_host(None, instance), version=version)
         cctxt.cast(context, "revert_to_snapshot",
-                   instance=instance, snapshot=snapshot)
+                   instance=instance, volume_id=volume_id,
+                   snapshot_id=snapshot_id)

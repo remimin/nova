@@ -734,14 +734,16 @@ class InstanceActionRevertPayload(InstanceActionPayload):
     VERSION = '1.0'
     fields = {
         'snapshot_id': fields.UUIDField(),
+        'volume_id': fields.UUIDField()
     }
 
-    def __init__(self, context, instance, fault, snapshot_id):
+    def __init__(self, context, instance, fault, volume_id, snapshot_id):
         super(InstanceActionRevertPayload, self).__init__(
                 context=context,
                 instance=instance,
                 fault=fault)
         self.snapshot_id = snapshot_id
+        self.volume_id = volume_id
 
 
 @base.notification_sample('instance-revert-start.json')

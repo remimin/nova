@@ -1,6 +1,7 @@
 {
     "$ref": "InstanceActionPayload.json",
     "nova_object.data": {
+        "volume_id": "479cb20c-2d08-4929-b410-0ffd79d5000a",
         "snapshot_id": "79934713-ebc6-46d7-a3b0-df9fbe214129"
     },
     "nova_object.name": "InstanceActionRevertPayload",
