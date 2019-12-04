@@ -455,10 +455,8 @@ def translate_snapshot_revert_exception(method):
             _reraise(exception.InvalidVolume(
                 reason="Cannot revert volume %(vol_id)s to its snapshot "
                        "%(s_id)s. Volume's and snapshot's status must be "
-                       "available") % {
-                'vol_id': volume_id,
-                's_id': snapshot_id
-            })
+                       "available" %
+                       {'vol_id': volume_id, 's_id': snapshot_id}))
         return res
     return translate_cinder_exception(wrapper)
 
@@ -903,13 +901,7 @@ class API(object):
             cinderclient(
                 context, '3.44', skip_version_check=True).volumes.\
                 revert_to_snapshot(volume_id, snapshot_id)
-        except cinder_exception.ClientException as ex:
+        except cinder_exception.ClientException:
             with excutils.save_and_reraise_exception():
-                LOG.error('Failed revert volume %(vol_id)s to snapshot '
-                          '%(s_id)s. Error: %(msg)s Code: %(code)s',
-                          {
-                              'vol_id': volume_id,
-                              's_id': snapshot_id,
-                              'msg': six.text_type(ex),
-                              'code': getattr(ex, 'code', None)
-                          })
+                LOG.error('Failed revert volume %s to snapshot %s.',
+                           volume_id, snapshot_id)

@@ -8699,6 +8699,7 @@ class ComputeManager(manager.Manager):
                 phase=fields.NotificationPhase.END)
 
     @wrap_exception()
+    @reverts_task_state
     @wrap_instance_event(prefix='compute')
     @wrap_instance_fault
     def revert_to_snapshot(self, context, instance, volume_id, snapshot_id):
@@ -8753,10 +8754,7 @@ class ComputeManager(manager.Manager):
             with excutils.save_and_reraise_exception():
                 tb = traceback.format_exc()
                 LOG.error('Terminating revert instance to snapshot, because of'
-                          ' detaching root volume is failed. Error: %s',
-                          six.text_type(ex))
-                instance.task_state = None
-                instance.save()
+                          ' detaching the volume is failed.')
                 self._notify_about_instance_usage(
                     context, instance, "revert_to_snapshot.error",
                     extra_usage_info=notify_extra_usage_info,
@@ -8776,39 +8774,49 @@ class ComputeManager(manager.Manager):
                 try:
                     self._wait_for_revert_to_snapshots_completion(context,
                                                                   snapshot_id)
-                except Exception as error:
+                except Exception:
                     LOG.exception("Exception while waiting completion of "
-                                  "volume revert to snapshots: %s",
-                                  error, instance=instance)
-            LOG.info('Took %0.2f seconds to revert instance to snapshot.',
-                     timer.elapsed(), instance=instance)
-        if detached:
-            if not attachment_id:
-                LOG.debug('Attaching volume %(vol_id)s to %(mnt)s after revert'
-                          ' instance to snapshot %(s_id)s.',
-                          {'vol_id': volume_id,
-                           'mnt': bdm.device_name,
-                           's_id': snapshot_id}, instance=instance)
-                self.volume_api.attach(context, volume_id, instance_uuid,
-                                       bdm.device_name)
-            else:
-                LOG.debug('Creating and completing a new attachment for root '
-                          'volume %(vol_id)s after revert instance to snapshot'
-                          ' %(s_id)s.',
-                          {'vol_id': volume_id,
-                           's_id': snapshot_id}, instance=instance)
-                attachment = self.volume_api.attachment_create(context,
-                                                               volume_id,
-                                                               instance_uuid)
-                connector = self.driver.get_volume_connector(instance)
-                self.volume_api.attachment_update(context, attachment['id'],
-                                                  connector,
-                                                  mountpoint=bdm.device_name)
-                self.volume_api.attachment_complete(context, attachment['id'])
-                # update attachment_id for block_device_mapping(root) beacause
-                # we recreate a new attachment for the root volume.
-                bdm.attachment_id = attachment['id']
-                bdm.save()
+                                  "volume revert to snapshots.",
+                                  instance=instance)
+                else:
+                    LOG.info('Took %0.2f seconds to revert instance to '
+                             'snapshot.', timer.elapsed(), instance=instance)
+        try:
+            if detached:
+                if not attachment_id:
+                    LOG.debug('Attaching volume %(vol_id)s to %(mnt)s after '
+                              'revert instance to snapshot %(s_id)s.',
+                              {'vol_id': volume_id,
+                               'mnt': bdm.device_name,
+                               's_id': snapshot_id}, instance=instance)
+                    self.volume_api.attach(context, volume_id, instance_uuid,
+                                           bdm.device_name)
+                else:
+                    LOG.debug('Creating and completing a new attachment for '
+                              'the volume %(vol_id)s after revert instance '
+                              'to snapshot %(s_id)s.',
+                              {'vol_id': volume_id,
+                               's_id': snapshot_id}, instance=instance)
+                    attachment = self.volume_api.attachment_create(
+                        context, volume_id, instance_uuid)
+                    connector = self.driver.get_volume_connector(instance)
+                    self.volume_api.attachment_update(
+                        context, attachment['id'], connector,
+                        mountpoint=bdm.device_name)
+                    self.volume_api.attachment_complete(context,
+                                                        attachment['id'])
+                    # update attachment_id for block_device_mapping(volume)
+                    # because we recreate a new attachment for the volume.
+                    bdm.attachment_id = attachment['id']
+                    bdm.save()
+        except Exception as ex:
+            LOG.error('Failed to attach the volume %s to instance. '
+                      'DevOps must solve the problem about attaching, and '
+                      'then reset the instance\'s state and reattach this '
+                      'volume to the instance.',
+                      volume_id, instance=instance)
+            instance.vm_state = vm_states.ERROR
+            fault = ex
         instance.task_state = None
         instance.save()
         if fault:
