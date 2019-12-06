@@ -6202,10 +6202,13 @@ class ComputeManager(manager.Manager):
                                          False)):
             raise exception.NetworkInterfaceTaggedAttachNotSupported()
 
+        info = {'port_id': port_id}
         compute_utils.notify_about_instance_action(
             context, instance, self.host,
             action=fields.NotificationAction.INTERFACE_ATTACH,
             phase=fields.NotificationPhase.START)
+        self._notify_about_instance_usage(
+            context, instance, "interface_attach.start", extra_usage_info=info)
 
         bind_host_id = self.driver.network_binding_host_id(context, instance)
         network_info = self.network_api.allocate_port_for_instance(
@@ -6242,6 +6245,9 @@ class ComputeManager(manager.Manager):
                 action=fields.NotificationAction.INTERFACE_ATTACH,
                 phase=fields.NotificationPhase.ERROR,
                 exception=ex, tb=tb)
+            self._notify_about_instance_usage(
+                context, instance, "interface_attach.error",
+                extra_usage_info=info, fault=ex)
 
             raise exception.InterfaceAttachFailed(
                 instance_uuid=instance.uuid)
@@ -6250,6 +6256,9 @@ class ComputeManager(manager.Manager):
             context, instance, self.host,
             action=fields.NotificationAction.INTERFACE_ATTACH,
             phase=fields.NotificationPhase.END)
+        self._notify_about_instance_usage(
+            context, instance, "interface_attach.end",
+            extra_usage_info=info)
 
         return network_info[0]
 
@@ -6267,11 +6276,14 @@ class ComputeManager(manager.Manager):
         if condemned is None:
             raise exception.PortNotFound(_("Port %s is not "
                                            "attached") % port_id)
-
+        info = {'port_id': port_id}
         compute_utils.notify_about_instance_action(
             context, instance, self.host,
             action=fields.NotificationAction.INTERFACE_DETACH,
             phase=fields.NotificationPhase.START)
+        self._notify_about_instance_usage(
+            context, instance, "interface_detach.start",
+            extra_usage_info=info)
 
         try:
             self.driver.detach_interface(context, instance, condemned)
@@ -6285,6 +6297,10 @@ class ComputeManager(manager.Manager):
                     "Detach interface failed, port_id=%(port_id)s, reason: "
                     "%(msg)s", {'port_id': port_id, 'msg': ex},
                     instance=instance)
+
+            self._notify_about_instance_usage(
+                context, instance, "interface_detach.error",
+                extra_usage_info=info, fault=ex)
             raise exception.InterfaceDetachFailed(instance_uuid=instance.uuid)
         else:
             try:
@@ -6303,6 +6319,9 @@ class ComputeManager(manager.Manager):
             context, instance, self.host,
             action=fields.NotificationAction.INTERFACE_DETACH,
             phase=fields.NotificationPhase.END)
+        self._notify_about_instance_usage(
+            context, instance, "interface_detach.end",
+            extra_usage_info=info)
 
     def _get_compute_info(self, context, host):
         return objects.ComputeNode.get_first_node_by_host_for_old_compat(
