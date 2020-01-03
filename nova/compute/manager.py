@@ -2938,7 +2938,8 @@ class ComputeManager(manager.Manager):
                         device_name=root_bdm.device_name,
                         disk_bus=root_bdm.disk_bus,
                         device_type=root_bdm.device_type,
-                        tag=root_bdm.tag)
+                        tag=root_bdm.tag,
+                        delete_on_termination=root_bdm.delete_on_termination)
                 else:
                     if legacy_image_defined:
                         image_defined_bdms = block_device.from_legacy_mapping(
@@ -2948,11 +2949,14 @@ class ComputeManager(manager.Manager):
                                                       image_defined_bdms))
                     for _bdm in image_defined_bdms:
                         if _bdm['boot_index'] == 0:
-                            _bdm.update(dict(instance_uuid=instance.uuid,
-                                             tag=root_bdm.tag,
-                                             volume_id=new_root_volume['id'],
-                                             disk_bus=root_bdm.disk_bus,
-                                             device_name=root_bdm.device_name))
+                            _bdm.update(
+                                dict(instance_uuid=instance.uuid,
+                                     tag=root_bdm.tag,
+                                     volume_id=new_root_volume['id'],
+                                     disk_bus=root_bdm.disk_bus,
+                                     device_name=root_bdm.device_name,
+                                     delete_on_termination=\
+                                        root_bdm.delete_on_termination))
                             new_root_bdm = objects.BlockDeviceMapping(
                                 context=context, **_bdm)
                             break
@@ -2968,8 +2972,8 @@ class ComputeManager(manager.Manager):
                         self.volume_api.delete(context,
                                                old_root_volume['id'])
                     except Exception as exc:
-                        LOG.warning(_LW('Failed to delete volume: '
-                                        '%(volume_id)s due to %(exc)s'),
+                        LOG.warning('Failed to delete volume: '
+                                    '%(volume_id)s due to %(exc)s',
                                     {'volume_id': root_bdm.volume_id,
                                      'exc': exc})
                 new_bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
