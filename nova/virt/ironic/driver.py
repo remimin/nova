@@ -21,6 +21,7 @@ bare metal resources.
 import base64
 from distutils import version
 import gzip
+import os
 import shutil
 import tempfile
 import time
@@ -89,6 +90,44 @@ _CONSOLE_STATE_CHECKING_INTERVAL = 1
 # Number of hash ring partitions per service
 # 5 should be fine for most deployments, as an experimental feature.
 _HASH_RING_PARTITIONS = 2 ** 5
+
+# user data template for telegraf.
+TELEGRAF_USER_DATA_BASE = """\
+#cloud-config
+write_files:
+    - encoding: b64
+      content: %(telegraf_data)s
+      owner: root:root
+      path: %(telegraf_config_path)s
+      permissions: '0644'
+"""
+
+# We have to restart the telegraf service after cloud-init generate the config
+# file for it.
+TELEGRAF_USER_DATA_SYSTEMD = TELEGRAF_USER_DATA_BASE + '''\
+runcmd:
+    - systemctl restart telegraf.service
+'''
+
+TELEGRAF_USER_DATA_WINDOWS = """\
+#cloud-config
+write_files:
+    - encoding: b64
+      content: %(telegraf_data)s
+      path: '%(telegraf_config_path)s'
+      permissions: '0644'
+"""
+# For windows, use shell-script plugin not runcmd plugin which belongs to
+# cloud-config plugin to restart telegraf service, because cloudbaseinit
+# doesn't have runcmd plugin.
+TELEGRAF_USER_DATA_WINDOWS_RESTART = """\
+rem cmd restart telegraf
+net stop telegraf
+net start telegraf
+"""
+
+TELEGRAF_CONFIG_PREFIX = 'telegraf_template_'
+TELEGRAF_USER_DATA_FILENAME_PREFIX = 'TELEGRAF_'
 
 
 def map_power_state(state):
@@ -1037,6 +1076,67 @@ class IronicDriver(virt_driver.ComputeDriver):
                 compressed.seek(0)
                 return base64.b64encode(compressed.read())
 
+    def _load_telegraf_template(self, instance, image_meta):
+        os_type = image_meta.properties.get('os_type', None)
+        telegraf_config_path = image_meta.properties.get(
+            'telegraf_config_path', None)
+        # If os_type or telegraf_config_path is None, we will not add user data
+        # for telegraf.
+        if not os_type or not telegraf_config_path:
+            return None
+        telegraf_data = None
+        telegraf_config_name = TELEGRAF_CONFIG_PREFIX + \
+                               ('windows' if os_type == 'windows' else 'linux')
+        LOG.debug('Loading telegraf config file %s.',
+                  telegraf_config_name, instance=instance)
+        with open(os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                               telegraf_config_name), 'r') as f:
+            telegraf_data = f.read().format(instance.uuid,
+                                            os_type,
+                                            instance.uuid)
+        return telegraf_data
+
+    def _get_telegraf_user_data(self, image_meta, telegraf_data):
+        """Geting the user data about telegraf according to type(e.g. windows,
+        centos, ubuntu etc.) and version of the system.
+        """
+        os_type = image_meta.properties.get('os_type')
+        if os_type == 'windows':
+            user_data_list = [TELEGRAF_USER_DATA_WINDOWS % {
+                'telegraf_data': base64.b64encode(telegraf_data),
+                'telegraf_config_path':
+                    image_meta.properties.get('telegraf_config_path')},
+                              TELEGRAF_USER_DATA_WINDOWS_RESTART]
+        else:
+            user_data_list = [TELEGRAF_USER_DATA_SYSTEMD % {
+                'telegraf_data': base64.b64encode(telegraf_data),
+                'telegraf_config_path':
+                    image_meta.properties.get('telegraf_config_path')}]
+        telegraf_user_data = []
+        for user_data in user_data_list:
+            telegraf_user_data.append(
+                {TELEGRAF_USER_DATA_FILENAME_PREFIX +
+                 utils.filename_generator(): user_data})
+        return telegraf_user_data
+
+    def _add_telegraf_user_data(self, instance, image_meta):
+        telegraf_data = self._load_telegraf_template(instance, image_meta)
+        if telegraf_data:
+            telegraf_user_data = self._get_telegraf_user_data(image_meta,
+                                                              telegraf_data)
+            origin_user_data = instance.user_data
+            if not origin_user_data:
+                current_user_data = telegraf_user_data
+            else:
+                current_user_data = [
+                    {utils.filename_generator():
+                         base64.b64decode(origin_user_data)}]
+                current_user_data.extend(telegraf_user_data)
+            # we have to combine telegraf_user_data with it.
+            instance.user_data = utils.combine_user_data(current_user_data)
+
+            instance.save()
+
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
               block_device_info=None):
@@ -1066,6 +1166,8 @@ class IronicDriver(virt_driver.ComputeDriver):
             raise ironic.exc.BadRequest(
                 _("Ironic node uuid not supplied to "
                   "driver for instance %s.") % instance.uuid)
+
+        self._add_telegraf_user_data(instance, image_meta)
 
         node = self._get_node(node_uuid)
         flavor = instance.flavor

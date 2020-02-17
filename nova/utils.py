@@ -27,9 +27,12 @@ import os
 import random
 import re
 import shutil
+import string
 import tempfile
 import time
 
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 import eventlet
 from keystoneauth1 import exceptions as ks_exc
 from keystoneauth1 import loading as ks_loading
@@ -40,6 +43,7 @@ from oslo_concurrency import processutils
 from oslo_context import context as common_context
 from oslo_log import log as logging
 import oslo_messaging as messaging
+from oslo_serialization import base64
 from oslo_utils import encodeutils
 from oslo_utils import excutils
 from oslo_utils import importutils
@@ -95,6 +99,17 @@ if hasattr(inspect, 'getfullargspec'):
     getargspec = inspect.getfullargspec
 else:
     getargspec = inspect.getargspec
+
+
+MIME_MAPPINGS = {
+    '#include': 'x-include-url',
+    '#!': 'x-shellscript',
+    'rem': 'x-shellscript',
+    '#cloud-config': 'cloud-config',
+    '#upstart-job': 'upstart-job',
+    '#part-handler': 'part-handler',
+    '#cloud-boothook': 'cloud-boothook',
+}
 
 
 def get_root_helper():
@@ -1339,3 +1354,34 @@ def run_once(message, logger, cleanup=None):
         wrapper.reset = functools.partial(reset, wrapper)
         return wrapper
     return outer_wrapper
+
+
+def combine_user_data(user_data_list):
+    """Combine user data.
+    :param user_data_list: Dict value. e.g.
+                          [ {'IF3VEQA5': 'W2dsb'}, {'02UK62QP', 'RuYW1'} ]
+                          The key of dict is filename for user_data, value of
+                          dict is value for user_data.
+    """
+    combined_user_data = MIMEMultipart()
+    for user_data in user_data_list:
+        filename = user_data.keys()[0]
+        user_data_info = user_data.values()[0]
+        user_data_type = _get_type(user_data_info)
+        sub_user_data = MIMEText(user_data_info, _subtype=user_data_type)
+        sub_user_data.add_header('Content-Disposition',
+                                 'attachment; filename="%s"' % filename)
+        combined_user_data.attach(sub_user_data)
+    return base64.encode_as_text(combined_user_data.as_string())
+
+
+def _get_type(user_data):
+    for k, v in MIME_MAPPINGS.items():
+        if user_data.startswith(k):
+            return v
+    return "plain"
+
+
+def filename_generator(size=8,
+                        chars=string.ascii_uppercase + string.digits):
+    return ''.join(random.choice(chars) for _ in range(size))

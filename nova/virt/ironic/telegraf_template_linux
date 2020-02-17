@@ -1,0 +1,43 @@
+[global_tags]
+vm_uuid = "{0}"
+vm_os_type = "{1}"
+[agent]
+interval = "60s"
+round_interval = true
+metric_batch_size = 1000
+metric_buffer_limit = 10000
+collection_jitter = "5s"
+flush_interval = "60s"
+flush_jitter = "10s"
+debug = false
+quiet = false
+hostname = "{2}"
+omit_hostname = false
+logfile = "/var/log/wocloud_monitor.log"
+[[outputs.file]]
+files = ["/dev/virtio-ports/org.qemu.telegraf_agent.0"]
+data_format = "influx"
+[[inputs.cpu]]
+percpu = false
+totalcpu = true
+fielddrop = ["time_*"]
+name_prefix = "vm_linux_"
+[[inputs.disk]]
+ignore_fs = ["tmpfs", "devtmpfs", "devfs"]
+name_prefix = "vm_linux_"
+[[inputs.diskio]]
+name_prefix = "vm_linux_"
+[[inputs.kernel]]
+name_prefix = "vm_linux_"
+[[inputs.mem]]
+name_prefix = "vm_linux_"
+[[inputs.processes]]
+name_prefix = "vm_linux_"
+[[inputs.swap]]
+name_prefix = "vm_linux_"
+[[inputs.system]]
+name_prefix = "vm_linux_"
+[[inputs.net]]
+name_prefix = "vm_linux_"
+[[inputs.netstat]]
+name_prefix = "vm_linux_"
