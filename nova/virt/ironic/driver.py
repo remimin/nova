@@ -20,6 +20,7 @@ bare metal resources.
 """
 import base64
 from distutils import version
+import email
 import gzip
 import os
 import shutil
@@ -1690,6 +1691,39 @@ class IronicDriver(virt_driver.ComputeDriver):
         # to date immediately after detachment.
         self.unplug_vifs(instance, [vif])
 
+    def _is_skippable(self, part):
+        # multipart/* are just containers
+        # origin user_data must remove
+        part_maintype = part.get_content_maintype() or ''
+        is_telegraf_user_data = part.get_filename() and \
+                                part.get_filename().startswith(
+                                    TELEGRAF_USER_DATA_FILENAME_PREFIX)
+        if part_maintype.lower() == 'multipart' or is_telegraf_user_data:
+            return True
+        return False
+
+    def _replace_telegraf_user_data(self, instance, image_meta):
+        origin_user_data = instance.user_data
+        current_user_data = []
+        if origin_user_data:
+            origin_user_data = base64.b64decode(origin_user_data)
+            parts = email.message_from_string(origin_user_data).walk()
+            for part in parts:
+                if not self._is_skippable(part):
+                    current_user_data.append(
+                        {utils.filename_generator(): part.get_payload()})
+
+        telegraf_data = self._load_telegraf_template(instance, image_meta)
+        if telegraf_data:
+            telegraf_user_data = self._get_telegraf_user_data(image_meta,
+                                                              telegraf_data)
+            current_user_data.extend(telegraf_user_data)
+        if not current_user_data:
+            instance.user_data = None
+        else:
+            instance.user_data = utils.combine_user_data(current_user_data)
+        instance.save()
+
     def rebuild(self, context, instance, image_meta, injected_files,
                 admin_password, allocations, bdms, detach_block_devices,
                 attach_block_devices, network_info=None,
@@ -1743,6 +1777,9 @@ class IronicDriver(virt_driver.ComputeDriver):
 
         node_uuid = instance.node
         node = self._get_node(node_uuid)
+
+        if not evacuate:
+            self._replace_telegraf_user_data(instance, image_meta)
 
         self._add_instance_info_to_node(node, instance, image_meta,
                                         instance.flavor, preserve_ephemeral)
