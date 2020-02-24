@@ -14,8 +14,8 @@ quiet = false
 hostname = "{2}"
 omit_hostname = false
 logfile = "/var/log/wocloud_monitor.log"
-[[outputs.file]]
-files = ["/dev/virtio-ports/org.qemu.telegraf_agent.0"]
+[[outputs.socket_writer]]
+address = "tcp4://169.254.169.254:81"
 data_format = "influx"
 [[inputs.cpu]]
 percpu = false

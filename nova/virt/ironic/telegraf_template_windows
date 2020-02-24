@@ -13,8 +13,8 @@ flush_jitter = "10s"
 debug = false
 quiet = false
 Hostname = "{2}"
-[[outputs.file]]
-files = ["\\\\.\\Global\\org.qemu.telegraf_agent.0"]
+[[outputs.socket_writer]]
+address = "tcp4://169.254.169.254:81"
 data_format = "influx"
 [[inputs.win_perf_counters]]
 [[inputs.win_perf_counters.object]]
