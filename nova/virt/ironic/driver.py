@@ -127,8 +127,58 @@ net stop telegraf
 net start telegraf
 """
 
+LINK_AGGREGATION_USER_DATA_FOR_WINDOWS = """\
+#ps1_sysnative
+# Load network_data.json
+$dir_data_config_file = (Get-ChildItem -Path ($PSCommandPath | Split-Path \
+-Parent) -Filter 'network_data.json' -File -Recurse).fullname
+$network_data = Get-Content -Raw -Path $dir_data_config_file | ConvertFrom-Json
+
+# Create NIC Teaming base on netwok_data.json
+$MAC_MASTER=''
+foreach ($nic in $network_data.links)
+{
+    if ($nic.type -like 'bond')
+    {
+        $nic_master=Get-NetAdapter | where MacAddress -eq \
+$nic.ethernet_mac_address.Replace(':','-').ToUpper()
+        $MAC_MASTER = $nic.ethernet_mac_address.Replace(':','-').ToUpper()
+        $TEAM_MODE=''
+        $bond_mode=$nic.bond_mode.ToLower()
+        if ($bond_mode -like '%(mode_lacp)s')
+        {
+            $TEAM_MODE='LACP'
+        }
+        elseif ($bond_mode -like '%(mode_static)s')
+        {
+            $TEAM_MODE='Static'
+        }
+        elseif ($bond_mode -like '%(mode_switchindependent)s')
+        {
+            $TEAM_MODE='SwitchIndependent'
+        }
+        else
+        {
+            exit 1
+        }
+        New-NetLbfoTeam -Name 'openstack' -TeamMembers $nic_master.Name \
+-TeamingMode $TEAM_MODE -LoadBalancingAlgorithm \
+MacAddresses -Confirm:$false
+    }
+    if ($nic.type -like 'phy')
+    {
+        $MAC_MEMBER = $nic.ethernet_mac_address.Replace(':','-').ToUpper()
+        if($MAC_MEMBER -notlike $MAC_MASTER)
+        {
+            $nic_member=Get-NetAdapter | where MacAddress -eq $MAC_MEMBER
+            Add-NetLbfoTeamMember -Name $nic_member.Name -Team 'openstack' \
+-Confirm:$false
+        }
+    }
+}
+"""
 TELEGRAF_CONFIG_PREFIX = 'telegraf_template_'
-TELEGRAF_USER_DATA_FILENAME_PREFIX = 'TELEGRAF_'
+CUSTOM_USER_DATA_FILENAME_PREFIX = 'CUSTOM_'
 
 
 def map_power_state(state):
@@ -1107,7 +1157,7 @@ class IronicDriver(virt_driver.ComputeDriver):
                 'telegraf_data': base64.b64encode(telegraf_data),
                 'telegraf_config_path':
                     image_meta.properties.get('telegraf_config_path')},
-                              TELEGRAF_USER_DATA_WINDOWS_RESTART]
+                TELEGRAF_USER_DATA_WINDOWS_RESTART]
         else:
             user_data_list = [TELEGRAF_USER_DATA_SYSTEMD % {
                 'telegraf_data': base64.b64encode(telegraf_data),
@@ -1116,24 +1166,51 @@ class IronicDriver(virt_driver.ComputeDriver):
         telegraf_user_data = []
         for user_data in user_data_list:
             telegraf_user_data.append(
-                {TELEGRAF_USER_DATA_FILENAME_PREFIX +
+                {CUSTOM_USER_DATA_FILENAME_PREFIX +
                  utils.filename_generator(): user_data})
         return telegraf_user_data
 
-    def _add_telegraf_user_data(self, instance, image_meta):
+    def _get_windows_link_aggregation_user_data(self, image_meta):
+        link_aggregation_user_data = None
+        if image_meta.properties.get('os_type', None) == 'windows':
+            link_aggregation_user_data = {
+                CUSTOM_USER_DATA_FILENAME_PREFIX +
+                utils.filename_generator():
+                LINK_AGGREGATION_USER_DATA_FOR_WINDOWS % {
+                    'mode_switchindependent':
+                        CONF.compute.windows_bond_mode.get(
+                            'switchindependent', 'switchindependent').lower(),
+                    'mode_static':
+                        CONF.compute.windows_bond_mode.get(
+                            'static', 'static').lower(),
+                    'mode_lacp':
+                        CONF.compute.windows_bond_mode.get(
+                            'lacp', 'lacp').lower()}
+            }
+        return link_aggregation_user_data
+
+    def _add_user_data_to_instance(self, instance, image_meta):
+        # about telegraf and link aggregation(windows) user data.
+        telegraf_user_data = None
         telegraf_data = self._load_telegraf_template(instance, image_meta)
         if telegraf_data:
             telegraf_user_data = self._get_telegraf_user_data(image_meta,
                                                               telegraf_data)
+        link_aggregation_user_data = \
+            self._get_windows_link_aggregation_user_data(image_meta)
+        if telegraf_user_data or link_aggregation_user_data:
+            current_user_data = []
+            if telegraf_user_data:
+                current_user_data.extend(telegraf_user_data)
+            if link_aggregation_user_data:
+                current_user_data.append(link_aggregation_user_data)
             origin_user_data = instance.user_data
-            if not origin_user_data:
-                current_user_data = telegraf_user_data
-            else:
-                current_user_data = [
+            if origin_user_data:
+                origin_user_data = [
                     {utils.filename_generator():
                          base64.b64decode(origin_user_data)}]
-                current_user_data.extend(telegraf_user_data)
-            # we have to combine telegraf_user_data with it.
+                current_user_data.extend(origin_user_data)
+            # we have to combine user_data with it.
             instance.user_data = utils.combine_user_data(current_user_data)
 
             instance.save()
@@ -1168,7 +1245,7 @@ class IronicDriver(virt_driver.ComputeDriver):
                 _("Ironic node uuid not supplied to "
                   "driver for instance %s.") % instance.uuid)
 
-        self._add_telegraf_user_data(instance, image_meta)
+        self._add_user_data_to_instance(instance, image_meta)
 
         node = self._get_node(node_uuid)
         flavor = instance.flavor
@@ -1697,7 +1774,7 @@ class IronicDriver(virt_driver.ComputeDriver):
         part_maintype = part.get_content_maintype() or ''
         is_telegraf_user_data = part.get_filename() and \
                                 part.get_filename().startswith(
-                                    TELEGRAF_USER_DATA_FILENAME_PREFIX)
+                                    CUSTOM_USER_DATA_FILENAME_PREFIX)
         if part_maintype.lower() == 'multipart' or is_telegraf_user_data:
             return True
         return False
@@ -1718,6 +1795,10 @@ class IronicDriver(virt_driver.ComputeDriver):
             telegraf_user_data = self._get_telegraf_user_data(image_meta,
                                                               telegraf_data)
             current_user_data.extend(telegraf_user_data)
+        link_aggregation_user_data = \
+            self._get_windows_link_aggregation_user_data(image_meta)
+        if link_aggregation_user_data:
+            current_user_data.append(link_aggregation_user_data)
         if not current_user_data:
             instance.user_data = None
         else:

@@ -732,6 +732,27 @@ Related options:
   failing if ``vif_plugging_is_fatal`` is True, or simply continuing with the
   live migration
 """),
+    cfg.DictOpt('windows_bond_mode',
+                default=dict(
+                    lacp='lacp',
+                    static='static',
+                    switchindependent='switchindependent',
+                ),
+                help="""
+The correspondence between the bond mode in portgroup and the mode of link
+aggregation officially supported by windows.
+
+e.g.: windows_bond_mode = lacp:ex1,static:ex2,switchindependent:ex3
+The above example means if bond_mode attribute for portgroup is any one of
+[ex1, ex2, ex3], we will use one of the [lacp, static, switchindependent]
+corresponding to it to create NIC.
+
+We only could update the value of this option.
+
+Related options:
+
+* ``compute_driver``: Only the ironic driver uses this option.
+"""),
 ]
 
 interval_opts = [
