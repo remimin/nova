@@ -3189,7 +3189,8 @@ class API(base.Base):
 
         image_id, image = self._get_image(context, image_href)
         self._check_auto_disk_config(image=image, **kwargs)
-        if 'flavor_id' in kwargs and kwargs['flavor_id'] != instance.flavor.id:
+        if 'flavor_id' in kwargs \
+                and kwargs['flavor_id'] != instance.flavor.flavorid:
             flavor = flavors.get_flavor_by_flavor_id(
                     kwargs['flavor_id'], read_deleted="no")
             cur_flavor = instance.get_flavor()
