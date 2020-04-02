@@ -1794,12 +1794,15 @@ class LibvirtConfigGuestHostdevMDEV(LibvirtConfigGuestHostdev):
             mode='subsystem', type='mdev', managed='no', **kwargs)
         # model attribute is only supported by mediated devices
         self.model = kwargs.get('model', 'vfio-pci')
+        self.display = None
         self.uuid = None
 
     def format_dom(self):
         dev = super(LibvirtConfigGuestHostdevMDEV, self).format_dom()
         if self.model:
             dev.set("model", self.model)
+        if self.display:
+            dev.set("display", self.display)
 
         address = etree.Element("address", uuid=self.uuid)
         source = etree.Element("source")
@@ -1811,6 +1814,8 @@ class LibvirtConfigGuestHostdevMDEV(LibvirtConfigGuestHostdev):
         children = super(LibvirtConfigGuestHostdevMDEV, self).parse_dom(xmldoc)
         if xmldoc.get('model'):
             self.model = xmldoc.get('model')
+        if xmldoc.get('display'):
+            self.display = xmldoc.get('display')
         for c in children:
             if c.tag == "source":
                 for sub in c.getchildren():

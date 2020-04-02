@@ -171,12 +171,15 @@ class ImageMetaProps(base.NovaObject):
     # Version 1.19: Added 'img_hide_hypervisor_id' type field
     # Version 1.20: Added 'traits_required' list field
     # Version 1.21: Added 'telegraf_config_path' field
-    VERSION = '1.21'
+    # Version 1.22: Added 'hw_vfio_display_on' type field
+    VERSION = '1.22'
 
     def obj_make_compatible(self, primitive, target_version):
         super(ImageMetaProps, self).obj_make_compatible(primitive,
                                                         target_version)
         target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (1, 22):
+            primitive.pop('hw_vfio_display_on', None)
         if target_version < (1, 21):
             primitive.pop('telegraf_config_path', None)
         if target_version < (1, 20):
@@ -474,7 +477,10 @@ class ImageMetaProps(base.NovaObject):
         'traits_required': fields.ListOfStringsField(),
 
         # telgeraf config path in instance OS.
-        'telegraf_config_path': fields.StringField()
+        'telegraf_config_path': fields.StringField(),
+
+        # boolean - if true, set mdev vfio-pci device display=on
+        'hw_vfio_display_on': fields.FlexibleBooleanField(),
 
     }
 
