@@ -300,6 +300,9 @@ MIN_QEMU_FILE_BACKED_DISCARD_VERSION = (2, 10, 0)
 # before the SIGKILL signal takes effect.
 MIN_LIBVIRT_BETTER_SIGKILL_HANDLING = (4, 7, 0)
 
+MIN_QEMU_DISPLAY_ON_VERSION = (2, 12, 0)
+MIN_LIBVIRT_VIDEO_NONE_VERSION = (4, 5, 0)
+
 VGPU_RESOURCE_SEMAPHORE = "vgpu_resources"
 
 
@@ -4714,6 +4717,10 @@ class LibvirtDriver(driver.ComputeDriver):
             raise exception.SerialPortNumberLimitExceeded(
                 allowed=ALLOWED_QEMU_SERIAL_PORTS, virt_type=virt_type)
 
+    def _is_display_on_available(self):
+        return self._host.has_min_version(MIN_LIBVIRT_VIDEO_NONE_VERSION,
+                                          MIN_QEMU_DISPLAY_ON_VERSION)
+
     def _add_video_driver(self, guest, image_meta, flavor):
         VALID_VIDEO_DEVICES = ("vga", "cirrus", "vmvga",
                                "xen", "qxl", "virtio")
@@ -4753,6 +4760,12 @@ class LibvirtDriver(driver.ComputeDriver):
                                                  max_vram=max_vram)
         if max_vram and video_ram:
             video.vram = video_ram * units.Mi / units.Ki
+        # If vGPU mdev display on, overwrite video.type with none
+        if (flavor.extra_specs.get("resources:VGPU") and
+                image_meta.properties.get('hw_vfio_display_on') and
+                self._is_display_on_available()):
+            video.type = 'none'
+            video.vram = None
         guest.add_device(video)
 
     def _add_qga_device(self, guest, instance):
@@ -5590,14 +5603,17 @@ class LibvirtDriver(driver.ComputeDriver):
         self._guest_add_memory_balloon(guest)
 
         if mdevs:
-            self._guest_add_mdevs(guest, mdevs)
+            self._guest_add_mdevs(guest, mdevs, image_meta)
 
         return guest
 
-    def _guest_add_mdevs(self, guest, chosen_mdevs):
+    def _guest_add_mdevs(self, guest, chosen_mdevs, image_meta):
         for chosen_mdev in chosen_mdevs:
             mdev = vconfig.LibvirtConfigGuestHostdevMDEV()
             mdev.uuid = chosen_mdev
+            if (image_meta.properties.get('hw_vfio_display_on') and
+                self._is_display_on_available()):
+                    mdev.display = 'on'
             guest.add_device(mdev)
 
     @staticmethod
