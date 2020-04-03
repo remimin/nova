@@ -1145,6 +1145,10 @@ class IronicDriver(virt_driver.ComputeDriver):
             telegraf_data = f.read().format(instance.uuid,
                                             os_type,
                                             instance.uuid)
+        # If the os_type is windows, we have to use "\r\n" replace "\n",
+        # because the windows's linefeed is "\r\n".
+        if os_type == 'windows':
+            telegraf_data = telegraf_data.replace("\n", "\r\n")
         return telegraf_data
 
     def _get_telegraf_user_data(self, image_meta, telegraf_data):
