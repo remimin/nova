@@ -1,7 +1,7 @@
 [global_tags]
 vm_uuid = "{0}"
 vm_os_type = "{1}"
-[agent]                                                                                                                                                                                                 [0/1812]
+[agent]
 interval = "60s"
 round_interval = true
 metric_batch_size = 1000
@@ -41,8 +41,7 @@ Measurement = "vm_win_net"
 [[inputs.win_perf_counters.object]]
 ObjectName = "Memory"
 Instances = ["------"]
-Counters = ["Available Bytes","Cache Faults/sec","Demand Zero Faults/sec","Page Faults/sec","Pages/sec","Transition Faults/sec","Pool Nonpaged Bytes","Pool Paged Bytes","Standby Cache Reserve Bytes","Standby
-Cache Normal Priority Bytes","Standby Cache Core Bytes",]
+Counters = ["Available Bytes","Cache Faults/sec","Demand Zero Faults/sec","Page Faults/sec","Pages/sec","Transition Faults/sec","Pool Nonpaged Bytes","Pool Paged Bytes","Standby Cache Reserve Bytes","Standby Cache Normal Priority Bytes","Standby Cache Core Bytes",]
 Measurement = "vm_win_mem"
 [[inputs.win_perf_counters.object]]
 ObjectName = "System"
