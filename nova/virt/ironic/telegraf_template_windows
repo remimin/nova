@@ -1,6 +1,6 @@
 [global_tags]
-vm_uuid = "{0}"
-vm_os_type = "{1}"
+phy_uuid = "{0}"
+phy_os_type = "{1}"
 [agent]
 interval = "60s"
 round_interval = true
@@ -21,30 +21,30 @@ data_format = "influx"
 ObjectName = "Processor"
 Instances = ["*"]
 Counters = ["% Idle Time","% Interrupt Time","% Privileged Time","% User Time", "% Processor Time","% DPC Time",]
-Measurement = "vm_win_cpu"
+Measurement = "phy_win_cpu"
 IncludeTotal = true
 [[inputs.win_perf_counters.object]]
 ObjectName = "LogicalDisk"
 Instances = ["*"]
 Counters = ["% Idle Time","% Disk Time","% Disk Read Time","% Disk Write Time","Current Disk Queue Length","% Free Space","Free Megabytes",]
-Measurement = "vm_win_disk"
+Measurement = "phy_win_disk"
 [[inputs.win_perf_counters.object]]
 ObjectName = "PhysicalDisk"
 Instances = ["*"]
 Counters = ["Disk Read Bytes/sec","Disk Write Bytes/sec","Current Disk Queue Length","Disk Reads/sec","Disk Writes/sec","% Disk Time","% Disk Read Time","% Disk Write Time",]
-Measurement = "vm_win_diskio"
+Measurement = "phy_win_diskio"
 [[inputs.win_perf_counters.object]]
 ObjectName = "Network Interface"
 Instances = ["*"]
 Counters = ["Bytes Received/sec","Bytes Sent/sec","Packets Received/sec","Packets Sent/sec","Packets Received Discarded","Packets Outbound Discarded","Packets Received Errors","Packets Outbound Errors",]
-Measurement = "vm_win_net"
+Measurement = "phy_win_net"
 [[inputs.win_perf_counters.object]]
 ObjectName = "Memory"
 Instances = ["------"]
 Counters = ["Available Bytes","Cache Faults/sec","Demand Zero Faults/sec","Page Faults/sec","Pages/sec","Transition Faults/sec","Pool Nonpaged Bytes","Pool Paged Bytes","Standby Cache Reserve Bytes","Standby Cache Normal Priority Bytes","Standby Cache Core Bytes",]
-Measurement = "vm_win_mem"
+Measurement = "phy_win_mem"
 [[inputs.win_perf_counters.object]]
 ObjectName = "System"
 Instances = ["------"]
 Counters = ["Context Switches/sec","System Calls/sec","Processor Queue Length","System Up Time",]
-Measurement = "vm_win_system"
+Measurement = "phy_win_system"

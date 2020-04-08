@@ -1,6 +1,6 @@
 [global_tags]
-vm_uuid = "{0}"
-vm_os_type = "{1}"
+phy_uuid = "{0}"
+phy_os_type = "{1}"
 [agent]
 interval = "60s"
 round_interval = true
@@ -21,23 +21,23 @@ data_format = "influx"
 percpu = false
 totalcpu = true
 fielddrop = ["time_*"]
-name_prefix = "vm_linux_"
+name_prefix = "phy_linux_"
 [[inputs.disk]]
 ignore_fs = ["tmpfs", "devtmpfs", "devfs"]
-name_prefix = "vm_linux_"
+name_prefix = "phy_linux_"
 [[inputs.diskio]]
-name_prefix = "vm_linux_"
+name_prefix = "phy_linux_"
 [[inputs.kernel]]
-name_prefix = "vm_linux_"
+name_prefix = "phy_linux_"
 [[inputs.mem]]
-name_prefix = "vm_linux_"
+name_prefix = "phy_linux_"
 [[inputs.processes]]
-name_prefix = "vm_linux_"
+name_prefix = "phy_linux_"
 [[inputs.swap]]
-name_prefix = "vm_linux_"
+name_prefix = "phy_linux_"
 [[inputs.system]]
-name_prefix = "vm_linux_"
+name_prefix = "phy_linux_"
 [[inputs.net]]
-name_prefix = "vm_linux_"
+name_prefix = "phy_linux_"
 [[inputs.netstat]]
-name_prefix = "vm_linux_"
+name_prefix = "phy_linux_"
