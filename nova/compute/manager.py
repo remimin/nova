@@ -5801,6 +5801,10 @@ class ComputeManager(manager.Manager):
                     phase=fields.NotificationPhase.ERROR,
                     exception=e,
                     volume_id=bdm.volume_id, tb=tb)
+                self._notify_about_instance_usage(
+                    context, instance, "volume.attach",
+                    extra_usage_info={'error': tb},
+                    fault=e)
 
         info = {'volume_id': bdm.volume_id}
         self._notify_about_instance_usage(
