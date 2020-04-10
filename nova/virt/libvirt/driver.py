@@ -4840,7 +4840,7 @@ class LibvirtDriver(driver.ComputeDriver):
         telegraf_config_path = image_meta.properties.get(
                 'telegraf_config_path', None)
         if not os_type or not telegraf_config_path:
-            return None
+            return []
         files = []
         if 'windows' in os_type:
             _files_for_windows = (
