@@ -105,6 +105,7 @@ MIME_MAPPINGS = {
     '#include': 'x-include-url',
     '#!': 'x-shellscript',
     'rem': 'x-shellscript',
+    '#ps1_sysnative': 'x-shellscript',
     '#cloud-config': 'cloud-config',
     '#upstart-job': 'upstart-job',
     '#part-handler': 'part-handler',
