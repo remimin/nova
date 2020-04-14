@@ -4962,12 +4962,6 @@ class API(base.Base):
         # exception.
         snapshot = self.volume_api.get_snapshot(context, snapshot_id)
 
-        if bdm.volume_size != snapshot.get('size'):
-            raise exc.HTTPBadRequest(
-                explanation="The volume %(vol_id)s size is not equal snapshot "
-                            "%(s_id)s size." %
-                            {'vol_id': volume_id,
-                             's_id': snapshot_id})
         if snapshot.get('status') != 'available':
             raise exc.HTTPBadRequest(
                 explanation='Snapshot %(s_id)s is not available. Instance '
