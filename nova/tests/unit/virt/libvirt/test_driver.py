@@ -105,6 +105,7 @@ from nova.virt.image import model as imgmodel
 from nova.virt import images
 from nova.virt.libvirt import blockinfo
 from nova.virt.libvirt import config as vconfig
+from nova.virt.libvirt import device as libvirt_device
 from nova.virt.libvirt import driver as libvirt_driver
 from nova.virt.libvirt import firewall
 from nova.virt.libvirt import guest as libvirt_guest
@@ -20747,7 +20748,8 @@ class LibvirtDriverTestCase(test.NoDBTestCase, TraitsComparisonMixin):
                      "types": {'nvidia-11': {'availableInstances': 16,
                                              'name': 'GRID M60-0B',
                                              'deviceAPI': 'vfio-pci'},
-                               }
+                               },
+                     "vendor_id": 4318
                      }]
         self.assertEqual(expected, drvr._get_mdev_capable_devices())
 
@@ -20791,7 +20793,8 @@ class LibvirtDriverTestCase(test.NoDBTestCase, TraitsComparisonMixin):
         expected = [{"dev_id": "mdev_4b20d080_1b54_4048_85b3_a6a62d165c01",
                      "uuid": "4b20d080-1b54-4048-85b3-a6a62d165c01",
                      "type": "nvidia-11",
-                     "iommu_group": 12
+                     "iommu_group": 12,
+                     "parent": "pci_0000_00_02_0",
                      }]
         self.assertEqual(expected, drvr._get_mediated_devices())
 
@@ -20866,96 +20869,31 @@ class LibvirtDriverTestCase(test.NoDBTestCase, TraitsComparisonMixin):
         self.assertEqual({},
                          drvr._get_all_assigned_mediated_devices(fake_inst))
 
-    def test_allocate_mdevs_with_no_vgpu_allocations(self):
-        allocations = {
-            'rp1': {
-                'resources': {
-                    # Just any resource class but VGPU
-                    rc_fields.ResourceClass.VCPU: 1,
-                }
-            }
-        }
-        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
-        self.assertIsNone(drvr._allocate_mdevs(allocations=allocations))
-
-    @mock.patch.object(libvirt_driver.LibvirtDriver,
-                       '_get_existing_mdevs_not_assigned')
-    def test_allocate_mdevs_with_available_mdevs(self, get_unassigned_mdevs):
-        allocations = {
-            'rp1': {
-                'resources': {
-                    rc_fields.ResourceClass.VGPU: 1,
-                }
-            }
-        }
-        get_unassigned_mdevs.return_value = set([uuids.mdev1])
-        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
-        self.assertEqual([uuids.mdev1],
-                         drvr._allocate_mdevs(allocations=allocations))
-
-    @mock.patch.object(nova.privsep.libvirt, 'create_mdev')
-    @mock.patch.object(libvirt_driver.LibvirtDriver,
-                       '_get_mdev_capable_devices')
-    @mock.patch.object(libvirt_driver.LibvirtDriver,
-                       '_get_existing_mdevs_not_assigned')
-    def test_allocate_mdevs_with_no_mdevs_but_capacity(self,
-                                                       unallocated_mdevs,
-                                                       get_mdev_capable_devs,
-                                                       privsep_create_mdev):
-        self.flags(enabled_vgpu_types=['nvidia-11'], group='devices')
-        allocations = {
-            'rp1': {
-                'resources': {
-                    rc_fields.ResourceClass.VGPU: 1,
-                }
-            }
-        }
-        unallocated_mdevs.return_value = set()
-        get_mdev_capable_devs.return_value = [
-            {"dev_id": "pci_0000_06_00_0",
-             "types": {'nvidia-11': {'availableInstances': 16,
-                                     'name': 'GRID M60-0B',
-                                     'deviceAPI': 'vfio-pci'},
-                       }
-             }]
-        privsep_create_mdev.return_value = uuids.mdev1
-        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
-        self.assertEqual([uuids.mdev1],
-                         drvr._allocate_mdevs(allocations=allocations))
-        privsep_create_mdev.assert_called_once_with("0000:06:00.0",
-                                                    'nvidia-11',
-                                                    uuid=None)
-
-    @mock.patch.object(nova.privsep.libvirt, 'create_mdev')
-    @mock.patch.object(libvirt_driver.LibvirtDriver,
-                       '_get_mdev_capable_devices')
-    @mock.patch.object(libvirt_driver.LibvirtDriver,
-                       '_get_existing_mdevs_not_assigned')
-    def test_allocate_mdevs_with_no_gpu_capacity(self,
-                                                 unallocated_mdevs,
-                                                 get_mdev_capable_devs,
-                                                 privsep_create_mdev):
-        self.flags(enabled_vgpu_types=['nvidia-11'], group='devices')
-        allocations = {
-            'rp1': {
-                'resources': {
-                    rc_fields.ResourceClass.VGPU: 1,
-                }
-            }
-        }
-        unallocated_mdevs.return_value = set()
-        # Mock the fact all possible mediated devices are created and all of
-        # them being assigned
-        get_mdev_capable_devs.return_value = [
-            {"dev_id": "pci_0000_06_00_0",
-             "types": {'nvidia-11': {'availableInstances': 0,
-                                     'name': 'GRID M60-0B',
-                                     'deviceAPI': 'vfio-pci'},
-                       }
-             }]
+    @mock.patch('nova.virt.libvirt.device.DeviceManager.'
+                '_populate_existing_mdevs')
+    @mock.patch('nova.virt.libvirt.device.DeviceManager.'
+                'get_claimed_devices_for_instance')
+    def test_get_claimed_mdevs(self, mock_get_claimed_devs, mock_pop):
         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), True)
-        self.assertRaises(exception.ComputeResourcesUnavailable,
-                          drvr._allocate_mdevs, allocations=allocations)
+        drvr.init_host(host='foo')
+        mock_get_claimed_devs.return_value = [
+            libvirt_device.MDevDevice(uuid=uuids.mdev1,
+                                      type='Intel GVT-g',
+                                      parent='fake_parent',
+                                      instance_uuid=uuids.fake_instance1),
+            libvirt_device.MDevDevice(uuid=uuids.mdev2,
+                                      type='Intel GVT-g',
+                                      parent='fake_parent',
+                                      instance_uuid=uuids.fake_instance2),
+            libvirt_device.MDevDevice(uuid=uuids.mdev3,
+                                      type='Intel GVT-g',
+                                      parent='fake_parent',
+                                      instance_uuid=None),
+            libvirt_device.Device(instance_uuid=uuids.fake_instance1)
+        ]
+        fake_instance1 = objects.Instance(id=1, uuid=uuids.fake_instance1)
+        ret = drvr._get_claimed_mdevs(fake_instance1)
+        self.assertEqual([uuids.mdev1], ret)
 
     @mock.patch.object(libvirt_driver.LibvirtDriver, '_get_mediated_devices')
     @mock.patch.object(libvirt_driver.LibvirtDriver,

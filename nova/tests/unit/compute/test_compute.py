@@ -2126,7 +2126,10 @@ class ComputeTestCase(BaseTestCase,
         LOG.info("Running instances: %s", instances)
         self.assertEqual(len(instances), 1)
 
-        self.compute.terminate_instance(self.context, instance, [])
+        with mock.patch.object(self.compute.driver,
+                               'unclaim_for_instance') as mock_unclaim:
+            self.compute.terminate_instance(self.context, instance, [])
+            mock_unclaim.assert_called_once_with(instance)
 
         instances = db.instance_get_all(self.context)
         LOG.info("After terminating instances: %s", instances)
@@ -7838,7 +7841,7 @@ class ComputeTestCase(BaseTestCase,
         instance = self._create_fake_instance_obj()
         instance.vcpus = 1
 
-        rt.instance_claim(admin_context, instance, NODENAME)
+        rt.instance_claim(admin_context, instance, NODENAME, None)
         self.assertEqual(1, cn.vcpus_used)
 
         self.compute.terminate_instance(admin_context, instance, [])
@@ -7862,7 +7865,7 @@ class ComputeTestCase(BaseTestCase,
 
         self.assertEqual(0, cn.vcpus_used)
 
-        rt.instance_claim(admin_context, instance, NODENAME)
+        rt.instance_claim(admin_context, instance, NODENAME, None)
         self.compute._init_instance(admin_context, instance)
         self.assertEqual(1, cn.vcpus_used)
 

@@ -109,6 +109,7 @@ from nova.virt.image import model as imgmodel
 from nova.virt import images
 from nova.virt.libvirt import blockinfo
 from nova.virt.libvirt import config as vconfig
+from nova.virt.libvirt import device as libvirt_device
 from nova.virt.libvirt import designer
 from nova.virt.libvirt import firewall as libvirt_firewall
 from nova.virt.libvirt import guest as libvirt_guest
@@ -399,6 +400,8 @@ class LibvirtDriver(driver.ComputeDriver):
         # avoid any re-calculation when computing resources.
         self._reserved_hugepages = hardware.numa_get_reserved_huge_pages()
 
+        self._device_manager = libvirt_device.DeviceManager(self)
+
     def _get_volume_drivers(self):
         driver_registry = dict()
 
@@ -560,10 +563,14 @@ class LibvirtDriver(driver.ComputeDriver):
                  'libvirt_ver': libvirt_utils.version_to_string(
                      MIN_LIBVIRT_OTHER_ARCH.get(kvm_arch))})
 
+        supports_mdev = False
         # TODO(sbauza): Remove this code once mediated devices are persisted
         # across reboots.
         if self._host.has_min_version(MIN_LIBVIRT_MDEV_SUPPORT):
             self._recreate_assigned_mediated_devices()
+            supports_mdev = True
+
+        self._device_manager.initialize(supports_mdev)
 
     @staticmethod
     def _is_existing_mdev(uuid):
@@ -3129,6 +3136,14 @@ class LibvirtDriver(driver.ComputeDriver):
     def poll_rebooting_instances(self, timeout, instances):
         pass
 
+    def _get_claimed_mdevs(self, instance):
+        return [dev.uuid
+            for dev in (
+                self._device_manager.get_claimed_devices_for_instance(
+                        instance))
+                    if (isinstance(dev, libvirt_device.MDevDevice) and
+                            dev.instance_uuid == instance.uuid)]
+
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
               block_device_info=None):
@@ -3154,7 +3169,7 @@ class LibvirtDriver(driver.ComputeDriver):
         self._ensure_console_log_for_instance(instance)
 
         # Does the guest need to be assigned some vGPU mediated devices ?
-        mdevs = self._allocate_mdevs(allocations)
+        mdevs = self._get_claimed_mdevs(instance)
 
         xml = self._get_guest_xml(context, instance, network_info,
                                   disk_info, image_meta,
@@ -6339,6 +6354,7 @@ class LibvirtDriver(driver.ComputeDriver):
         device = {
             "dev_id": cfgdev.name,
             "types": {},
+            "vendor_id": cfgdev.pci_capability.vendor_id,
         }
         for mdev_cap in cfgdev.pci_capability.mdev_capability:
             for cap in mdev_cap.mdev_types:
@@ -6379,6 +6395,8 @@ class LibvirtDriver(driver.ComputeDriver):
             "dev_id": cfgdev.name,
             # name is like mdev_00ead764_fdc0_46b6_8db9_2963f5c815b4
             "uuid": str(uuid.UUID(cfgdev.name[5:].replace('_', '-'))),
+            # the physical GPU PCI device
+            "parent": cfgdev.parent,
             "type": cfgdev.mdev_information.type,
             "iommu_group": cfgdev.mdev_information.iommu_group,
         }
@@ -6467,13 +6485,15 @@ class LibvirtDriver(driver.ComputeDriver):
                                for mdev in mdevs]) - set(allocated_mdevs)
         return available_mdevs
 
-    def _create_new_mediated_device(self, requested_types, uuid=None):
+    def _create_new_mediated_device(self, requested_types, uuid=None,
+                                    mdevs_available=None):
         """Find a physical device that can support a new mediated device and
         create it.
 
         :param requested_types: Filter only capable devices supporting those
                                 types.
         :param uuid: The possible mdev UUID we want to create again
+        :param mdevs_available: The available mdevs, list of MDevDevice.
 
         :returns: the newly created mdev UUID or None if not possible
         """
@@ -6494,26 +6514,14 @@ class LibvirtDriver(driver.ComputeDriver):
                 chosen_mdev = nova.privsep.libvirt.create_mdev(pci_addr,
                                                                asked_type,
                                                                uuid=uuid)
-                return chosen_mdev
+                return libvirt_device.MDevDevice(
+                    uuid=chosen_mdev, type=asked_type,
+                    parent=dev_name)
 
-    @utils.synchronized(VGPU_RESOURCE_SEMAPHORE)
-    def _allocate_mdevs(self, allocations):
-        """Returns a list of mediated device UUIDs corresponding to available
-        resources we can assign to the guest(s) corresponding to the allocation
-        requests passed as argument.
-
-        That method can either find an existing but unassigned mediated device
-        it can allocate, or create a new mediated device from a capable
-        physical device if the latter has enough left capacity.
-
-        :param allocations: Information about resources allocated to the
-                            instance via placement, of the form returned by
-                            SchedulerReportClient.get_allocations_for_consumer.
-                            That code is supporting Placement API version 1.12
-        """
+    def _get_requested_vgpus(self, allocations):
         vgpu_allocations = self._vgpu_allocations(allocations)
         if not vgpu_allocations:
-            return
+            return None, None
         # TODO(sbauza): Once we have nested resource providers, find which one
         # is having the related allocation for the specific VGPU type.
         # For the moment, we should only have one allocation for
@@ -6528,25 +6536,11 @@ class LibvirtDriver(driver.ComputeDriver):
         vgpus_asked = alloc['resources'][rc_fields.ResourceClass.VGPU]
 
         requested_types = self._get_supported_vgpu_types()
-        # Which mediated devices are created but not assigned to a guest ?
-        mdevs_available = self._get_existing_mdevs_not_assigned(
-            requested_types)
 
-        chosen_mdevs = []
-        for c in six.moves.range(vgpus_asked):
-            chosen_mdev = None
-            if mdevs_available:
-                # Take the first available mdev
-                chosen_mdev = mdevs_available.pop()
-            else:
-                chosen_mdev = self._create_new_mediated_device(requested_types)
-            if not chosen_mdev:
-                # If we can't find devices having available VGPUs, just raise
-                raise exception.ComputeResourcesUnavailable(
-                    reason='vGPU resource is not available')
-            else:
-                chosen_mdevs.append(chosen_mdev)
-        return chosen_mdevs
+        # FIXME(Armstrong Liu): we don't have parent_device here because of
+        # having no self.provider_tree. So we don't return parent_deice,
+        # but use gpu policy to create one outside this method.
+        return requested_types, vgpus_asked
 
     def _detach_mediated_devices(self, guest):
         mdevs = guest.get_all_devices(
@@ -9407,3 +9401,11 @@ class LibvirtDriver(driver.ComputeDriver):
                         "%s service status. Monitor device type is %s." %(
                             monitor_agent_type,
                             CONF.libvirt.monitor_device_type))
+
+    def claim_for_instance(self, instance, allocations, flavor=None):
+        self._device_manager.claim_for_instance(instance, allocations,
+                                                flavor=flavor)
+
+    def unclaim_for_instance(self, instance, flavor=None):
+        self._device_manager.unclaim_for_instance(instance,
+                                                  flavor=flavor)

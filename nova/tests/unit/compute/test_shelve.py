@@ -48,6 +48,7 @@ def _fake_resources():
 
 
 class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
+    @mock.patch.object(nova.virt.fake.SmallFakeDriver, 'unclaim_for_instance')
     @mock.patch.object(objects.BlockDeviceMappingList, 'get_by_instance_uuid')
     @mock.patch.object(nova.compute.manager.ComputeManager,
                        '_terminate_volume_connections')
@@ -60,7 +61,8 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
     def _shelve_instance(self, shelved_offload_time, mock_notify,
                          mock_notify_instance_usage, mock_get_power_state,
                          mock_snapshot, mock_power_off, mock_terminate,
-                         mock_get_bdms, clean_shutdown=True,
+                         mock_get_bdms, mock_unclaim_for_instance,
+                         clean_shutdown=True,
                          guest_power_state=power_state.RUNNING):
         mock_get_power_state.return_value = 123
 
@@ -175,6 +177,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
 
         if CONF.shelved_offload_time == 0:
             self.assertTrue(mock_terminate.called)
+            mock_unclaim_for_instance.assert_called_once_with(instance)
 
     def test_shelve(self):
         self._shelve_instance(-1)
@@ -300,7 +303,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
         def fake_delete(self2, ctxt, image_id):
             self.deleted_image_id = image_id
 
-        def fake_claim(context, instance, node, limits):
+        def fake_claim(context, instance, node, allocations, limits):
             instance.host = self.compute.host
             requests = objects.InstancePCIRequests(requests=[])
             return claims.Claim(context, instance, test_compute.NODENAME,
@@ -410,7 +413,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
 
         tracking = {'last_state': instance.task_state}
 
-        def fake_claim(context, instance, node, limits):
+        def fake_claim(context, instance, node, allocations, limits):
             instance.host = self.compute.host
             requests = objects.InstancePCIRequests(requests=[])
             return claims.Claim(context, instance, test_compute.NODENAME,
@@ -456,7 +459,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
         mock_setup_network.assert_called_once_with(self.context, instance,
                                                    self.compute.host)
         mock_instance_claim.assert_called_once_with(self.context, instance,
-                                                    test_compute.NODENAME,
+                                                    test_compute.NODENAME, {},
                                                     limits)
         mock_spawn.assert_called_once_with(self.context, instance,
                 test.MatchType(objects.ImageMeta),
@@ -502,7 +505,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
 
         tracking = {'last_state': instance.task_state}
 
-        def fake_claim(context, instance, node, limits):
+        def fake_claim(context, instance, node, allocations, limits):
             instance.host = self.compute.host
             instance.node = node
             requests = objects.InstancePCIRequests(requests=[])
@@ -542,7 +545,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
         mock_setup_network.assert_called_once_with(self.context, instance,
                                                    self.compute.host)
         mock_instance_claim.assert_called_once_with(self.context, instance,
-                                                    test_compute.NODENAME,
+                                                    test_compute.NODENAME, {},
                                                     limits)
         mock_spawn.assert_called_once_with(
             self.context, instance, test.MatchType(objects.ImageMeta),
