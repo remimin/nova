@@ -2102,10 +2102,21 @@ class ComputeManager(manager.Manager):
         self._check_trusted_certs(instance)
 
         try:
+            allocs = (
+                self.reportclient.get_allocations_for_consumer(context,
+                                                               instance.uuid))
+        except Exception:
+            LOG.exception('Failure retrieving placement allocations',
+                          instance=instance)
+            msg = _('Failure retrieving placement allocations')
+            raise exception.BuildAbortException(instance_uuid=instance.uuid,
+                                                reason=msg)
+
+        try:
             scheduler_hints = self._get_scheduler_hints(filter_properties,
                                                         request_spec)
             rt = self._get_resource_tracker()
-            with rt.instance_claim(context, instance, node, limits):
+            with rt.instance_claim(context, instance, node, allocs, limits):
                 # NOTE(russellb) It's important that this validation be done
                 # *after* the resource tracker instance claim, as that is where
                 # the host is set on the instance.
@@ -2124,7 +2135,6 @@ class ComputeManager(manager.Manager):
                             task_states.BLOCK_DEVICE_MAPPING)
                     block_device_info = resources['block_device_info']
                     network_info = resources['network_info']
-                    allocs = resources['allocations']
                     LOG.debug('Start spawning the instance on the hypervisor.',
                               instance=instance)
                     with timeutils.StopWatch() as timer:
@@ -2350,21 +2360,6 @@ class ComputeManager(manager.Manager):
             msg = _('Failure prepping block device.')
             raise exception.BuildAbortException(instance_uuid=instance.uuid,
                     reason=msg)
-
-        try:
-            resources['allocations'] = (
-                self.reportclient.get_allocations_for_consumer(context,
-                                                               instance.uuid))
-        except Exception:
-            LOG.exception('Failure retrieving placement allocations',
-                          instance=instance)
-            # Make sure the async call finishes
-            if network_info is not None:
-                network_info.wait(do_raise=False)
-            self.driver.failed_spawn_cleanup(instance)
-            msg = _('Failure retrieving placement allocations')
-            raise exception.BuildAbortException(instance_uuid=instance.uuid,
-                                                reason=msg)
 
         try:
             yield resources
@@ -5368,7 +5363,8 @@ class ComputeManager(manager.Manager):
                                                         self.host)
         network_info = self.network_api.get_instance_nw_info(context, instance)
         try:
-            with rt.instance_claim(context, instance, node, limits):
+            with rt.instance_claim(context, instance, node, allocations,
+                                   limits):
                 self.driver.spawn(context, instance, image_meta,
                                   injected_files=[],
                                   admin_password=None,

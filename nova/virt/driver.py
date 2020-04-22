@@ -388,6 +388,32 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
+    def claim_for_instance(self, instance, allocations, flavor=None):
+        """Claim the resources.
+
+        This method claims the instance requested resources.
+
+        :param instance: nova.objects.instance.Instance object
+        :param allocations:
+            Placement allocation records for the instance.
+        :param flavor: nova.objects.flavor.Flavor. An different flavor
+            with instance's flavor will be passed in when resize.
+        :raises: ComputeResourcesUnavailable if the virt driver can't strike
+            any available resource.
+        """
+        pass
+
+    def unclaim_for_instance(self, instance, flavor=None):
+        """Unclaim the resources
+
+        This methods unclaims the instance requested resources.
+
+        :param instance: nova.objects.instance.Instance object
+        :param flavor_id: nova.objects.flavor.Flavor. An different flavor
+            than instance's flavor be passed in when resize.
+        """
+        pass
+
     def get_console_pool_info(self, console_type):
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()

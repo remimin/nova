@@ -157,7 +157,8 @@ class ResourceTracker(object):
             raise exception.ComputeHostNotFound(host=nodename)
 
     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
-    def instance_claim(self, context, instance, nodename, limits=None):
+    def instance_claim(self, context, instance, nodename, allocations,
+                       limits=None):
         """Indicate that some resources are needed for an upcoming compute
         instance build operation.
 
@@ -168,6 +169,7 @@ class ResourceTracker(object):
         :param instance: instance to reserve resources for.
         :type instance: nova.objects.instance.Instance object
         :param nodename: The Ironic nodename selected by the scheduler
+        :param allocations: The placement allocation records for the instance.
         :param limits: Dict of oversubscription limits for memory, disk,
                        and CPUs.
         :returns: A Claim ticket representing the reserved resources.  It can
@@ -221,6 +223,10 @@ class ResourceTracker(object):
         # so that the resource audit knows about any cpus we've pinned.
         instance_numa_topology = claim.claimed_numa_topology
         instance.numa_topology = instance_numa_topology
+
+        # NOTE(Armstrong Liu): Claim for instance in virt layer.
+        self.driver.claim_for_instance(instance, allocations)
+
         self._set_instance_host_and_node(instance, nodename)
 
         if self.pci_tracker:
@@ -423,6 +429,9 @@ class ResourceTracker(object):
                                          is_removed=True)
 
         instance.clear_numa_topology()
+
+        self.driver.unclaim_for_instance(instance)
+
         self._unset_instance_host_and_node(instance)
 
         self._update(context.elevated(), self.compute_nodes[nodename])
@@ -489,6 +498,11 @@ class ResourceTracker(object):
         if uuid in self.tracked_instances:
             self._update_usage_from_instance(context, instance, nodename)
             self._update(context.elevated(), self.compute_nodes[nodename])
+
+        # Unclaim the resource when the instance is deleted or shelved
+        # offloaded.
+        if instance.vm_state in vm_states.ALLOW_RESOURCE_REMOVAL:
+            self.driver.unclaim_for_instance(instance)
 
     def disabled(self, nodename):
         return (nodename not in self.compute_nodes or
