@@ -41,6 +41,19 @@ class MDevDevice(Device):
         # The parent of mdev, which is referenced to the physical device.
         self.parent = parent
 
+    def __str__(self):
+        return 'MDevDevice(uuid=%(uuid)s, ' \
+               'type=%(type)s, ' \
+               'parent=%(parent)s, ' \
+               'instance_uuid=%(instance_uuid)s, ' \
+               'flavor_id=%(flavor_id)s)' % ({
+                   'uuid': self.uuid,
+                   'type': self.type,
+                   'parent': self.parent,
+                   'instance_uuid': self.instance_uuid,
+                   'flavor_id': self.flavor_id,
+               })
+
 
 class DeviceManager(object):
 
@@ -160,3 +173,6 @@ class DeviceManager(object):
         return [mdev for mdev in self._mdev_list
             if mdev.instance_uuid == instance.uuid and
                 (mdev.flavor_id == flavor_id)]
+
+    def get_mdev_list(self):
+        return self._mdev_list
