@@ -844,6 +844,10 @@ class ResourceTracker(object):
 
         pci_devices = resources.get('pci_passthrough_devices')
 
+        LOG.debug("vGPU usage view: %s.",
+                  [str(dev) for dev in
+                   self.driver._device_manager.get_mdev_list()])
+
         LOG.debug("Hypervisor/Node resource view: "
                   "name=%(node)s "
                   "free_ram=%(free_ram)sMB "
