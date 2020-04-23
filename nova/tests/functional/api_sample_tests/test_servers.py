@@ -20,6 +20,7 @@ import six
 
 from nova.api.openstack import api_version_request as avr
 import nova.conf
+from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional.api_sample_tests import api_sample_base
 from nova.tests.unit.api.openstack import fakes
 from nova.tests.unit.image import fake
@@ -309,6 +310,59 @@ class ServersSampleJson263Test(ServersSampleBase):
         response = self._do_put('servers/%s' % uuid,
                                 'server-update-req', subs)
         self._verify_response('server-update-resp', subs, response, 200)
+
+
+class ServersSampleJson266Test(ServersSampleBase):
+    microversion = '2.66'
+    scenarios = [('v2_66', {'api_major_version': 'v2.1'})]
+
+    def setUp(self):
+        super(ServersSampleJson266Test, self).setUp()
+        self.common_subs = {
+            'hostid': '[a-f0-9]+',
+            'instance_name': 'instance-\d{8}',
+            'hypervisor_hostname': r'[\w\.\-]+',
+            'hostname': r'[\w\.\-]+',
+            'access_ip_v4': '1.2.3.4',
+            'access_ip_v6': '80fe::',
+            'user_data': (self.user_data if six.PY2
+                          else self.user_data.decode('utf-8')),
+            'cdrive': '.*',
+        }
+
+    def test_get_servers_list_with_changes_before(self):
+        uuid = self._post_server(use_common_server_api_samples=False)
+        current_time = timeutils.parse_isotime(timeutils.utcnow().isoformat())
+        response = self._do_get(
+            'servers?changes-before=%s' % timeutils.normalize_time(
+                current_time))
+        subs = self.common_subs.copy()
+        subs['id'] = uuid
+        self._verify_response(
+            'servers-list-with-changes-before', subs, response, 200)
+
+    def test_get_servers_detail_with_changes_before(self):
+        uuid = self._post_server(use_common_server_api_samples=False)
+        current_time = timeutils.parse_isotime(timeutils.utcnow().isoformat())
+        response = self._do_get(
+            'servers/detail?changes-before=%s' % timeutils.normalize_time(
+                current_time))
+        subs = self.common_subs.copy()
+        subs['id'] = uuid
+        self._verify_response(
+            'servers-details-with-changes-before', subs, response, 200)
+
+
+class ServersSampleJson267Test(ServersSampleBase):
+    microversion = '2.67'
+    scenarios = [('v2_67', {'api_major_version': 'v2.1'})]
+
+    def setUp(self):
+        super(ServersSampleJson267Test, self).setUp()
+        self.useFixture(nova_fixtures.CinderFixtureNewAttachFlow(self))
+
+    def test_servers_post(self):
+        return self._post_server(use_common_server_api_samples=False)
 
 
 class ServersUpdateSampleJsonTest(ServersSampleBase):
