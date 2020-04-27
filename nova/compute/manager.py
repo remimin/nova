@@ -4469,8 +4469,11 @@ class ComputeManager(manager.Manager):
 
         limits = filter_properties.get('limits', {})
         rt = self._get_resource_tracker()
+        allocs = (
+            self.reportclient.get_allocations_for_consumer(context,
+                                                           instance.uuid))
         with rt.resize_claim(context, instance, instance_type, node,
-                             migration, image_meta=image,
+                             migration, allocs, image_meta=image,
                              limits=limits) as claim:
             LOG.info('Migrating', instance=instance)
             # RPC cast to the source host to start the actual resize/migration.

@@ -155,6 +155,7 @@ class DeviceManager(object):
             if not mdev:
                 for mdev in chosen_mdevs:
                     mdev.instance_uuid = None
+                    mdev.flavor_id = None
                 raise exception.ComputeResourcesUnavailable(
                     reason="vGPU resource is not available")
 
@@ -164,6 +165,7 @@ class DeviceManager(object):
             if (mdev.instance_uuid == instance.uuid and
                     mdev.flavor_id == flavor_id):
                 mdev.instance_uuid = None
+                mdev.flavor_id = None
 
     def get_claimed_devices_for_instance(self, instance, flavor=None):
         return self._get_claimed_mdevs_for_instance(instance, flavor=flavor)
