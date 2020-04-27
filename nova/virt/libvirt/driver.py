@@ -8764,9 +8764,11 @@ class LibvirtDriver(driver.ComputeDriver):
                         info['type'] == 'raw' and CONF.use_cow_images):
                 self._disk_raw_to_qcow2(info['path'])
 
+        mdevs = self._get_claimed_mdevs(instance)
         xml = self._get_guest_xml(context, instance, network_info,
                                   block_disk_info, image_meta,
-                                  block_device_info=block_device_info)
+                                  block_device_info=block_device_info,
+                                  mdevs=mdevs)
         # NOTE(mriedem): vifs_already_plugged=True here, regardless of whether
         # or not we've migrated to another host, because we unplug VIFs locally
         # and the status change in the port might go undetected by the neutron
@@ -8825,9 +8827,11 @@ class LibvirtDriver(driver.ComputeDriver):
                                             instance,
                                             instance.image_meta,
                                             block_device_info)
+        mdevs = self._get_claimed_mdevs(instance)
         xml = self._get_guest_xml(context, instance, network_info, disk_info,
                                   instance.image_meta,
-                                  block_device_info=block_device_info)
+                                  block_device_info=block_device_info,
+                                  mdevs=mdevs)
         # NOTE(artom) In some Neutron or port configurations we've already
         # waited for vif-plugged events in the compute manager's
         # _finish_revert_resize_network_migrate_finish(), right after updating
