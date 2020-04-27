@@ -16,7 +16,6 @@
 """
 Tests for Block Device utility functions.
 """
-from oslo_utils.fixture import uuidsentinel as uuids
 import six
 
 from nova import block_device
