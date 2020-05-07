@@ -2629,7 +2629,7 @@ class TestRebuild(BaseTestCase):
             mock.patch('nova.objects.Migration.save'),
             mock.patch('nova.objects.Instance.save'),
         ) as (mig_save_mock, inst_save_mock):
-            self.rt.rebuild_claim(ctx, instance, _NODENAME,
+            self.rt.rebuild_claim(ctx, instance, _NODENAME, self.allocations,
                                   migration=migration)
 
         self.assertEqual(_HOSTNAME, migration.dest_compute)
