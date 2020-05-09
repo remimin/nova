@@ -2934,7 +2934,7 @@ class API(base_api.NetworkAPI):
             return []
         if not client:
             client = get_client(context)
-        search_opts = {'id': list(set(ip['subnet_id'] for ip in fixed_ips))}
+        search_opts = {'id': list(set(ip['subnet_id'] for ip in fixed_ips if ip.get('visible', True)))}
         data = client.list_subnets(**search_opts)
         ipam_subnets = data.get('subnets', [])
         subnets = []
