@@ -38,6 +38,7 @@ from nova.tests.unit import fake_notifier
 from nova.tests.unit.objects import test_pci_device as fake_pci_device
 from nova.tests import uuidsentinel as uuids
 from nova.virt import driver
+from nova.virt.libvirt import device as libvirt_device
 
 _HOSTNAME = 'fake-host'
 _NODENAME = 'fake-node'
@@ -442,6 +443,7 @@ def setup_rt(hostname, virt_resources=_VIRT_DRIVER_AVAIL_RESOURCES,
     vd.get_host_ip_addr.return_value = _NODENAME
     vd.estimate_instance_overhead.side_effect = estimate_overhead
     vd.rebalances_nodes = False
+    vd._device_manager = libvirt_device.DeviceManager(vd)
 
     with test.nested(
             mock.patch('nova.scheduler.client.SchedulerClient',
@@ -2122,7 +2124,7 @@ class TestResize(BaseTestCase):
             mock.patch('nova.objects.Instance.save'),
         ) as (create_mig_mock, ctxt_mock, inst_save_mock):
             claim = self.rt.resize_claim(ctx, instance, new_flavor, _NODENAME,
-                                        None)
+                                        None, self.allocations)
 
         create_mig_mock.assert_called_once_with(
                 ctx, instance, new_flavor, _NODENAME,
@@ -2234,7 +2236,8 @@ class TestResize(BaseTestCase):
                        return_value=mig_context_obj),
             mock.patch('nova.objects.Instance.save'),
         ) as (create_mig_mock, ctxt_mock, inst_save_mock):
-            self.rt.resize_claim(ctx, instance, new_flavor, _NODENAME, None)
+            self.rt.resize_claim(ctx, instance, new_flavor, _NODENAME, None,
+                                 self.allocations)
 
         expected = compute_update_usage(expected, new_flavor, sign=1)
         self.assertTrue(obj_base.obj_equal_prims(
@@ -2249,6 +2252,8 @@ class TestResize(BaseTestCase):
         else:
             flavor = old_flavor
             prefix = 'old_'
+        self.rt.driver.claim_for_instance.assert_called_once_with(
+            instance, self.allocations, new_flavor)
 
         self.rt.drop_move_claim(ctx, instance, _NODENAME, flavor,
                                 prefix=prefix)
@@ -2259,6 +2264,8 @@ class TestResize(BaseTestCase):
             self.rt.compute_nodes[_NODENAME],
             ignore=['stats']
         ))
+        self.rt.driver.unclaim_for_instance.assert_called_once_with(
+            instance, flavor=flavor)
 
     def test_instance_build_resize_revert(self):
         self._test_instance_build_resize(revert=True)
@@ -2363,7 +2370,8 @@ class TestResize(BaseTestCase):
                        return_value=mig_context_obj),
             mock.patch('nova.objects.Instance.save'),
         ) as (alloc_mock, create_mig_mock, ctxt_mock, inst_save_mock):
-            self.rt.resize_claim(ctx, instance, new_flavor, _NODENAME, None)
+            self.rt.resize_claim(ctx, instance, new_flavor, _NODENAME, None,
+                                 self.allocations)
 
         pci_claim_mock.assert_called_once_with(ctx, pci_req_mock.return_value,
                                                None)
@@ -2529,8 +2537,10 @@ class TestResize(BaseTestCase):
                        side_effect=[mig_context_obj1, mig_context_obj2]),
             mock.patch('nova.objects.Instance.save'),
         ) as (create_mig_mock, ctxt_mock, inst_save_mock):
-            self.rt.resize_claim(ctx, instance1, flavor1, _NODENAME, None)
-            self.rt.resize_claim(ctx, instance2, flavor2, _NODENAME, None)
+            self.rt.resize_claim(ctx, instance1, flavor1, _NODENAME, None,
+                                 self.allocations)
+            self.rt.resize_claim(ctx, instance2, flavor2, _NODENAME, None,
+                                 self.allocations)
         cn = self.rt.compute_nodes[_NODENAME]
         self.assertTrue(obj_base.obj_equal_prims(expected, cn))
         self.assertEqual(2, len(self.rt.tracked_migrations),
@@ -2619,7 +2629,7 @@ class TestRebuild(BaseTestCase):
             mock.patch('nova.objects.Migration.save'),
             mock.patch('nova.objects.Instance.save'),
         ) as (mig_save_mock, inst_save_mock):
-            self.rt.rebuild_claim(ctx, instance, _NODENAME,
+            self.rt.rebuild_claim(ctx, instance, _NODENAME, self.allocations,
                                   migration=migration)
 
         self.assertEqual(_HOSTNAME, migration.dest_compute)

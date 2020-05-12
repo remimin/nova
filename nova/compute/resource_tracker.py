@@ -245,24 +245,25 @@ class ResourceTracker(object):
         return claim
 
     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
-    def rebuild_claim(self, context, instance, nodename, limits=None,
-                      image_meta=None, migration=None):
+    def rebuild_claim(self, context, instance, nodename, allocations,
+                      limits=None, image_meta=None, migration=None):
         """Create a claim for a rebuild operation."""
         instance_type = instance.flavor
         return self._move_claim(context, instance, instance_type, nodename,
-                                migration, move_type='evacuation',
+                                migration, allocations, move_type='evacuation',
                                 limits=limits, image_meta=image_meta)
 
     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
     def resize_claim(self, context, instance, instance_type, nodename,
-                     migration, image_meta=None, limits=None):
+                     migration, allocations, image_meta=None, limits=None):
         """Create a claim for a resize or cold-migration move."""
         return self._move_claim(context, instance, instance_type, nodename,
-                                migration, image_meta=image_meta,
+                                migration, allocations, image_meta=image_meta,
                                 limits=limits)
 
     def _move_claim(self, context, instance, new_instance_type, nodename,
-                    migration, move_type=None, image_meta=None, limits=None):
+                    migration, allocations, move_type=None, image_meta=None,
+                    limits=None):
         """Indicate that resources are needed for a move to this host.
 
         Move can be either a migrate/resize, live-migrate or an
@@ -279,6 +280,7 @@ class ResourceTracker(object):
         and CPUs
         :param migration: A migration object if one was already created
                           elsewhere for this operation (otherwise None)
+        :param allocations: The placement allocation records for the instance.
         :returns: A Claim ticket representing the reserved resources.  This
         should be turned into finalize  a resource claim or free
         resources after the compute operation is finished.
@@ -331,6 +333,10 @@ class ResourceTracker(object):
                                  limits=limits)
 
         claim.migration = migration
+
+        self.driver.claim_for_instance(instance, allocations,
+                                       new_instance_type)
+
         claimed_pci_devices_objs = []
         if self.pci_tracker:
             # NOTE(jaypipes): ComputeNode.pci_device_pools is set below
@@ -482,6 +488,7 @@ class ResourceTracker(object):
 
             ctxt = context.elevated()
             self._update(ctxt, self.compute_nodes[nodename])
+        self.driver.unclaim_for_instance(instance, flavor=instance_type)
 
     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
     def update_usage(self, context, instance, nodename):

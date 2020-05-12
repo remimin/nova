@@ -693,6 +693,9 @@ class ComputeManager(manager.Manager):
                                                            instance)
                 destroy_disks = not (self._is_instance_storage_shared(
                     context, instance))
+                # Unclaim instance's mediated devices if has any.
+                LOG.info("Unclaim instance's mediated devices if has any.")
+                self.driver.unclaim_for_instance(instance)
             except exception.InstanceNotFound:
                 network_info = network_model.NetworkInfo()
                 bdi = {}
@@ -3102,6 +3105,8 @@ class ComputeManager(manager.Manager):
 
         with self._error_out_instance_on_exception(context, instance):
             try:
+                allocs = (self.reportclient.get_allocations_for_consumer(
+                        context, instance.uuid))
 
                 if instance.new_flavor:
                     migration = objects.Migration(context=context.elevated())
@@ -3118,11 +3123,13 @@ class ComputeManager(manager.Manager):
                     claim_ctxt = rt.resize_claim(context, instance,
                                                  instance.new_flavor,
                                                  scheduled_node,
-                                                 limits=limits, image_meta=image_meta,
+                                                 allocs,
+                                                 limits=limits,
+                                                 image_meta=image_meta,
                                                  migration=migration)
                 else:
                     claim_ctxt = rebuild_claim(
-                        context, instance, scheduled_node,
+                        context, instance, scheduled_node, allocs,
                         limits=limits, image_meta=image_meta,
                         migration=migration)
                 self._do_rebuild_instance_with_claim(
@@ -4469,8 +4476,11 @@ class ComputeManager(manager.Manager):
 
         limits = filter_properties.get('limits', {})
         rt = self._get_resource_tracker()
+        allocs = (
+            self.reportclient.get_allocations_for_consumer(context,
+                                                           instance.uuid))
         with rt.resize_claim(context, instance, instance_type, node,
-                             migration, image_meta=image,
+                             migration, allocs, image_meta=image,
                              limits=limits) as claim:
             LOG.info('Migrating', instance=instance)
             # RPC cast to the source host to start the actual resize/migration.
