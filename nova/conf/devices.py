@@ -30,6 +30,17 @@ list), only the first one will be used. An example is as the following::
 
     [devices]
     enabled_vgpu_types = GRID K100,Intel GVT-g,MxGPU.2,nvidia-11
+"""),
+    cfg.StrOpt('vgpu_allocate_policy',
+               default='stack',
+               choices=('stack', 'spread'),
+               help="""
+Policy for create mdevs.
+
+Possible values:
+
+* stack - Use GPU which has the least available instances to create mdevs.
+* spread - Use GPU which has the most avaibable instances to create mdevs.
 """)
 ]
 
