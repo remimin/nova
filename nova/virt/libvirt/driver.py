@@ -6497,26 +6497,90 @@ class LibvirtDriver(driver.ComputeDriver):
 
         :returns: the newly created mdev UUID or None if not possible
         """
-        # Try to see if we can still create a new mediated device
+        # the devs like
+        # {
+        #     "pci_0000_88_00_0":[
+        #         "d66b1534-d31f-468e-b0f4-cf4fdd1e7886",
+        #         "d28b16c6-04c4-410c-a1ae-54fe10d2eac7"
+        #     ]
+        # }
+        # the key is PCI address, the value is a integer list which means
+        # available instances including those not assigned.
+        asked_type = requested_types[0]
+        devs = collections.defaultdict(list)
+        if mdevs_available:
+            for mdev in mdevs_available:
+                devs[mdev.parent].append(mdev.uuid)
+        LOG.debug('Host available mediated devices that have been created but '
+                  'not assigned are %s.', jsonutils.dumps(devs))
+        # the mdevs_available_instances like
+        # {
+        #     "pci_0000_88_00_0":4,
+        #     "pci_0000_8d_00_0":2,
+        #     "pci_0000_8e_00_0":3
+        # }
+        # the key is PCI address, the value is a number, the available
+        # instances include not assigned.
+        mdevs_available_instances = {}
         devices = self._get_mdev_capable_devices(requested_types)
         for device in devices:
             # For the moment, the libvirt driver only supports one
             # type per host
             # TODO(sbauza): Once we support more than one type, make
             # sure we look at the flavor/trait for the asked type.
-            asked_type = requested_types[0]
-            if device['types'][asked_type]['availableInstances'] > 0:
-                # That physical GPU has enough room for a new mdev
-                dev_name = device['dev_id']
-                # We need the PCI address, not the libvirt name
-                # The libvirt name is like 'pci_0000_84_00_0'
-                pci_addr = "{}:{}:{}.{}".format(*dev_name[4:].split('_'))
-                chosen_mdev = nova.privsep.libvirt.create_mdev(pci_addr,
-                                                               asked_type,
-                                                               uuid=uuid)
-                return libvirt_device.MDevDevice(
-                    uuid=chosen_mdev, type=asked_type,
-                    parent=dev_name)
+            dev_name = device['dev_id']
+            all_available_instance = \
+                device['types'][asked_type]['availableInstances'] + \
+                len(devs[dev_name])
+            if all_available_instance:
+                mdevs_available_instances[dev_name] = all_available_instance
+        LOG.debug("Host available mediated devices are: %s. There are two "
+                  "parts, one part is created but not assigned, the other part"
+                  " is not yet created.",
+                  jsonutils.dumps(mdevs_available_instances))
+        # NOTE(liuzhuangzhuang)We have to sorted the mdevs_available_instances
+        # by its value(available instance).
+        if not mdevs_available_instances:
+            return None
+        reverse = True if CONF.devices.vgpu_allocate_policy == 'spread' \
+            else False
+
+        def _cmp(x, y, reverse=False):
+            if x[1] != y[1]:
+                return cmp(x[1], y[1])
+            return cmp(len(devs.get(x[0])), len(devs.get(y[0]))) if reverse \
+                else cmp(len(devs.get(y[0])), len(devs.get(x[0])))
+
+        # the sort_devis like
+        # [('pci_0000_b3_00_0', 3), ('pci_0000_8d_00_0', 2)]
+        sort_devs = sorted(mdevs_available_instances.items(),
+                           cmp=lambda x, y: _cmp(x, y, reverse),
+                           reverse=reverse)
+        # get the first device's pci address, e.g.: pci_0000_b3_00_0
+        dev_name = sort_devs[0][0]
+        # if the dev has existing but not assigned mdevs, we should use it
+        # instead of creating one.
+        if len(devs[dev_name]) != 0:
+            random.shuffle(devs[dev_name])
+            chosen_mdev = devs[dev_name][0]
+            LOG.debug('Chosing a existing but not assigned mdev %s, its parent'
+                      ' dev address is %s.', chosen_mdev, dev_name)
+            return libvirt_device.MDevDevice(uuid=chosen_mdev,
+                                             type=asked_type,
+                                             parent=dev_name)
+        # if the dev doesn't have existing and not assigned mdevs, then create
+        # a new one.
+        # We need the PCI address, not the libvirt name
+        # The libvirt name is like 'pci_0000_84_00_0'
+        pci_addr = "{}:{}:{}.{}".format(*dev_name[4:].split('_'))
+        chosen_mdev = nova.privsep.libvirt.create_mdev(pci_addr,
+                                                       asked_type,
+                                                       uuid=uuid)
+        LOG.debug('Creating a new mdev %s which parent dev address is %s.',
+                  chosen_mdev, dev_name)
+        return libvirt_device.MDevDevice(uuid=chosen_mdev,
+                                         type=asked_type,
+                                         parent=dev_name)
 
     def _get_requested_vgpus(self, allocations):
         vgpu_allocations = self._vgpu_allocations(allocations)
