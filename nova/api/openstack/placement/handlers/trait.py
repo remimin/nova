@@ -268,3 +268,28 @@ def delete_traits_for_resource_provider(req):
     req.response.status = 204
     req.response.content_type = None
     return req.response
+
+
+@wsgi_wrapper.PlacementWsgify
+@microversion.version_handler('1.6')
+def remove_trait_for_resource_provider(req):
+    context = req.environ['placement.context']
+    context.can(policies.RP_TRAIT_DELETE)
+    uuid = util.wsgi_path_item(req.environ, 'uuid')
+    trait_name = util.wsgi_path_item(req.environ, 'name')
+
+    resource_provider = rp_obj.ResourceProvider.get_by_uuid(context, uuid)
+    try:
+        trait = rp_obj.Trait.get_by_name(context, trait_name)
+        result = resource_provider.remove_trait_from_provider(context,
+                                                              trait.id)
+    except exception.TraitNotFound as ex:
+        raise webob.exc.HTTPNotFound(ex.format_message())
+    except exception.TraitCannotDeleteStandard as ex:
+        raise webob.exc.HTTPBadRequest(ex.format_message())
+    if result.rowcount == 0:
+        raise webob.exc.HTTPNotFound("Trait %s is not associated to resource "
+                                     "provider %s." % (trait_name, uuid))
+    req.response.status = 204
+    req.response.content_type = None
+    return req.response

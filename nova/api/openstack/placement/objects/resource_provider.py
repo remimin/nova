@@ -973,6 +973,16 @@ class ResourceProvider(base.VersionedObject, base.TimestampedObject):
         self.obj_reset_changes()
 
     @db_api.placement_context_manager.writer
+    def remove_trait_from_provider(self, context, trait_id):
+        del_stmt = _RP_TRAIT_TBL.delete().where(
+            sa.and_(
+                _RP_TRAIT_TBL.c.resource_provider_id == self.id,
+                _RP_TRAIT_TBL.c.trait_id == trait_id,
+            )
+        )
+        return context.session.execute(del_stmt)
+
+    @db_api.placement_context_manager.writer
     def _create_in_db(self, context, updates):
         parent_id = None
         root_id = None
