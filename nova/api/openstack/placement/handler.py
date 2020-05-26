@@ -123,6 +123,9 @@ ROUTE_DECLARATIONS = {
         'PUT': trait.update_traits_for_resource_provider,
         'DELETE': trait.delete_traits_for_resource_provider
     },
+    '/resource_providers/{uuid}/traits/{name}': {
+        'DELETE': trait.remove_trait_for_resource_provider,
+    },
     '/usages': {
         'GET': usage.get_total_usages,
     },
