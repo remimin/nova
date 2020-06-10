@@ -335,13 +335,16 @@ class LibvirtGenericVIFDriver(object):
 
         profile = vif["profile"]
         vif_details = vif["details"]
+        # VIF_DETAILS_MACVTAP_SOURCE is used by get_dest_vif
+        source_dev = vif.pop('source_dev', None)
         net_type = 'direct'
         if vif['vnic_type'] == network_model.VNIC_TYPE_DIRECT:
             net_type = 'hostdev'
 
         designer.set_vif_host_backend_hw_veb(
             conf, net_type, profile['pci_slot'],
-            vif_details[network_model.VIF_DETAILS_VLAN])
+            vif_details[network_model.VIF_DETAILS_VLAN],
+            source_dev=source_dev)
 
         # NOTE(vladikr): Not setting vlan tags for macvtap on SR-IOV VFs
         # as vlan tag is not supported in Libvirt until version 1.3.5

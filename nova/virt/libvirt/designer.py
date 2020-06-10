@@ -106,7 +106,7 @@ def set_vif_host_backend_802qbh_config(conf, net_type, devname, profileid,
 
 
 def set_vif_host_backend_hw_veb(conf, net_type, devname, vlan,
-                                tapname=None):
+                                tapname=None, source_dev=None):
     """Populate a LibvirtConfigGuestInterface instance
     with host backend details for an device that supports hardware
     virtual ethernet bridge.
@@ -116,7 +116,8 @@ def set_vif_host_backend_hw_veb(conf, net_type, devname, vlan,
     conf.vlan = vlan
     if net_type == 'direct':
         conf.source_mode = 'passthrough'
-        conf.source_dev = pci_utils.get_ifname_by_pci_address(devname)
+        conf.source_dev = source_dev if source_dev \
+                else pci_utils.get_ifname_by_pci_address(devname)
         conf.driver_name = 'vhost'
     else:  # net_type == network_model.VNIC_TYPE_DIRECT
         conf.source_dev = devname

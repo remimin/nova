@@ -57,6 +57,8 @@ class VIFMigrateData(obj_base.NovaObject):
         # the libvirt driver here: https://review.openstack.org/#/c/551370/
         # 29/nova/virt/libvirt/driver.py@7036
         'source_vif': fields.Field(fields.NetworkVIFModel()),
+        # SR-IOV macvtap destination hardware device name
+        'source_dev': fields.StringField(),
     }
 
     @property
@@ -92,6 +94,8 @@ class VIFMigrateData(obj_base.NovaObject):
         vif['vnic_type'] = self.vnic_type
         vif['profile'] = self.profile
         vif['details'] = self.vif_details
+        if 'source_dev' in self:
+            vif['source_dev'] = self.source_dev
         return vif
 
 

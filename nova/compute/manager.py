@@ -89,6 +89,7 @@ from nova.objects import fields
 from nova.objects import instance as obj_instance
 from nova.objects import migrate_data as migrate_data_obj
 from nova.pci import request as pci_req_module
+from nova.pci import utils as pci_utils
 from nova.pci import whitelist
 from nova import rpc
 from nova import safe_utils
@@ -7022,7 +7023,8 @@ class ComputeManager(manager.Manager):
 
         # Free instance allocations on source before claims are allocated on
         # destination node
-        self.rt.free_pci_device_allocations_for_instance(ctxt, instance)
+        rt = self._get_resource_tracker()
+        rt.free_pci_device_allocations_for_instance(ctxt, instance)
         # NOTE(danms): Save source node before calling post method on
         # destination, which will update it
         source_node = instance.node
@@ -7158,7 +7160,8 @@ class ComputeManager(manager.Manager):
         block_device_info = self._get_instance_block_device_info(context,
                                                                  instance)
         # Allocate the claimed PCI resources at destination.
-        self.rt.allocate_pci_devices_for_instance(context, instance)
+        rt = self._get_resource_tracker()
+        rt.allocate_pci_devices_for_instance(context, instance)
 
         try:
             self.driver.post_live_migration_at_destination(
@@ -7401,7 +7404,8 @@ class ComputeManager(manager.Manager):
                                                                      instance)
             # free any instance PCI claims done on destination during
             # check_can_live_migrate_destination()
-            self.rt.free_pci_device_claims_for_instance(context, instance)
+            rt = self._get_resource_tracker()
+            rt.free_pci_device_claims_for_instance(context, instance)
 
             self.driver.rollback_live_migration_at_destination(
                 context, instance, network_info, block_device_info,
@@ -8935,7 +8939,8 @@ class ComputeManager(manager.Manager):
                 requests=pci_reqs,
                 instance_uuid=instance.uuid)
 
-            claimed_pci_devices_objs = self.rt.claim_pci_devices(
+            rt = self._get_resource_tracker()
+            claimed_pci_devices_objs = rt.claim_pci_devices(
                 ctxt,
                 vif_pci_requests)
 
@@ -8972,3 +8977,8 @@ class ComputeManager(manager.Manager):
             LOG.debug("Updating migrate VIF profile for port %(port_id)s:"
                       "%(profile)s", {'port_id': port_id,
                                       'profile': profile})
+            # SR-IOV macvtap indirect mode
+            source_vif = mig_vif.source_vif
+            if source_vif['vnic_type'] == network_model.VIF_TYPE_MACVTAP:
+                mig_vif.source_dev = \
+                        pci_utils.get_ifname_by_pci_address(pci_dev.address)
