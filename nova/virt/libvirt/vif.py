@@ -668,15 +668,7 @@ class LibvirtGenericVIFDriver(object):
         pass
 
     def plug_hw_veb(self, instance, vif):
-        # TODO(vladikr): This code can be removed once the minimum version of
-        # Libvirt is incleased above 1.3.5, as vlan will be set by libvirt
-        if vif['vnic_type'] == network_model.VNIC_TYPE_MACVTAP:
-            linux_net_utils.set_vf_interface_vlan(
-                vif['profile']['pci_slot'],
-                mac_addr=vif['address'],
-                vlan=vif['details'][network_model.VIF_DETAILS_VLAN])
-
-        elif vif['vnic_type'] == network_model.VNIC_TYPE_DIRECT:
+        if vif['vnic_type'] == network_model.VNIC_TYPE_DIRECT:
             trusted = strutils.bool_from_string(
                 vif['profile'].get('trusted', "False"))
             if trusted:
@@ -841,20 +833,7 @@ class LibvirtGenericVIFDriver(object):
         pass
 
     def unplug_hw_veb(self, instance, vif):
-        # TODO(sean-k-mooney): remove in Train after backporting 0 mac
-        # change as this should no longer be needed with libvirt >= 3.2.0.
-        if vif['vnic_type'] == network_model.VNIC_TYPE_MACVTAP:
-            # NOTE(sean-k-mooney): Retaining the vm mac on the vf
-            # after unplugging the vif prevents the PF from transmitting
-            # a packet with that destination address. This would create a
-            # a network partition in the event a vm is migrated or the neuton
-            # port is reused for another vm before the VF is reused.
-            # The ip utility accepts the MAC 00:00:00:00:00:00 which can
-            # be used to reset the VF mac when no longer in use by a vm.
-            # As such we hardcode the 00:00:00:00:00:00 mac.
-            linux_net_utils.set_vf_interface_vlan(vif['profile']['pci_slot'],
-                                                  mac_addr='00:00:00:00:00:00')
-        elif vif['vnic_type'] == network_model.VNIC_TYPE_DIRECT:
+        if vif['vnic_type'] == network_model.VNIC_TYPE_DIRECT:
             if "trusted" in vif['profile']:
                 linux_net.set_vf_trusted(vif['profile']['pci_slot'], False)
 
