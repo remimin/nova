@@ -6211,12 +6211,21 @@ class LibvirtDriver(driver.ComputeDriver):
         if not devname:
             return
 
-        virtdev = self._host.device_lookup_by_name(devname)
-        xmlstr = virtdev.XMLDesc(0)
-        cfgdev = vconfig.LibvirtConfigNodeDevice()
-        cfgdev.parse_str(xmlstr)
-        return {'name': cfgdev.name,
-                'capabilities': cfgdev.pci_capability.features}
+        try:
+            virtdev = self._host.device_lookup_by_name(devname)
+            xmlstr = virtdev.XMLDesc(0)
+            cfgdev = vconfig.LibvirtConfigNodeDevice()
+            cfgdev.parse_str(xmlstr)
+            return {'name': cfgdev.name,
+                    'capabilities': cfgdev.pci_capability.features}
+        except libvirt.libvirtError as ex:
+            err_code = ex.get_error_code()
+            err_msg = encodeutils.exception_to_unicode(ex)
+            LOG.warning("Cloudn't get %(devname)s capabilites. "
+                        "error: %(err_msg)s, error code: %(err_code)s",
+                        {"devname": devname,
+                         "err_msg": err_msg,
+                         "err_code": err_code})
 
     def _get_pcidev_info(self, devname):
         """Returns a dict of PCI device."""
